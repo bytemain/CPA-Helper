@@ -257,6 +257,7 @@ func (a *App) Routes() http.Handler {
 	}))
 
 	mux.HandleFunc("/api/auth/", a.wrap(a.handleAuth))
+	mux.HandleFunc("/api/product-info", a.wrap(a.handleProductInfo))
 	mux.HandleFunc("/api/settings", a.wrap(a.handleSettings))
 	mux.HandleFunc("/api/collector/status", a.wrap(a.handleCollectorStatus))
 	mux.HandleFunc("/api/usage/", a.wrap(a.handleUsage))
@@ -495,6 +496,8 @@ type AppConfig struct {
 	LiteLLMProxy            LiteLLMProxyConfig `json:"litellm_proxy"`
 	ModelRequestURL         string             `json:"model_request_url"`
 	SessionSecret           string             `json:"session_secret"`
+	ProductName             string             `json:"product_name"`
+	ProductLogo             string             `json:"product_logo"`
 }
 
 func defaultConfig() (AppConfig, error) {
@@ -550,14 +553,15 @@ func (a *App) loadConfig(ctx context.Context) (AppConfig, error) {
 		SELECT collector_enabled, cliaproxy_url, management_key, queue_name, batch_size,
 		       poll_interval_seconds, retry_interval_seconds, codex_keeper_settings,
 		       codex_keeper_priority_rules, litellm_proxy_enabled, litellm_proxy_url,
-		       model_request_url, session_secret
+		       model_request_url, session_secret, product_name, product_logo
 		FROM app_settings WHERE id = 1
 	`)
 	var collectorEnabled, litellmProxyEnabled bool
 	var cliaproxyURL, managementKey, queueName, keeperJSON, rulesJSON, litellmProxyURL, modelRequestURL, sessionSecret string
+	var productName, productLogo string
 	var batchSize int
 	var pollInterval, retryInterval float64
-	if err := row.Scan(&collectorEnabled, &cliaproxyURL, &managementKey, &queueName, &batchSize, &pollInterval, &retryInterval, &keeperJSON, &rulesJSON, &litellmProxyEnabled, &litellmProxyURL, &modelRequestURL, &sessionSecret); err != nil {
+	if err := row.Scan(&collectorEnabled, &cliaproxyURL, &managementKey, &queueName, &batchSize, &pollInterval, &retryInterval, &keeperJSON, &rulesJSON, &litellmProxyEnabled, &litellmProxyURL, &modelRequestURL, &sessionSecret, &productName, &productLogo); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AppConfig{}, fmt.Errorf("%w: app_settings id=1 is missing; run `cpa-helper migrate`", ErrAppSettingsMissing)
 		}
@@ -594,6 +598,8 @@ func (a *App) loadConfig(ctx context.Context) (AppConfig, error) {
 		ProxyURL: strings.TrimSpace(litellmProxyURL),
 	}
 	cfg.ModelRequestURL = nonBlank(strings.TrimRight(strings.TrimSpace(modelRequestURL), "/"), cfg.Collector.CLIProxyURL)
+	cfg.ProductName = strings.TrimSpace(productName)
+	cfg.ProductLogo = strings.TrimSpace(productLogo)
 	return cfg, nil
 }
 
@@ -648,9 +654,10 @@ func (a *App) saveConfig(ctx context.Context, cfg AppConfig) error {
 		    batch_size = ?, poll_interval_seconds = ?, retry_interval_seconds = ?,
 		    codex_keeper_settings = ?, codex_keeper_priority_rules = ?,
 		    litellm_proxy_enabled = ?, litellm_proxy_url = ?,
-		    model_request_url = ?, session_secret = ?, updated_at = ?
+		    model_request_url = ?, session_secret = ?,
+		    product_name = ?, product_logo = ?, updated_at = ?
 		WHERE id = 1
-	`, cfg.Collector.Enabled, strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/"), strings.TrimSpace(cfg.Collector.ManagementKey), strings.TrimSpace(cfg.Collector.QueueName), cfg.Collector.BatchSize, cfg.Collector.PollIntervalSeconds, cfg.Collector.RetryIntervalSeconds, string(keeperBytes), string(rulesBytes), cfg.LiteLLMProxy.Enabled, strings.TrimSpace(cfg.LiteLLMProxy.ProxyURL), strings.TrimRight(strings.TrimSpace(cfg.ModelRequestURL), "/"), cfg.SessionSecret, dbTime(time.Now()))
+	`, cfg.Collector.Enabled, strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/"), strings.TrimSpace(cfg.Collector.ManagementKey), strings.TrimSpace(cfg.Collector.QueueName), cfg.Collector.BatchSize, cfg.Collector.PollIntervalSeconds, cfg.Collector.RetryIntervalSeconds, string(keeperBytes), string(rulesBytes), cfg.LiteLLMProxy.Enabled, strings.TrimSpace(cfg.LiteLLMProxy.ProxyURL), strings.TrimRight(strings.TrimSpace(cfg.ModelRequestURL), "/"), cfg.SessionSecret, cfg.ProductName, cfg.ProductLogo, dbTime(time.Now()))
 	return err
 }
 

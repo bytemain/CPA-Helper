@@ -42,7 +42,7 @@ import { getMe, isAuthUser, logout } from '@/features/auth/api/authApi'
 import { useCurrentUser } from '@/features/auth/state/currentUser'
 import { useThemePreference } from '@/shared/composables/useThemePreference'
 import { useI18n } from '@/shared/i18n'
-import { logoUrl } from '@/shared/utils/assets'
+import { useProductInfo } from '@/shared/state/productInfo'
 
 const route = useRoute()
 const router = useRouter()
@@ -57,6 +57,7 @@ const { currentUser, setCurrentUser } = useCurrentUser()
 const hasLoadedUser = ref(currentUser.value !== null)
 const { isDark, preference, setThemePreference, toggleTheme } = useThemePreference()
 const { language, t, toggleLanguage } = useI18n()
+const { productName, productLogo } = useProductInfo()
 let navigationFeedbackTimer: number | undefined
 let routeTransitionReleaseTimer: number | undefined
 
@@ -309,10 +310,10 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
     >
       <div class="brand">
         <div class="brand-mark">
-          <img :src="logoUrl" alt="">
+          <img :src="productLogo" alt="">
         </div>
         <div class="brand-copy">
-          <strong>CPA-Helper</strong>
+          <strong>{{ productName }}</strong>
           <span>{{ accountText }} · {{ roleText }}</span>
         </div>
       </div>
@@ -379,10 +380,10 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
           </template>
         </NButton>
         <div class="mobile-brand" :aria-label="t('CPA-Helper 账号信息', 'CPA-Helper account info')">
-          <img class="mobile-brand-logo" :src="logoUrl" alt="" aria-hidden="true">
+          <img class="mobile-brand-logo" :src="productLogo" alt="" aria-hidden="true">
           <div class="mobile-brand-copy">
             <div class="mobile-title-row">
-              <strong>CPA-Helper</strong>
+              <strong>{{ productName }}</strong>
               <span class="mobile-version-badge">{{ appVersion }}</span>
             </div>
             <span>{{ accountText }} · {{ roleText }}</span>
@@ -430,7 +431,7 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
     </NLayout>
 
     <NDrawer v-model:show="drawerOpen" placement="left" :width="248">
-      <NDrawerContent :title="`CPA-Helper · ${appVersion}`" body-content-style="padding: 0;">
+      <NDrawerContent :title="`${productName} · ${appVersion}`" body-content-style="padding: 0;">
         <NMenu :value="selectedKey" :options="menuOptions" @update:value="handleMenuUpdate" />
         <div class="drawer-actions">
           <NButton secondary @click="toggleLanguage">
