@@ -379,7 +379,7 @@ const logoutAriaLabel = computed(() => t('退出登录', 'Sign out'))
             <NIcon :component="Menu" />
           </template>
         </NButton>
-        <div class="mobile-brand" :aria-label="t('CPA-Helper 账号信息', 'CPA-Helper account info')">
+        <div class="mobile-brand" :aria-label="`${productName} ${t('账号信息', 'account info')}`">
           <img class="mobile-brand-logo" :src="productLogo" alt="" aria-hidden="true">
           <div class="mobile-brand-copy">
             <div class="mobile-title-row">
