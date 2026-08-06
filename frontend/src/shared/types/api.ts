@@ -37,6 +37,8 @@ export interface SettingsResponse {
   batch_size: number
   poll_interval_seconds: number
   retry_interval_seconds: number
+  product_name: string
+  product_logo: string
 }
 
 export interface SettingsUpdatePayload {
@@ -48,6 +50,13 @@ export interface SettingsUpdatePayload {
   batch_size?: number
   poll_interval_seconds?: number
   retry_interval_seconds?: number
+  product_name?: string
+  product_logo?: string
+}
+
+export interface ProductInfoResponse {
+  product_name: string
+  product_logo: string
 }
 
 export interface ModelRequestGuide {

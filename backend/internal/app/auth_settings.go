@@ -265,6 +265,8 @@ type settingsUpdateRequest struct {
 	BatchSize            *int     `json:"batch_size"`
 	PollIntervalSeconds  *float64 `json:"poll_interval_seconds"`
 	RetryIntervalSeconds *float64 `json:"retry_interval_seconds"`
+	ProductName          *string  `json:"product_name"`
+	ProductLogo          *string  `json:"product_logo"`
 }
 
 type modelRequestTestPayload struct {
@@ -349,6 +351,20 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 			}
 			cfg.Collector.RetryIntervalSeconds = *payload.RetryIntervalSeconds
 		}
+		if payload.ProductName != nil {
+			name := strings.TrimSpace(*payload.ProductName)
+			if len([]rune(name)) > 64 {
+				return validationError("product_name 超出最大长度 64")
+			}
+			cfg.ProductName = name
+		}
+		if payload.ProductLogo != nil {
+			logo := strings.TrimSpace(*payload.ProductLogo)
+			if logo != "" && !isAllowedLogoDataURL(logo) {
+				return validationError("product_logo 必须是 PNG 或 JPEG 的 base64 data URL")
+			}
+			cfg.ProductLogo = logo
+		}
 		if err := a.saveConfig(r.Context(), cfg); err != nil {
 			return err
 		}
@@ -371,7 +387,31 @@ func settingsResponse(cfg AppConfig) map[string]any {
 		"batch_size":             collector.BatchSize,
 		"poll_interval_seconds":  collector.PollIntervalSeconds,
 		"retry_interval_seconds": collector.RetryIntervalSeconds,
+		"product_name":           cfg.ProductName,
+		"product_logo":           cfg.ProductLogo,
 	}
+}
+
+func isAllowedLogoDataURL(s string) bool {
+	return strings.HasPrefix(s, "data:image/png;base64,") ||
+		strings.HasPrefix(s, "data:image/jpeg;base64,") ||
+		strings.HasPrefix(s, "data:image/webp;base64,") ||
+		strings.HasPrefix(s, "data:image/gif;base64,")
+}
+
+func (a *App) handleProductInfo(w http.ResponseWriter, r *http.Request) error {
+	if err := requireMethod(r, http.MethodGet); err != nil {
+		return err
+	}
+	cfg, err := a.loadConfig(r.Context())
+	if err != nil {
+		return err
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"product_name": cfg.ProductName,
+		"product_logo": cfg.ProductLogo,
+	})
+	return nil
 }
 
 func (a *App) handleCurrentModelRequestGuide(w http.ResponseWriter, r *http.Request) error {

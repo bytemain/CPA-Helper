@@ -22,6 +22,7 @@ import {
   updateSettings,
 } from '@/features/settings/api/settingsApi'
 import { useI18n } from '@/shared/i18n'
+import { setProductInfo } from '@/shared/state/productInfo'
 import type { CollectorStatus, SettingsUpdatePayload } from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
 
@@ -39,7 +40,34 @@ const settingsForm = reactive({
   batch_size: 100,
   poll_interval_seconds: 2,
   retry_interval_seconds: 10,
+  product_name: '',
+  product_logo: '',
 })
+
+const logoPreview = computed(() => settingsForm.product_logo || null)
+
+function handleLogoFile(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  if (!file.type.startsWith('image/')) {
+    message.error(t('请选择图片文件', 'Please select an image file'))
+    return
+  }
+  if (file.size > 512 * 1024) {
+    message.error(t('图片文件不能超过 512 KB', 'Image file must not exceed 512 KB'))
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    settingsForm.product_logo = reader.result as string
+  }
+  reader.readAsDataURL(file)
+}
+
+function clearLogo() {
+  settingsForm.product_logo = ''
+}
 
 const remoteStatusType = computed(() => {
   if (collectorStatus.value?.remote_enabled === true) {
@@ -78,6 +106,8 @@ async function refresh() {
     settingsForm.batch_size = settings.batch_size
     settingsForm.poll_interval_seconds = settings.poll_interval_seconds
     settingsForm.retry_interval_seconds = settings.retry_interval_seconds
+    settingsForm.product_name = settings.product_name ?? ''
+    settingsForm.product_logo = settings.product_logo ?? ''
     collectorStatus.value = status
   } catch (error) {
     message.error(errorText(error, '加载设置失败', 'Failed to load settings'))
@@ -97,9 +127,12 @@ async function saveSettings() {
       batch_size: settingsForm.batch_size,
       poll_interval_seconds: settingsForm.poll_interval_seconds,
       retry_interval_seconds: settingsForm.retry_interval_seconds,
+      product_name: settingsForm.product_name,
+      product_logo: settingsForm.product_logo,
     }
     const saved = await updateSettings(payload)
     settingsForm.management_key = saved.management_key
+    setProductInfo(saved.product_name ?? '', saved.product_logo ?? '')
     message.success(t('设置已保存', 'Settings saved'))
     await refresh()
   } catch (error) {
@@ -244,6 +277,43 @@ onMounted(refresh)
         </div>
       </section>
     </div>
+
+    <section class="panel">
+      <div class="panel-inner">
+        <h2 class="section-title">{{ t('产品信息', 'Product Branding') }}</h2>
+        <NForm :model="settingsForm" label-placement="top">
+          <div class="form-grid branding-grid">
+            <div class="field-stack">
+              <div class="field-label">{{ t('产品名称', 'Product name') }}</div>
+              <NInput
+                v-model:value="settingsForm.product_name"
+                :placeholder="t('留空使用默认名称 CPA-Helper', 'Leave blank to use default name CPA-Helper')"
+                :maxlength="64"
+                show-count
+              />
+              <div class="form-help">{{ t('显示在侧边栏、登录页等位置。', 'Shown in the sidebar, login page, and other locations.') }}</div>
+            </div>
+            <div class="field-stack">
+              <div class="field-label">{{ t('产品头像', 'Product logo') }}</div>
+              <div class="logo-upload-row">
+                <div class="logo-preview" :class="{ 'has-logo': logoPreview }">
+                  <img v-if="logoPreview" :src="logoPreview" alt="">
+                  <span v-else class="logo-placeholder">?</span>
+                </div>
+                <div class="logo-upload-actions">
+                  <label class="logo-file-label">
+                    <input type="file" accept="image/*" class="logo-file-input" @change="handleLogoFile">
+                    <NButton tag="span" secondary size="small">{{ t('选择图片', 'Choose image') }}</NButton>
+                  </label>
+                  <NButton v-if="logoPreview" secondary size="small" @click="clearLogo">{{ t('移除', 'Remove') }}</NButton>
+                </div>
+              </div>
+              <div class="form-help">{{ t('支持 PNG / JPEG / WebP / GIF，不超过 512 KB。留空使用默认图标。', 'PNG / JPEG / WebP / GIF, max 512 KB. Leave blank to use the default icon.') }}</div>
+            </div>
+          </div>
+        </NForm>
+      </div>
+    </section>
   </section>
 </template>
 
@@ -288,6 +358,61 @@ onMounted(refresh)
 
 .status-alert {
   margin-top: 10px;
+}
+
+.branding-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.logo-upload-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.logo-preview {
+  flex-shrink: 0;
+  width: 52px;
+  height: 52px;
+  border-radius: 12px;
+  overflow: hidden;
+  background: var(--cpa-surface-solid);
+  border: 1px solid var(--cpa-border);
+  display: grid;
+  place-items: center;
+}
+
+.logo-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.logo-placeholder {
+  color: var(--cpa-text-muted);
+  font-size: 22px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.logo-upload-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.logo-file-label {
+  cursor: pointer;
+}
+
+.logo-file-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
 }
 
 @media (max-width: 900px) {

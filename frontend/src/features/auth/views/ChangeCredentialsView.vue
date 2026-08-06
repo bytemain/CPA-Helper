@@ -6,11 +6,12 @@ import { NAlert, NButton, NCard, NForm, NFormItem, NInput, useMessage } from 'na
 import { changeCredentials, getMe } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
 import { useI18n } from '@/shared/i18n'
-import { logoUrl } from '@/shared/utils/assets'
+import { useProductInfo } from '@/shared/state/productInfo'
 
 const router = useRouter()
 const message = useMessage()
 const { errorText, t } = useI18n()
+const { productLogo } = useProductInfo()
 const isLoading = ref(false)
 const errorMessage = ref<string | null>(null)
 const form = reactive({
@@ -58,7 +59,7 @@ async function handleSubmit() {
 
     <section class="auth-content" :aria-label="t('修改密码区域', 'Change password area')">
       <div class="brand-mark">
-        <img :src="logoUrl" alt="">
+        <img :src="productLogo" alt="">
       </div>
 
       <NCard class="auth-card" :bordered="true">

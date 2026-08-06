@@ -6,12 +6,13 @@ import { NAlert, NButton, NCard, NForm, NFormItem, NInput, useMessage } from 'na
 import { getSetupState, login, setupFirstAdmin } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
 import { useI18n } from '@/shared/i18n'
-import { logoUrl } from '@/shared/utils/assets'
+import { loadProductInfo, useProductInfo } from '@/shared/state/productInfo'
 
 const route = useRoute()
 const router = useRouter()
 const message = useMessage()
 const { errorText, t } = useI18n()
+const { productName, productLogo } = useProductInfo()
 const isLoading = ref(false)
 const isSetupLoading = ref(true)
 const setupRequired = ref(false)
@@ -21,7 +22,7 @@ const form = reactive({
   password: '',
   nickname: '',
 })
-const headingTitle = computed(() => (setupRequired.value ? t('创建首个管理员账号', 'Create first admin account') : 'CPA-Helper'))
+const headingTitle = computed(() => (setupRequired.value ? t('创建首个管理员账号', 'Create first admin account') : productName.value))
 const headingSubtitle = computed(() =>
   setupRequired.value ? t('首次使用前需要先录入管理员账号', 'Create an admin account before first use') : t('本地 AI 用量管理控制台', 'Local AI usage management console'),
 )
@@ -29,8 +30,12 @@ const submitText = computed(() => (setupRequired.value ? t('创建并登录', 'C
 
 onMounted(async () => {
   try {
-    const state = await getSetupState()
-    setupRequired.value = state.setup_required
+    await Promise.all([
+      loadProductInfo(),
+      getSetupState().then((state) => {
+        setupRequired.value = state.setup_required
+      }),
+    ])
   } catch (error) {
     errorMessage.value = errorText(error, '初始化状态加载失败', 'Failed to load setup state')
   } finally {
@@ -83,7 +88,7 @@ async function handleSubmit() {
 
     <section class="auth-content" :aria-label="t('登录区域', 'Sign-in area')">
       <div class="brand-mark">
-        <img :src="logoUrl" alt="">
+        <img :src="productLogo" alt="">
       </div>
 
       <NCard class="auth-card" :bordered="true">
