@@ -361,7 +361,7 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 		if payload.ProductLogo != nil {
 			logo := strings.TrimSpace(*payload.ProductLogo)
 			if logo != "" && !isAllowedLogoDataURL(logo) {
-				return validationError("product_logo 必须是 PNG 或 JPEG 的 base64 data URL")
+				return validationError("product_logo 必须是 PNG、JPEG、WebP 或 GIF 的 base64 data URL")
 			}
 			cfg.ProductLogo = logo
 		}
