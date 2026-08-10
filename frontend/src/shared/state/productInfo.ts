@@ -9,11 +9,16 @@ const DEFAULT_PRODUCT_NAME = 'CPA-Helper'
 const productName = ref(DEFAULT_PRODUCT_NAME)
 const productLogo = ref(defaultLogoUrl)
 
+function syncDocumentTitle(name: string): void {
+  document.title = name
+}
+
 export async function loadProductInfo(): Promise<void> {
   try {
     const info = await apiClient.get<ProductInfoResponse>('/product-info')
     productName.value = info.product_name.trim() || DEFAULT_PRODUCT_NAME
     productLogo.value = info.product_logo.trim() || defaultLogoUrl
+    syncDocumentTitle(productName.value)
   } catch {
     // fall back to defaults on error
   }
@@ -22,6 +27,7 @@ export async function loadProductInfo(): Promise<void> {
 export function setProductInfo(name: string, logo: string): void {
   productName.value = name.trim() || DEFAULT_PRODUCT_NAME
   productLogo.value = logo.trim() || defaultLogoUrl
+  syncDocumentTitle(productName.value)
 }
 
 export function useProductInfo() {
