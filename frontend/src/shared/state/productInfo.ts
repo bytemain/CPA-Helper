@@ -18,7 +18,6 @@ export async function loadProductInfo(): Promise<void> {
     const info = await apiClient.get<ProductInfoResponse>('/product-info')
     productName.value = info.product_name.trim() || DEFAULT_PRODUCT_NAME
     productLogo.value = info.product_logo.trim() || defaultLogoUrl
-    syncDocumentTitle(productName.value)
   } catch {
     // fall back to defaults on error
   }

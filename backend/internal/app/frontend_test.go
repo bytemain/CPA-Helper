@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -93,6 +94,69 @@ func TestHandleSPAFrontendDistOverrideUsesExternalFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	if body := recorder.Body.String(); !strings.Contains(body, "external") || strings.Contains(body, "embedded") {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestReplaceTitleTag(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		title string
+		want  string
+	}{
+		{
+			name:  "replaces existing title",
+			input: `<html><head><title>CPA-Helper</title></head></html>`,
+			title: "My Product",
+			want:  `<html><head><title>My Product</title></head></html>`,
+		},
+		{
+			name:  "no title tag returns unchanged",
+			input: `<html><head></head></html>`,
+			title: "My Product",
+			want:  `<html><head></head></html>`,
+		},
+		{
+			name:  "no closing tag returns unchanged",
+			input: `<html><head><title>CPA-Helper</head></html>`,
+			title: "My Product",
+			want:  `<html><head><title>CPA-Helper</head></html>`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(replaceTitleTag([]byte(tc.input), tc.title))
+			if got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestInjectBrandingNilDB(t *testing.T) {
+	// When a.db is nil (no database), injectBranding returns the HTML unchanged.
+	app := &App{}
+	input := `<html><head><title>CPA-Helper</title><link rel="icon" href="__CPA_HELPER_LOGO_URL__"/></head></html>`
+	got := string(app.injectBranding(context.Background(), []byte(input)))
+	if got != input {
+		t.Fatalf("expected unchanged HTML when db is nil, got %q", got)
+	}
+}
+
+func TestHandleSPAInjectsTitle(t *testing.T) {
+	// When db is nil the HTML is served as-is (no injection panic).
+	app := &App{frontendFS: fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte(`<html><head><title>CPA-Helper</title></head></html>`)},
+	}}
+
+	req := httptest.NewRequest("GET", "http://example.com/", nil)
+	recorder := httptest.NewRecorder()
+	if err := app.handleSPA(recorder, req); err != nil {
+		t.Fatal(err)
+	}
+	body := recorder.Body.String()
+	if !strings.Contains(body, "<title>CPA-Helper</title>") {
 		t.Fatalf("body = %q", body)
 	}
 }

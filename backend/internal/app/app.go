@@ -402,8 +402,14 @@ func (a *App) serveExternalSPA(w http.ResponseWriter, r *http.Request) (bool, er
 	}
 	indexPath := filepath.Join(a.frontendDist, "index.html")
 	if _, err := os.Stat(indexPath); err == nil {
-		http.ServeFile(w, r, indexPath)
-		return true, nil
+		data, err := os.ReadFile(indexPath)
+		if err != nil {
+			return false, err
+		}
+		data = a.injectBranding(r.Context(), data)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, err = w.Write(data)
+		return true, err
 	}
 	return false, nil
 }
@@ -416,9 +422,64 @@ func (a *App) serveEmbeddedSPA(w http.ResponseWriter, r *http.Request) (bool, er
 		}
 	}
 	if _, err := fs.Stat(a.frontendFS, "index.html"); err == nil {
-		return true, serveFSFile(w, r, a.frontendFS, "index.html")
+		data, err := fs.ReadFile(a.frontendFS, "index.html")
+		if err != nil {
+			return false, err
+		}
+		data = a.injectBranding(r.Context(), data)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, err = w.Write(data)
+		return true, err
 	}
 	return false, nil
+}
+
+// injectBranding replaces the <title> tag and __CPA_HELPER_LOGO_URL__ placeholder
+// in the given HTML with the product name and logo from the app configuration.
+// On any error it returns the original HTML unchanged.
+func (a *App) injectBranding(ctx context.Context, html []byte) []byte {
+	if a.db == nil {
+		return html
+	}
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return html
+	}
+
+	productName := cfg.ProductName
+	if productName == "" {
+		productName = "CPA-Helper"
+	}
+	logoURL := cfg.ProductLogo
+	if logoURL == "" {
+		logoURL = "/logo.png"
+	}
+
+	html = bytes.ReplaceAll(html, []byte("__CPA_HELPER_LOGO_URL__"), []byte(logoURL))
+	html = replaceTitleTag(html, productName)
+	return html
+}
+
+// replaceTitleTag replaces the content of the first <title>...</title> in html.
+func replaceTitleTag(html []byte, title string) []byte {
+	const openTag = "<title>"
+	const closeTag = "</title>"
+	start := bytes.Index(html, []byte(openTag))
+	if start == -1 {
+		return html
+	}
+	end := bytes.Index(html[start:], []byte(closeTag))
+	if end == -1 {
+		return html
+	}
+	end += start
+	var buf bytes.Buffer
+	buf.Write(html[:start])
+	buf.WriteString(openTag)
+	buf.WriteString(title)
+	buf.WriteString(closeTag)
+	buf.Write(html[end+len(closeTag):])
+	return buf.Bytes()
 }
 
 func cleanSPAPath(requestPath string) string {
