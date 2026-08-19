@@ -144,8 +144,40 @@ func TestInjectBrandingNilDB(t *testing.T) {
 	}
 }
 
+func TestInjectProductInfoScript(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		productName string
+		productLogo string
+		wantContain string
+	}{
+		{
+			name:        "injects script before </head>",
+			input:       `<html><head><title>CPA-Helper</title></head><body></body></html>`,
+			productName: "My Product",
+			productLogo: "/logo.png",
+			wantContain: `<script>window.__PRODUCT_INFO__={"product_name":"My Product","product_logo":"/logo.png"}</script></head>`,
+		},
+		{
+			name:        "no </head> tag returns unchanged",
+			input:       `<html><body></body></html>`,
+			productName: "My Product",
+			productLogo: "/logo.png",
+			wantContain: `<html><body></body></html>`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(injectProductInfoScript([]byte(tc.input), tc.productName, tc.productLogo))
+			if !strings.Contains(got, tc.wantContain) {
+				t.Fatalf("got %q, want it to contain %q", got, tc.wantContain)
+			}
+		})
+	}
+}
+
 func TestHandleSPAInjectsTitle(t *testing.T) {
-	// When db is nil the HTML is served as-is (no injection panic).
 	app := &App{frontendFS: fstest.MapFS{
 		"index.html": &fstest.MapFile{Data: []byte(`<html><head><title>CPA-Helper</title></head></html>`)},
 	}}
