@@ -1,7 +1,5 @@
 import { readonly, ref } from 'vue'
 
-import { apiClient } from '@/shared/api/apiClient'
-import type { ProductInfoResponse } from '@/shared/types/api'
 import { logoUrl as defaultLogoUrl } from '@/shared/utils/assets'
 
 const DEFAULT_PRODUCT_NAME = 'CPA-Helper'
@@ -13,13 +11,13 @@ function syncDocumentTitle(name: string): void {
   document.title = name
 }
 
-export async function loadProductInfo(): Promise<void> {
-  try {
-    const info = await apiClient.get<ProductInfoResponse>('/product-info')
-    productName.value = info.product_name.trim() || DEFAULT_PRODUCT_NAME
-    productLogo.value = info.product_logo.trim() || defaultLogoUrl
-  } catch {
-    // fall back to defaults on error
+export function loadProductInfo(): void {
+  const info = (window as Record<string, unknown>).__PRODUCT_INFO__ as
+    | { product_name?: string; product_logo?: string }
+    | undefined
+  if (info) {
+    productName.value = (typeof info.product_name === 'string' ? info.product_name.trim() : '') || DEFAULT_PRODUCT_NAME
+    productLogo.value = (typeof info.product_logo === 'string' ? info.product_logo.trim() : '') || defaultLogoUrl
   }
 }
 

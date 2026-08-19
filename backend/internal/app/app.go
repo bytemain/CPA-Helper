@@ -435,7 +435,9 @@ func (a *App) serveEmbeddedSPA(w http.ResponseWriter, r *http.Request) (bool, er
 }
 
 // injectBranding replaces the <title> tag and __CPA_HELPER_LOGO_URL__ placeholder
-// in the given HTML with the product name and logo from the app configuration.
+// in the given HTML with the product name and logo from the app configuration,
+// and injects a <script> block that exposes window.__PRODUCT_INFO__ so the
+// frontend can bootstrap without an extra HTTP round-trip.
 // On any error it returns the original HTML unchanged.
 func (a *App) injectBranding(ctx context.Context, html []byte) []byte {
 	if a.db == nil {
@@ -457,7 +459,33 @@ func (a *App) injectBranding(ctx context.Context, html []byte) []byte {
 
 	html = bytes.ReplaceAll(html, []byte("__CPA_HELPER_LOGO_URL__"), []byte(logoURL))
 	html = replaceTitleTag(html, productName)
+	html = injectProductInfoScript(html, productName, logoURL)
 	return html
+}
+
+// injectProductInfoScript injects a <script> block before </head> that sets
+// window.__PRODUCT_INFO__ = {product_name: "...", product_logo: "..."}.
+// Values are embedded as JSON so they are properly escaped.
+func injectProductInfoScript(html []byte, productName, productLogo string) []byte {
+	type productInfo struct {
+		ProductName string `json:"product_name"`
+		ProductLogo string `json:"product_logo"`
+	}
+	jsonBytes, err := json.Marshal(productInfo{ProductName: productName, ProductLogo: productLogo})
+	if err != nil {
+		return html
+	}
+	script := []byte("<script>window.__PRODUCT_INFO__=" + string(jsonBytes) + "</script>")
+	const headClose = "</head>"
+	idx := bytes.Index(html, []byte(headClose))
+	if idx == -1 {
+		return html
+	}
+	var buf bytes.Buffer
+	buf.Write(html[:idx])
+	buf.Write(script)
+	buf.Write(html[idx:])
+	return buf.Bytes()
 }
 
 // replaceTitleTag replaces the content of the first <title>...</title> in html.

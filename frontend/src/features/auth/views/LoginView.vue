@@ -6,7 +6,7 @@ import { NAlert, NButton, NCard, NForm, NFormItem, NInput, useMessage } from 'na
 import { getSetupState, login, setupFirstAdmin } from '@/features/auth/api/authApi'
 import { setCurrentUser } from '@/features/auth/state/currentUser'
 import { useI18n } from '@/shared/i18n'
-import { loadProductInfo, useProductInfo } from '@/shared/state/productInfo'
+import { useProductInfo } from '@/shared/state/productInfo'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,12 +30,9 @@ const submitText = computed(() => (setupRequired.value ? t('创建并登录', 'C
 
 onMounted(async () => {
   try {
-    await Promise.all([
-      loadProductInfo(),
-      getSetupState().then((state) => {
-        setupRequired.value = state.setup_required
-      }),
-    ])
+    await getSetupState().then((state) => {
+      setupRequired.value = state.setup_required
+    })
   } catch (error) {
     errorMessage.value = errorText(error, '初始化状态加载失败', 'Failed to load setup state')
   } finally {
