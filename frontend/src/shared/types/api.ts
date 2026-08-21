@@ -229,6 +229,9 @@ export interface CodexKeeperQuotaWindowUsage {
   unpriced_records: number
   stale: boolean
   window_source: string
+  window_elapsed_seconds?: number
+  window_elapsed_percent?: number
+  projected_cost_usd?: number
 }
 
 export interface CodexKeeperAccount {
