@@ -399,21 +399,6 @@ func isAllowedLogoDataURL(s string) bool {
 		strings.HasPrefix(s, "data:image/gif;base64,")
 }
 
-func (a *App) handleProductInfo(w http.ResponseWriter, r *http.Request) error {
-	if err := requireMethod(r, http.MethodGet); err != nil {
-		return err
-	}
-	cfg, err := a.loadConfig(r.Context())
-	if err != nil {
-		return err
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"product_name": cfg.ProductName,
-		"product_logo": cfg.ProductLogo,
-	})
-	return nil
-}
-
 func (a *App) handleCurrentModelRequestGuide(w http.ResponseWriter, r *http.Request) error {
 	if err := requireMethod(r, http.MethodGet); err != nil {
 		return err

@@ -54,11 +54,6 @@ export interface SettingsUpdatePayload {
   product_logo?: string
 }
 
-export interface ProductInfoResponse {
-  product_name: string
-  product_logo: string
-}
-
 export interface ModelRequestGuide {
   model_request_url: string
   openai_base_url: string

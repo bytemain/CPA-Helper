@@ -30,9 +30,8 @@ const submitText = computed(() => (setupRequired.value ? t('创建并登录', 'C
 
 onMounted(async () => {
   try {
-    await getSetupState().then((state) => {
-      setupRequired.value = state.setup_required
-    })
+    const state = await getSetupState()
+    setupRequired.value = state.setup_required
   } catch (error) {
     errorMessage.value = errorText(error, '初始化状态加载失败', 'Failed to load setup state')
   } finally {

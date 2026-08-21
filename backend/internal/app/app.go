@@ -257,7 +257,6 @@ func (a *App) Routes() http.Handler {
 	}))
 
 	mux.HandleFunc("/api/auth/", a.wrap(a.handleAuth))
-	mux.HandleFunc("/api/product-info", a.wrap(a.handleProductInfo))
 	mux.HandleFunc("/api/settings", a.wrap(a.handleSettings))
 	mux.HandleFunc("/api/collector/status", a.wrap(a.handleCollectorStatus))
 	mux.HandleFunc("/api/usage/", a.wrap(a.handleUsage))
@@ -434,10 +433,12 @@ func (a *App) serveEmbeddedSPA(w http.ResponseWriter, r *http.Request) (bool, er
 	return false, nil
 }
 
-// injectBranding replaces the <title> tag and __CPA_HELPER_LOGO_URL__ placeholder
-// in the given HTML with the product name and logo from the app configuration,
-// and injects a <script> block that exposes window.__PRODUCT_INFO__ so the
-// frontend can bootstrap without an extra HTTP round-trip.
+// injectBranding replaces the <title> tag in the given HTML with the product
+// name from the app configuration, and injects a <script> block that exposes
+// window.__PRODUCT_INFO__ so the frontend can bootstrap without an extra HTTP
+// round-trip. The favicon is applied by the frontend from __PRODUCT_INFO__,
+// because the vite build already substitutes the __CPA_HELPER_LOGO_URL__
+// placeholder in index.html at build time.
 // On any error it returns the original HTML unchanged.
 func (a *App) injectBranding(ctx context.Context, html []byte) []byte {
 	if a.db == nil {
@@ -457,7 +458,6 @@ func (a *App) injectBranding(ctx context.Context, html []byte) []byte {
 		logoURL = "/logo.png"
 	}
 
-	html = bytes.ReplaceAll(html, []byte("__CPA_HELPER_LOGO_URL__"), []byte(logoURL))
 	html = replaceTitleTag(html, productName)
 	html = injectProductInfoScript(html, productName, logoURL)
 	return html
