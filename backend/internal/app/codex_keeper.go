@@ -167,10 +167,6 @@ type keeperQuotaWindowUsageResponse struct {
 	ReasoningTokens  int     `json:"reasoning_tokens"`
 	TotalTokens      int     `json:"total_tokens"`
 	EstimatedCostUSD float64 `json:"estimated_cost_usd"`
-
-	ElapsedSeconds       int     `json:"window_elapsed_seconds"`
-	WindowElapsedPercent float64 `json:"window_elapsed_percent"`
-	ProjectedCostUSD     float64 `json:"projected_cost_usd"`
 	UnpricedRecords  int     `json:"unpriced_records"`
 	Stale            bool    `json:"stale"`
 	WindowSource     string  `json:"window_source"`
@@ -193,10 +189,6 @@ type keeperQuotaWindowUsage struct {
 	UnpricedRecords  int
 	Stale            bool
 	WindowSource     string
-
-	ElapsedSeconds       int
-	WindowElapsedPercent float64
-	ProjectedCostUSD     float64
 }
 
 type keeperQuotaWindowUsagePair struct {
@@ -1088,10 +1080,6 @@ func keeperQuotaWindowUsageResponseFrom(usage *keeperQuotaWindowUsage) *keeperQu
 		UnpricedRecords:  usage.UnpricedRecords,
 		Stale:            usage.Stale,
 		WindowSource:     usage.WindowSource,
-
-		ElapsedSeconds:       usage.ElapsedSeconds,
-		WindowElapsedPercent: usage.WindowElapsedPercent,
-		ProjectedCostUSD:     usage.ProjectedCostUSD,
 	}
 }
 
@@ -1234,39 +1222,7 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 			addRecordToKeeperQuotaWindowUsage(pair.Secondary, record, prices)
 		}
 	}
-	for _, pair := range usages {
-		finalizeKeeperQuotaWindowUsage(pair.Primary, now)
-		finalizeKeeperQuotaWindowUsage(pair.Secondary, now)
-	}
 	return usages, nil
-}
-
-// finalizeKeeperQuotaWindowUsage fills the window-progress and projection
-// fields once all records are aggregated. ProjectedCostUSD linearly
-// extrapolates the observed cost to the full window ("本窗口预计消费"):
-// a completed/stale window projects to its own total; a window with no
-// elapsed time projects to zero.
-func finalizeKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, now time.Time) {
-	if usage == nil || usage.WindowSeconds <= 0 {
-		return
-	}
-	elapsed := int(now.Sub(usage.WindowStart).Seconds())
-	if elapsed < 0 {
-		elapsed = 0
-	}
-	if elapsed > usage.WindowSeconds {
-		elapsed = usage.WindowSeconds
-	}
-	usage.ElapsedSeconds = elapsed
-	usage.WindowElapsedPercent = mathRound(float64(elapsed)/float64(usage.WindowSeconds)*100, 2)
-	switch {
-	case usage.Stale || elapsed >= usage.WindowSeconds:
-		usage.ProjectedCostUSD = usage.EstimatedCostUSD
-	case elapsed > 0:
-		usage.ProjectedCostUSD = mathRound(usage.EstimatedCostUSD*float64(usage.WindowSeconds)/float64(elapsed), 8)
-	default:
-		usage.ProjectedCostUSD = 0
-	}
 }
 
 func keeperQuotaWindowPairForAccount(account keeperAccount, now time.Time) keeperQuotaWindowUsagePair {

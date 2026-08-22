@@ -221,32 +221,6 @@ const filteredNormalAccounts = computed(() =>
 )
 const tableLoading = computed(() => isLoading.value)
 const enabledAccountCount = computed(() => accounts.value.filter((account) => !account.disabled).length)
-
-const longWindowProjectedCostUsd = computed(() => {
-  let total = 0
-  let covered = 0
-  for (const account of accounts.value) {
-    if (account.disabled) {
-      continue
-    }
-    const usage = isFreeQuotaWindowAccount(account.account_type)
-      ? account.primary_window_usage
-      : account.secondary_window_usage ?? account.primary_window_usage
-    if (!usage || usage.stale === true) {
-      continue
-    }
-    total += usage.projected_cost_usd ?? usage.estimated_cost_usd ?? 0
-    covered += 1
-  }
-  return { total, covered }
-})
-
-const projectedWindowCostText = computed(() => {
-  if (longWindowProjectedCostUsd.value.covered === 0) {
-    return t('-', '-')
-  }
-  return formatUsd(longWindowProjectedCostUsd.value.total)
-})
 const disabledAccountCount = computed(() => accounts.value.filter((account) => account.disabled).length)
 const hasDisabledAccounts = computed(() => disabledAccountCount.value > 0)
 const showDisabledSection = computed(
@@ -1011,14 +985,10 @@ function quotaWindowUsageText(item: QuotaWindowItem): string {
   if (!item.usage) {
     return t('本窗口暂无用量', 'No usage in this window')
   }
-  const base = t(
+  return t(
     `${formatInteger(item.usage.records)} 次 / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`,
     `${formatInteger(item.usage.records)} requests / ${formatCompact(item.usage.total_tokens)} Tokens / ${formatUsd(item.usage.estimated_cost_usd)}`,
   )
-  if (typeof item.usage.projected_cost_usd === 'number' && item.usage.projected_cost_usd > 0) {
-    return `${base} → ${t('预计', 'projected')} ${formatUsd(item.usage.projected_cost_usd)}`
-  }
-  return base
 }
 
 function quotaWindowUsageTags(item: QuotaWindowItem): QuotaUsageTag[] {
@@ -1026,15 +996,11 @@ function quotaWindowUsageTags(item: QuotaWindowItem): QuotaUsageTag[] {
     return [{ label: t('状态', 'Status'), value: t('需刷新', 'Needs refresh'), tone: 'stale' }]
   }
   const usage = item.usage
-  const tags: QuotaUsageTag[] = [
+  return [
     { label: t('请求', 'Requests'), value: formatInteger(usage?.records ?? 0) },
     { label: 'Tokens', value: formatCompact(usage?.total_tokens ?? 0) },
     { label: t('费用', 'Cost'), value: formatUsd(usage?.estimated_cost_usd ?? 0) },
   ]
-  if (typeof usage?.projected_cost_usd === 'number' && usage.projected_cost_usd > 0) {
-    tags.push({ label: t('预计本窗口', 'Projected'), value: formatUsd(usage.projected_cost_usd) })
-  }
-  return tags
 }
 
 function quotaWindowResetText(item: QuotaWindowItem): string {
@@ -1961,21 +1927,6 @@ onBeforeUnmount(() => {
         <div class="metric-value">{{ formatInteger(unauthorizedErrorAccountCount) }}</div>
         <div class="metric-footnote">HTTP 401</div>
       </button>
-      <div class="metric-card">
-        <div class="metric-icon" aria-hidden="true">
-          <Activity :size="20" :stroke-width="2.2" />
-        </div>
-        <div class="metric-label">{{ t('本窗口预计消费', 'Projected Window Cost') }}</div>
-        <div class="metric-value">{{ projectedWindowCostText }}</div>
-        <div class="metric-footnote">
-          {{
-            t(
-              `按当前速率外推 ${longWindowProjectedCostUsd.covered} 个账号的长窗口（牌价折算）`,
-              `Linear extrapolation over ${longWindowProjectedCostUsd.covered} accounts' long windows (list price)`,
-            )
-          }}
-        </div>
-      </div>
       <button
         type="button"
         class="metric-card metric-action is-purple"
