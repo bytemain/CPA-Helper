@@ -9,6 +9,7 @@ import {
   Layers3,
   ShieldCheck,
   Timer,
+  Zap,
 } from 'lucide-vue-next'
 
 import { getUsageOverview } from '@/features/usage/api/usageApi'
@@ -741,6 +742,16 @@ const rateSummary = computed(() =>
   activeQuickRange.value === 'today' && realtimeSummary.value ? realtimeSummary.value : summary.value,
 )
 
+const cacheHitRate = computed(() => {
+  const currentSummary = summary.value
+  const inputTokens = currentSummary?.input_tokens ?? 0
+  const hitTokens = currentSummary?.cache_hit_tokens ?? 0
+  if (inputTokens <= 0 || hitTokens <= 0) {
+    return 0
+  }
+  return Math.min(1, hitTokens / inputTokens)
+})
+
 const requestsPerMinute = computed(() => {
   const currentSummary = rateSummary.value
   return (currentSummary?.total_records ?? 0) / summaryDurationMinutes(currentSummary)
@@ -821,6 +832,21 @@ const metricCards = computed<MetricCardConfig[]>(() => {
         )}`,
         `Input ${formatCompact(currentSummary?.input_tokens ?? 0)} / output ${formatCompact(
           currentSummary?.output_tokens ?? 0,
+        )}`,
+      ),
+    },
+    {
+      key: 'cache_hit',
+      label: t('缓存命中', 'Cache hit'),
+      value: formatPercent(cacheHitRate.value),
+      icon: Zap,
+      tone: 'purple',
+      footnote: t(
+        `缓存 ${formatCompact(currentSummary?.cache_hit_tokens ?? 0)} / 输入 ${formatCompact(
+          currentSummary?.input_tokens ?? 0,
+        )}`,
+        `Cached ${formatCompact(currentSummary?.cache_hit_tokens ?? 0)} / input ${formatCompact(
+          currentSummary?.input_tokens ?? 0,
         )}`,
       ),
     },
@@ -1761,6 +1787,9 @@ onBeforeUnmount(() => {
 }
 
 .dashboard-metric-grid {
+  /* 7 cards since the cache-hit metric: let them share one row on wide
+     screens and wrap naturally below instead of the global 6-column grid. */
+  grid-template-columns: repeat(auto-fit, minmax(138px, 1fr));
   gap: 8px;
 }
 
