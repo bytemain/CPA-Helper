@@ -366,16 +366,15 @@ func (r *KeeperRunner) StartAccounts(authNames []string) error {
 // finishes, so a caller (e.g. reset-quota) can guarantee the fresh state is
 // written before it responds. Returns conflictError when another run holds a
 // conflicting mode; the caller decides whether that is fatal.
-func (r *KeeperRunner) RunAccountsSync(authNames []string) error {
+func (r *KeeperRunner) RunAccountsSync(authNames []string) (keeperStats, error) {
 	names, err := normalizeKeeperAuthNames(authNames)
 	if err != nil {
-		return err
+		return keeperStats{}, err
 	}
 	if !r.markRunning("accounts") {
-		return conflictError("Codex Keeper 正在运行")
+		return keeperStats{}, conflictError("Codex Keeper 正在运行")
 	}
-	r.runAccounts("accounts", names)
-	return nil
+	return r.runAccounts("accounts", names)
 }
 
 func (r *KeeperRunner) StartDaemon() error {
@@ -711,7 +710,7 @@ func (r *KeeperRunner) run(mode string) {
 	r.runAccounts(mode, nil)
 }
 
-func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
+func (r *KeeperRunner) runAccounts(mode string, authNames []string) (keeperStats, error) {
 	options := keeperRunOptionsForMode(mode, authNames)
 	options.TryLockAuthName = r.tryLockAuthName
 	options.UnlockAuthName = r.unlockAuthName
@@ -745,6 +744,7 @@ func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
 	if strings.TrimSpace(logMessage) != "" {
 		r.log(logMessage)
 	}
+	return stats, err
 }
 
 func (r *KeeperRunner) log(message string) {
@@ -798,6 +798,21 @@ func (a *App) auditKeeperOp(op, authName string, kv ...any) {
 	}
 	args := append([]any{"op", op, "account", authName}, kv...)
 	slog.Info("codex_keeper op", args...)
+}
+
+// keeperSafeReason maps an error to a stable, non-sensitive reason code for audit
+// logs. Known AppErrors expose their machine code (e.g. not_found, conflict,
+// validation_error); anything else collapses to "internal_error" so a raw error
+// message (which could carry a URL, token, or upstream detail) never reaches the log.
+func keeperSafeReason(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var appErr *AppError
+	if errors.As(err, &appErr) && appErr.Code != "" {
+		return appErr.Code
+	}
+	return "internal_error"
 }
 
 type keeperLogFile struct {
@@ -989,6 +1004,7 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		}
 		result, err := a.resetKeeperQuota(r.Context(), name)
 		if err != nil {
+			a.auditKeeperOp("reset-quota", name, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		// Immediately re-inspect just this account so its post-reset usage / window /
@@ -998,10 +1014,18 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		// snapshot. This goes through the runner (RunAccountsSync) so it holds the
 		// global "accounts" mode and the per-auth lock — it never runs concurrently
 		// with a background inspection of the same account. Best-effort: the reset
-		// already succeeded, so a conflict or inspection error is logged (the running
-		// background run will refresh the account) but does not fail the response.
-		if ierr := a.keeper.RunAccountsSync([]string{name}); ierr != nil {
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", ierr.Error())
+		// already succeeded, so the refresh outcome is audited (skipped/error/ok) but
+		// never fails the response — a conflicting background run will refresh it.
+		stats, ierr := a.keeper.RunAccountsSync([]string{name})
+		switch {
+		case ierr != nil:
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", keeperSafeReason(ierr))
+		case stats.Skipped > 0:
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", "account_busy")
+		case stats.NetworkError > 0:
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "error", "reason", "network_error")
+		default:
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "ok")
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
 		return nil
@@ -1079,6 +1103,11 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		}
 		disabled := parts[2] == "disable"
 		if err := a.setKeeperAccountDisabled(r.Context(), authName, disabled); err != nil {
+			op := "enable"
+			if disabled {
+				op = "disable"
+			}
+			a.auditKeeperOp(op, authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		if disabled {
@@ -1093,6 +1122,7 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return validationError("账号名称无效")
 		}
 		if err := a.deleteKeeperAccount(r.Context(), authName); err != nil {
+			a.auditKeeperOp("delete", authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

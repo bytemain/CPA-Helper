@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -2440,7 +2441,7 @@ func TestKeeperResetInspectHonorsPerAuthLock(t *testing.T) {
 	// The reset-triggered sync inspect must skip the locked account: "accounts" does
 	// not conflict with "daemon" at the mode level, so markRunning succeeds and the
 	// per-auth lock is the guard that must prevent a concurrent inspection.
-	if err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
+	if _, err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
 		t.Fatalf("RunAccountsSync returned %v; expected it to run and skip the locked account", err)
 	}
 	mu.Lock()
@@ -2452,7 +2453,7 @@ func TestKeeperResetInspectHonorsPerAuthLock(t *testing.T) {
 
 	// Once the background run releases the lock, a fresh sync inspect proceeds.
 	app.keeper.unlockAuthName(authName)
-	if err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
+	if _, err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
 		t.Fatalf("RunAccountsSync after unlock: %v", err)
 	}
 	mu.Lock()
@@ -2475,7 +2476,32 @@ func TestRunAccountsSyncRejectsConflictingMode(t *testing.T) {
 	if !app.keeper.markRunning("accounts") {
 		t.Fatal("could not mark accounts running")
 	}
-	if err := app.keeper.RunAccountsSync([]string{"whatever.json"}); err == nil {
+	if _, err := app.keeper.RunAccountsSync([]string{"whatever.json"}); err == nil {
 		t.Fatal("expected conflictError when an accounts run is already active")
+	}
+}
+
+// TestKeeperSafeReason proves audit reasons are stable machine codes and never
+// leak a raw error message (which could carry a URL/token/upstream detail).
+func TestKeeperSafeReason(t *testing.T) {
+	if got := keeperSafeReason(nil); got != "ok" {
+		t.Fatalf("nil -> %q, want ok", got)
+	}
+	if got := keeperSafeReason(validationError("auth_index missing")); got != "validation_error" {
+		t.Fatalf("validationError -> %q, want validation_error", got)
+	}
+	if got := keeperSafeReason(notFoundError("gone")); got != "not_found" {
+		t.Fatalf("notFoundError -> %q, want not_found", got)
+	}
+	if got := keeperSafeReason(conflictError("busy")); got != "conflict" {
+		t.Fatalf("conflictError -> %q, want conflict", got)
+	}
+	raw := errors.New("dial https://cpa.internal:8317 failed: token=sk-secret")
+	got := keeperSafeReason(raw)
+	if got != "internal_error" {
+		t.Fatalf("opaque error -> %q, want internal_error", got)
+	}
+	if strings.Contains(got, "token") || strings.Contains(got, "cpa.internal") || strings.Contains(got, "sk-secret") {
+		t.Fatalf("safe reason leaked raw error content: %q", got)
 	}
 }
