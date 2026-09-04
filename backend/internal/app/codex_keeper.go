@@ -67,6 +67,10 @@ type keeperStats struct {
 	// fetch failed this run (snapshot preserved, health unchanged). Not persisted to
 	// the runs table; used to audit a post-reset refresh as partial.
 	ResetCreditsUnavailable int `json:"reset_credits_unavailable"`
+	// StateWriteError counts accounts whose state write-back to the DB failed this
+	// run. The inspection may have looked healthy, but nothing was persisted — so a
+	// post-reset refresh must be audited as error, not ok.
+	StateWriteError int `json:"state_write_error"`
 }
 
 type keeperStatusResponse struct {
@@ -301,6 +305,9 @@ type keeperAccountResult struct {
 	// ResetCreditsUnavailable is set when the account is healthy but its reset-credit
 	// fetch failed, so the snapshot was not refreshed this inspection.
 	ResetCreditsUnavailable bool
+	// StateWriteFailed is set when persisting this result to the DB failed, so the
+	// inspection did not actually update the stored state.
+	StateWriteFailed bool
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -841,6 +848,10 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 			return "skipped", "conflict"
 		}
 		return "error", reason
+	case stats.StateWriteError > 0:
+		// The inspection may have looked healthy, but the state write-back to the DB
+		// failed — nothing was persisted, so this is never a successful refresh.
+		return "error", "state_write_error"
 	case stats.NetworkError > 0:
 		return "error", "network_error"
 	case stats.StatusDisabled > 0:
@@ -2549,13 +2560,23 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		name = "unknown"
 	}
 	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now}
+	// persistState writes the result to the DB and, if that fails, records the
+	// failure on the result (and logs it) rather than swallowing the error — so a
+	// state that never reached the DB is not later reported as a healthy refresh.
+	persistState := func(r keeperAccountResult) keeperAccountResult {
+		if err := a.upsertKeeperState(ctx, r); err != nil {
+			logFn(r.Name + ": 状态写回失败：" + err.Error())
+			r.StateWriteFailed = true
+		}
+		return r
+	}
 	detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, name)
 	if err != nil {
 		message := "读取 auth file 详情失败：" + err.Error()
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + message)
 		return result
 	}
@@ -2564,7 +2585,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	merged := mergeKeeperObjects(authInfo, detail)
@@ -2584,7 +2605,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	if disabled && !manualRefresh && !recoverableUnauthorizedDisabled {
 		result.Result = "disabled"
 		a.preserveKeeperBadCredentialDiagnosis(ctx, &result)
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	if keeperString(merged["access_token"]) == "" {
@@ -2596,7 +2617,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 					message = "禁用坏凭证失败：" + err.Error()
 					result.LastError = &message
 					result.Result = "network_error"
-					_ = a.upsertKeeperState(ctx, result)
+					result = persistState(result)
 					return result
 				}
 			}
@@ -2611,7 +2632,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "status_disabled"
 		result.LastError = &message
 		result.LatestAction = &action
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2622,7 +2643,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + message)
 		return result
 	}
@@ -2639,7 +2660,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 					message = "禁用坏凭证失败：" + err.Error()
 					result.Result = "network_error"
 					result.LastError = &message
-					_ = a.upsertKeeperState(ctx, result)
+					result = persistState(result)
 					return result
 				}
 			}
@@ -2654,7 +2675,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "status_disabled"
 		result.LastError = &message
 		result.LatestAction = &action
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2666,7 +2687,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	usage := parseKeeperUsageInfo(usageResult.JSONData)
@@ -2705,7 +2726,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 				result.Result = "network_error"
 				result.LastError = &message
 				result.LatestAction = &message
-				_ = a.upsertKeeperState(ctx, result)
+				result = persistState(result)
 				logFn(name + ": " + message)
 				return result
 			}
@@ -2718,7 +2739,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.LatestAction = &action
 		result.ClearRestorePriority = true
 		result.LastError = nil
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2754,7 +2775,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.ClearRestorePriority = true
 	}
 	result.LastError = nil
-	_ = a.upsertKeeperState(ctx, result)
+	result = persistState(result)
 	return result
 }
 
@@ -2873,6 +2894,9 @@ func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {
 	if result.ResetCreditsUnavailable {
 		stats.ResetCreditsUnavailable++
 	}
+	if result.StateWriteFailed {
+		stats.StateWriteError++
+	}
 }
 
 func (stats *keeperStats) add(delta keeperStats) {
@@ -2885,6 +2909,7 @@ func (stats *keeperStats) add(delta keeperStats) {
 	stats.Skipped += delta.Skipped
 	stats.NetworkError += delta.NetworkError
 	stats.ResetCreditsUnavailable += delta.ResetCreditsUnavailable
+	stats.StateWriteError += delta.StateWriteError
 }
 
 func (stats *keeperStats) mergeCachedState(state keeperAuthState) {

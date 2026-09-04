@@ -2560,6 +2560,7 @@ func TestKeeperRefreshAuditOutcome(t *testing.T) {
 		{"opaque run error", keeperStats{}, errors.New("dial cpa.internal token=sk"), "error", "internal_error"},
 		{"network error", keeperStats{Total: 1, NetworkError: 1}, nil, "error", "network_error"},
 		{"status disabled (bad creds)", keeperStats{Total: 1, StatusDisabled: 1}, nil, "error", "status_disabled"},
+		{"healthy but state write failed", keeperStats{Total: 1, Healthy: 1, StateWriteError: 1}, nil, "error", "state_write_error"},
 		{"per-auth lock skip", keeperStats{Total: 1, Skipped: 1}, nil, "skipped", "account_busy"},
 		{"vanished target not inspected", keeperStats{Total: 0}, nil, "skipped", "not_inspected"},
 		{"inspected ok", keeperStats{Total: 1, Healthy: 1}, nil, "ok", ""},
@@ -2649,11 +2650,100 @@ func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
 // (e.g. ResetCreditsUnavailable) is not silently dropped by the generalized
 // aggregation. Every field is given a distinct value and must sum.
 func TestKeeperStatsAddSumsEveryField(t *testing.T) {
-	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9}
-	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90}
+	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9, StateWriteError: 11}
+	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90, StateWriteError: 110}
 	base.add(delta)
-	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99}
+	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99, StateWriteError: 121}
 	if base != want {
 		t.Fatalf("add sum = %+v, want %+v", base, want)
+	}
+}
+
+// TestKeeperResetInspectStateWriteFailure proves a DB write-back failure is not
+// swallowed: with a BEFORE UPDATE trigger aborting the upsert, the account still
+// inspects healthy, but the run reports StateWriteError, the stored snapshot is
+// unchanged, and the audit outcome is error/state_write_error (never ok).
+func TestKeeperResetInspectStateWriteFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "writefail.json"
+	credit := map[string]any{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": "2026-09-21T00:08:46.146320Z"}
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-wf",
+				"email": "wf@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 1, "credits": []map[string]any{credit}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	// First inspection creates the row (INSERT, before the trigger exists).
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+	before, err := app.getKeeperState(context.Background(), authName)
+	if err != nil {
+		t.Fatalf("get before: %v", err)
+	}
+
+	// Make every subsequent UPDATE fail, as the review probe did.
+	if _, err := app.db.ExecContext(context.Background(),
+		`CREATE TRIGGER block_keeper_update BEFORE UPDATE ON codex_keeper_auth_states BEGIN SELECT RAISE(ABORT, 'blocked'); END;`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	// Second inspection: usage/reset-credits succeed, but the upsert (now an UPDATE)
+	// aborts. The failure must surface, not be swallowed.
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("second inspect: %v", err)
+	}
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount < 1 {
+		t.Fatalf("expected a healthy-class outcome, stats=%+v", stats)
+	}
+	if stats.StateWriteError != 1 {
+		t.Fatalf("StateWriteError = %d, want 1 (write-back failure must be recorded)", stats.StateWriteError)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "state_write_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, state_write_error)", result, reason)
+	}
+
+	// The stored snapshot must be unchanged (the aborted UPDATE wrote nothing).
+	after, err := app.getKeeperState(context.Background(), authName)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if before.LastCheckedAt == nil || after.LastCheckedAt == nil || !before.LastCheckedAt.Equal(*after.LastCheckedAt) {
+		t.Fatalf("last_checked_at changed despite a failed write: before=%v after=%v", before.LastCheckedAt, after.LastCheckedAt)
 	}
 }
