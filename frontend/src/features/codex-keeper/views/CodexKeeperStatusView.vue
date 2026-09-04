@@ -1299,7 +1299,10 @@ function toggleRefreshAccountSelection(account: CodexKeeperAccount) {
 }
 
 function selectAllFilteredRefreshAccounts() {
-  selectedRefreshAccountNames.value = filteredAccountNames.value
+  // Rows with any in-flight action (incl. reset-quota) stay out of bulk selection.
+  selectedRefreshAccountNames.value = filteredAccounts.value
+    .filter((account) => !isRowActing(account))
+    .map((account) => account.name)
 }
 
 function handleAccountCardClick(account: CodexKeeperAccount) {
@@ -1351,7 +1354,11 @@ function openFilteredUnauthorizedDisabledBulkDeleteDialog() {
 }
 
 async function submitBulkDelete() {
-  const authNames = selectedDisabledAccountNames.value
+  // Same row-level fence as bulk refresh: never delete a row mid-action.
+  const authNames = selectedDisabledAccountNames.value.filter((name) => {
+    const account = accounts.value.find((entry) => entry.name === name)
+    return account === undefined || !isRowActing(account)
+  })
   if (authNames.length === 0) {
     return
   }
@@ -1587,17 +1594,17 @@ async function refreshAccounts(
   rawNames: string[],
   options: { closeDetail?: boolean; clearSelection?: boolean } = {},
 ) {
-  const authNames = uniqueAccountNames(rawNames)
-  if (authNames.length === 0) {
-    return
-  }
-  const refreshKeys = authNames
+  // Resolve targets and drop any row that already has an in-flight action
+  // (toggle/priority/delete/refresh/reset-quota) so bulk and programmatic
+  // refreshes respect the same row-level fence as the per-row buttons.
+  const targets = uniqueAccountNames(rawNames)
     .map((name) => accounts.value.find((account) => account.name === name))
-    .filter((account): account is CodexKeeperAccount => account !== undefined)
-    .map((account) => accountActionKey(account, 'refresh'))
-  if (refreshKeys.some((key) => actingActions.value.has(key)) || isBulkRefreshing.value) {
+    .filter((account): account is CodexKeeperAccount => account !== undefined && !isRowActing(account))
+  if (targets.length === 0 || isBulkRefreshing.value) {
     return
   }
+  const authNames = targets.map((account) => account.name)
+  const refreshKeys = targets.map((account) => accountActionKey(account, 'refresh'))
   const nextActions = new Set(actingActions.value)
   refreshKeys.forEach((key) => nextActions.add(key))
   actingActions.value = nextActions
