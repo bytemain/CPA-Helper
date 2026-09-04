@@ -99,6 +99,8 @@ func TestKeeperQuotaReset(t *testing.T) {
 				_, _ = w.Write([]byte(`{}`))
 			case "wrong-index":
 				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": "someone-else", "models": []string{}})
+			case "padded-index":
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": "  " + payload.AuthIndex + "  ", "models": []string{}})
 			case "bad-status":
 				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "auth_index": payload.AuthIndex})
 			default:
@@ -186,7 +188,7 @@ func TestKeeperQuotaReset(t *testing.T) {
 	// deceptive 2xx whose body lacks status=ok for our exact auth_index) must
 	// surface an error and must NOT increment the counter.
 	baseline := accountsResetCount(t, handler, cookies)
-	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status"} {
+	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status", "padded-index"} {
 		mu.Lock()
 		resetMode = mode
 		mu.Unlock()

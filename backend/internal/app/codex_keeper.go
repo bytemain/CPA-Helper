@@ -2953,8 +2953,10 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 		Status    string `json:"status"`
 		AuthIndex string `json:"auth_index"`
 	}
+	// authIndex was already trimmed before the request; require CPA to echo it
+	// exactly (no lenient trimming of the response) to honor the exact-match contract.
 	if err := json.Unmarshal(payload, &cpaResult); err != nil ||
-		cpaResult.Status != "ok" || strings.TrimSpace(cpaResult.AuthIndex) != authIndex {
+		cpaResult.Status != "ok" || cpaResult.AuthIndex != authIndex {
 		return keeperQuotaResetResult{}, validationError("CLIProxyAPI 未确认重置成功（响应缺少 status=ok 或 auth_index 不匹配）")
 	}
 	now := dbTime(time.Now())
