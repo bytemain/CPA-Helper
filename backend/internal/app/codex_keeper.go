@@ -762,6 +762,24 @@ func formatKeeperLogLine(timestamp time.Time, message string) string {
 	return strings.TrimSuffix(output.String(), "\n")
 }
 
+// auditKeeperOp records a successful single-account operation (reset-quota, enable,
+// disable, delete, …) to both the Keeper run log (UI + rotating log file) and the
+// process log (journalctl). CPA-Helper previously logged only on error/panic, so
+// HTTP-200 mutations left no per-account audit trail; this closes that gap for
+// troubleshooting and reconciliation. kv are alternating key/value pairs.
+func (a *App) auditKeeperOp(op, authName string, kv ...any) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] %s", op, authName)
+	for i := 0; i+1 < len(kv); i += 2 {
+		fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1])
+	}
+	if a.keeper != nil {
+		a.keeper.log(b.String())
+	}
+	args := append([]any{"op", op, "account", authName}, kv...)
+	slog.Info("codex_keeper op", args...)
+}
+
 type keeperLogFile struct {
 	path string
 	date time.Time
@@ -945,12 +963,22 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		if strings.TrimSpace(payload.AuthName) == "" {
+		name := strings.TrimSpace(payload.AuthName)
+		if name == "" {
 			return validationError("auth_name 不能为空")
 		}
-		result, err := a.resetKeeperQuota(r.Context(), strings.TrimSpace(payload.AuthName))
+		result, err := a.resetKeeperQuota(r.Context(), name)
 		if err != nil {
 			return err
+		}
+		// Immediately re-inspect just this account so its post-reset usage / window /
+		// reset-credit state is refreshed in the DB (a reset consumes a credit and
+		// clears the cooldown). The frontend reloads accounts right after a successful
+		// reset, so it then shows the fresh state instead of the stale pre-reset
+		// snapshot. Best-effort: the reset already succeeded, so an inspection error is
+		// logged but does not fail the response.
+		if _, _, ierr := a.executeKeeperRunForAccounts(r.Context(), "accounts", []string{name}, a.keeper.log); ierr != nil {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "error", "error", ierr.Error())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
 		return nil
@@ -3250,6 +3278,7 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	if err := a.db.QueryRowContext(ctx, `SELECT reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets WHERE auth_name = ?`, authName).Scan(&count, &lastAt); err != nil {
 		return keeperQuotaResetResult{}, err
 	}
+	a.auditKeeperOp("reset-quota", authName, "result", "ok", "reset_count", count, "auth_index", authIndex)
 	return keeperQuotaResetResult{
 		Name:             authName,
 		QuotaResetCount:  count,
@@ -3460,7 +3489,15 @@ func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, dis
 		    last_checked_at = ?, last_healthy_at = COALESCE(?, last_healthy_at), updated_at = ?
 		WHERE auth_name = ?
 	`, disabled, disabled, disabled, disabled, disabled, disabled, checkedAt, lastHealthy, now, state.Name)
-	return err
+	if err != nil {
+		return err
+	}
+	op := "enable"
+	if disabled {
+		op = "disable"
+	}
+	a.auditKeeperOp(op, authName, "result", "ok")
+	return nil
 }
 
 func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
@@ -3478,8 +3515,11 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName)
-	return err
+	if _, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName); err != nil {
+		return err
+	}
+	a.auditKeeperOp("delete", authName, "result", "ok")
+	return nil
 }
 
 func (a *App) bulkDeleteKeeperAccounts(w http.ResponseWriter, r *http.Request) error {
