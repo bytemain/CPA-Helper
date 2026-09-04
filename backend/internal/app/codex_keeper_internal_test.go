@@ -2505,3 +2505,33 @@ func TestKeeperSafeReason(t *testing.T) {
 		t.Fatalf("safe reason leaked raw error content: %q", got)
 	}
 }
+
+// TestKeeperRefreshAuditOutcome pins the post-reset refresh audit classification so
+// the reconciliation log never misreports: a mode conflict is skipped (not error),
+// a real run error is error, a vanished target (Total==0) is skipped/not_inspected
+// (not ok), and only a genuine inspection is ok.
+func TestKeeperRefreshAuditOutcome(t *testing.T) {
+	cases := []struct {
+		name       string
+		stats      keeperStats
+		err        error
+		wantResult string
+		wantReason string
+	}{
+		{"conflict is skipped", keeperStats{}, conflictError("busy"), "skipped", "conflict"},
+		{"validation is error", keeperStats{}, validationError("bad"), "error", "validation_error"},
+		{"opaque run error", keeperStats{}, errors.New("dial cpa.internal token=sk"), "error", "internal_error"},
+		{"network error", keeperStats{Total: 1, NetworkError: 1}, nil, "error", "network_error"},
+		{"per-auth lock skip", keeperStats{Total: 1, Skipped: 1}, nil, "skipped", "account_busy"},
+		{"vanished target not inspected", keeperStats{Total: 0}, nil, "skipped", "not_inspected"},
+		{"inspected ok", keeperStats{Total: 1, Healthy: 1}, nil, "ok", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, reason := keeperRefreshAuditOutcome(tc.stats, tc.err)
+			if result != tc.wantResult || reason != tc.wantReason {
+				t.Fatalf("got (%q,%q), want (%q,%q)", result, reason, tc.wantResult, tc.wantReason)
+			}
+		})
+	}
+}

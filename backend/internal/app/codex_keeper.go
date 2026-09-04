@@ -815,6 +815,35 @@ func keeperSafeReason(err error) string {
 	return "internal_error"
 }
 
+// keeperRefreshAuditOutcome classifies the result of the post-reset single-account
+// re-inspection for the audit log, so the trail never misreports a refresh:
+//   - a mode conflict (a background run holds "accounts") is skipped, not an error —
+//     that run will refresh the account;
+//   - any other run error (auth-file list transport/parse, normalize) is a real error;
+//   - a network error during the inspect is an error;
+//   - a per-auth lock skip is skipped/account_busy;
+//   - Total==0 means the account was absent from the remote list, so nothing was
+//     inspected — skipped/not_inspected, NOT ok;
+//   - otherwise the account was inspected and written: ok.
+func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, reason string) {
+	switch {
+	case err != nil:
+		reason = keeperSafeReason(err)
+		if reason == "conflict" {
+			return "skipped", "conflict"
+		}
+		return "error", reason
+	case stats.NetworkError > 0:
+		return "error", "network_error"
+	case stats.Skipped > 0:
+		return "skipped", "account_busy"
+	case stats.Total == 0:
+		return "skipped", "not_inspected"
+	default:
+		return "ok", ""
+	}
+}
+
 type keeperLogFile struct {
 	path string
 	date time.Time
@@ -1017,15 +1046,10 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		// already succeeded, so the refresh outcome is audited (skipped/error/ok) but
 		// never fails the response — a conflicting background run will refresh it.
 		stats, ierr := a.keeper.RunAccountsSync([]string{name})
-		switch {
-		case ierr != nil:
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", keeperSafeReason(ierr))
-		case stats.Skipped > 0:
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", "account_busy")
-		case stats.NetworkError > 0:
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "error", "reason", "network_error")
-		default:
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "ok")
+		if result, reason := keeperRefreshAuditOutcome(stats, ierr); reason != "" {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", result, "reason", reason)
+		} else {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", result)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
 		return nil
