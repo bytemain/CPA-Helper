@@ -23,6 +23,9 @@ import (
 
 const (
 	keeperUsageURL                 = "https://chatgpt.com/backend-api/wham/usage"
+	keeperResetCreditsURL          = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	keeperResetCreditType          = "codex_rate_limits"
+	keeperResetCreditStatus        = "available"
 	keeperLogFilePrefix            = "codex-keeper-"
 	keeperLogComponent             = "codex_keeper"
 	keeperLogRetainedFiles         = 3
@@ -115,26 +118,52 @@ type keeperQuotaResetRequest struct {
 }
 
 type keeperAccount struct {
-	Name                   string     `json:"name"`
-	Email                  *string    `json:"email"`
-	AuthIndex              *string    `json:"auth_index"`
-	AccountType            *string    `json:"account_type"`
-	Disabled               bool       `json:"disabled"`
-	Priority               *int       `json:"priority"`
-	PrimaryUsedPercent     *int       `json:"primary_used_percent"`
-	SecondaryUsedPercent   *int       `json:"secondary_used_percent"`
-	PrimaryResetAt         *time.Time `json:"primary_reset_at"`
-	SecondaryResetAt       *time.Time `json:"secondary_reset_at"`
-	PrimaryWindowSeconds   *int       `json:"primary_window_seconds"`
-	SecondaryWindowSeconds *int       `json:"secondary_window_seconds"`
-	QuotaThreshold         *int       `json:"quota_threshold"`
-	LastStatusCode         *int       `json:"last_status_code"`
-	QuotaResetCount        int        `json:"quota_reset_count"`
-	LastQuotaResetAt       *time.Time `json:"last_quota_reset_at"`
-	LastError              *string    `json:"last_error"`
-	LatestAction           *string    `json:"latest_action"`
-	LastCheckedAt          *time.Time `json:"last_checked_at"`
-	LastHealthyAt          *time.Time `json:"last_healthy_at"`
+	Name                   string              `json:"name"`
+	Email                  *string             `json:"email"`
+	AuthIndex              *string             `json:"auth_index"`
+	AccountType            *string             `json:"account_type"`
+	Disabled               bool                `json:"disabled"`
+	Priority               *int                `json:"priority"`
+	PrimaryUsedPercent     *int                `json:"primary_used_percent"`
+	SecondaryUsedPercent   *int                `json:"secondary_used_percent"`
+	PrimaryResetAt         *time.Time          `json:"primary_reset_at"`
+	SecondaryResetAt       *time.Time          `json:"secondary_reset_at"`
+	PrimaryWindowSeconds   *int                `json:"primary_window_seconds"`
+	SecondaryWindowSeconds *int                `json:"secondary_window_seconds"`
+	QuotaThreshold         *int                `json:"quota_threshold"`
+	LastStatusCode         *int                `json:"last_status_code"`
+	QuotaResetCount        int                 `json:"quota_reset_count"`
+	LastQuotaResetAt       *time.Time          `json:"last_quota_reset_at"`
+	ResetCreditCount       *int                `json:"reset_credit_count"`
+	ResetCredits           []keeperResetCredit `json:"reset_credits"`
+	LastError              *string             `json:"last_error"`
+	LatestAction           *string             `json:"latest_action"`
+	LastCheckedAt          *time.Time          `json:"last_checked_at"`
+	LastHealthyAt          *time.Time          `json:"last_healthy_at"`
+}
+
+// keeperResetCredit is the safe projection of one entry from
+// wham/rate-limit-reset-credits: only identity + status + timestamps are kept,
+// never the profile URL / description. ExpiresAt is nil for a never-expiring
+// credit (upstream expires_at: null), which must still be shown, not dropped.
+type keeperResetCredit struct {
+	ID        string     `json:"id"`
+	ResetType string     `json:"reset_type"`
+	Status    string     `json:"status"`
+	GrantedAt *time.Time `json:"granted_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Title     string     `json:"title,omitempty"`
+}
+
+// keeperResetCreditResponse is the wire shape of one reset credit. Timestamps are
+// formatted for the product timezone; ExpiresAt nil means "never expires".
+type keeperResetCreditResponse struct {
+	ID        string  `json:"id"`
+	ResetType string  `json:"reset_type"`
+	Status    string  `json:"status"`
+	GrantedAt *string `json:"granted_at"`
+	ExpiresAt *string `json:"expires_at"`
+	Title     string  `json:"title,omitempty"`
 }
 
 type keeperAccountResponse struct {
@@ -159,6 +188,8 @@ type keeperAccountResponse struct {
 	LastHealthyAt          *string                         `json:"last_healthy_at"`
 	QuotaResetCount        int                             `json:"quota_reset_count"`
 	LastQuotaResetAt       *string                         `json:"last_quota_reset_at"`
+	ResetCreditCount       *int                            `json:"reset_credit_count"`
+	ResetCredits           []keeperResetCreditResponse     `json:"reset_credits"`
 }
 
 type keeperQuotaWindowUsageResponse struct {
@@ -256,6 +287,12 @@ type keeperAccountResult struct {
 	LastError              *string
 	LatestAction           *string
 	CheckedAt              time.Time
+	// ResetCreditCount / ResetCredits are set only when a reset-credit fetch
+	// succeeds. Left nil (the failure/skip case) they preserve the previous
+	// snapshot in upsertKeeperState via COALESCE, so a failed fetch never wipes
+	// good data. A successful empty result carries a non-nil count of 0.
+	ResetCreditCount *int
+	ResetCredits     *string
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -1081,9 +1118,32 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 			LastHealthyAt:          apiDateTimePtr(account.LastHealthyAt),
 			QuotaResetCount:        account.QuotaResetCount,
 			LastQuotaResetAt:       apiDateTimePtr(account.LastQuotaResetAt),
+			ResetCreditCount:       account.ResetCreditCount,
+			ResetCredits:           keeperResetCreditResponses(account.ResetCredits),
 		})
 	}
 	return responses
+}
+
+// keeperResetCreditResponses formats persisted reset credits for the API, keeping
+// the stored expires_at-ascending order and emitting a nil ExpiresAt (never
+// expires) unchanged so the frontend can render "永不过期".
+func keeperResetCreditResponses(credits []keeperResetCredit) []keeperResetCreditResponse {
+	if len(credits) == 0 {
+		return nil
+	}
+	out := make([]keeperResetCreditResponse, 0, len(credits))
+	for _, credit := range credits {
+		out = append(out, keeperResetCreditResponse{
+			ID:        credit.ID,
+			ResetType: credit.ResetType,
+			Status:    credit.Status,
+			GrantedAt: apiDateTimePtr(credit.GrantedAt),
+			ExpiresAt: apiDateTimePtr(credit.ExpiresAt),
+			Title:     credit.Title,
+		})
+	}
+	return out
 }
 
 func keeperQuotaWindowUsageResponseFrom(usage *keeperQuotaWindowUsage) *keeperQuotaWindowUsageResponse {
@@ -2487,6 +2547,16 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.PrimaryWindowSeconds = usage.PrimaryWindowSeconds
 	result.SecondaryWindowSeconds = usage.SecondaryWindowSeconds
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
+	// Best-effort reset-credit snapshot. A failed/malformed fetch leaves both
+	// fields nil, so upsertKeeperState preserves the previous snapshot instead of
+	// wiping it; a successful empty result carries count 0 and an empty list.
+	if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
+		result.ResetCreditCount = &count
+		if encoded, err := json.Marshal(credits); err == nil {
+			payload := string(encoded)
+			result.ResetCredits = &payload
+		}
+	}
 	result.Result = "healthy"
 
 	if recoverableUnauthorizedDisabled {
@@ -2846,12 +2916,141 @@ func (a *App) checkKeeperUsage(ctx context.Context, cfg AppConfig, detail map[st
 	}
 }
 
+// fetchKeeperResetCredits pulls the account's reset-credit list from
+// wham/rate-limit-reset-credits through the same per-auth api-call egress used by
+// checkKeeperUsage. It is best-effort: any transport error, non-2xx inner status,
+// or malformed/incomplete body returns ok=false so the caller preserves the
+// previous snapshot rather than overwriting it. On success it returns the
+// authoritative available_count (never credits length, which upstream may
+// truncate) and the safe-projected, expires_at-ascending credit list.
+func (a *App) fetchKeeperResetCredits(ctx context.Context, cfg AppConfig, detail map[string]any) (int, []keeperResetCredit, bool) {
+	authIndex := keeperAuthIndex(detail)
+	header := map[string]string{
+		"Authorization": "Bearer $TOKEN$",
+		"Content-Type":  "application/json",
+		"User-Agent":    "codex_cli_rs/0.76.0",
+	}
+	if accountID := keeperString(detail["account_id"]); accountID != "" {
+		header["Chatgpt-Account-Id"] = accountID
+	}
+	body := map[string]any{
+		"auth_index": authIndex,
+		"method":     "GET",
+		"url":        keeperResetCreditsURL,
+		"header":     header,
+		"data":       "",
+	}
+	response, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/api-call", nil, body, time.Duration(cfg.CodexKeeper.UsageTimeoutSeconds)*time.Second)
+	if err != nil {
+		return 0, nil, false
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return 0, nil, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return 0, nil, false
+	}
+	statusCode := keeperIntPtr(raw["status_code"], raw["statusCode"])
+	if statusCode == nil || *statusCode < 200 || *statusCode >= 300 {
+		return 0, nil, false
+	}
+	return parseKeeperResetCredits(keeperBodyJSON(raw["body"]))
+}
+
+// parseKeeperResetCredits validates and projects a rate-limit-reset-credits body.
+// It requires a top-level integer available_count and a credits array; a missing
+// or malformed either fails (ok=false). Entries are kept only when
+// reset_type == codex_rate_limits, status == available, and is_supported_by_plan
+// is not explicitly false. expires_at may be null (never-expiring) — such entries
+// are kept and sorted last. Only id/reset_type/status/granted_at/expires_at/title
+// are projected; profile URL and description are dropped.
+func parseKeeperResetCredits(body map[string]any) (int, []keeperResetCredit, bool) {
+	if body == nil {
+		return 0, nil, false
+	}
+	count := keeperIntPtr(body["available_count"])
+	if count == nil {
+		return 0, nil, false
+	}
+	rawCredits, ok := body["credits"].([]any)
+	if !ok {
+		return 0, nil, false
+	}
+	credits := make([]keeperResetCredit, 0, len(rawCredits))
+	for _, item := range rawCredits {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if keeperString(entry["reset_type"]) != keeperResetCreditType {
+			continue
+		}
+		if keeperString(entry["status"]) != keeperResetCreditStatus {
+			continue
+		}
+		if v, present := entry["is_supported_by_plan"]; present && !keeperBool(v) {
+			continue
+		}
+		credits = append(credits, keeperResetCredit{
+			ID:        keeperString(entry["id"]),
+			ResetType: keeperString(entry["reset_type"]),
+			Status:    keeperString(entry["status"]),
+			GrantedAt: keeperParseRFC3339(entry["granted_at"]),
+			ExpiresAt: keeperParseRFC3339(entry["expires_at"]),
+			Title:     keeperString(entry["title"]),
+		})
+	}
+	sort.SliceStable(credits, func(i, j int) bool {
+		a, b := credits[i].ExpiresAt, credits[j].ExpiresAt
+		if a == nil && b == nil {
+			return false
+		}
+		if a == nil { // never-expiring sorts last
+			return false
+		}
+		if b == nil {
+			return true
+		}
+		return a.Before(*b)
+	})
+	return *count, credits, true
+}
+
+// parseStoredKeeperResetCredits decodes the reset_credits JSON snapshot column
+// back into projected credits, returning nil for NULL/empty/invalid JSON.
+func parseStoredKeeperResetCredits(value sql.NullString) []keeperResetCredit {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil
+	}
+	var credits []keeperResetCredit
+	if err := json.Unmarshal([]byte(value.String), &credits); err != nil {
+		return nil
+	}
+	return credits
+}
+
+// keeperParseRFC3339 parses an RFC3339 timestamp (with optional microseconds),
+// returning nil for null/missing/unparseable values.
+func keeperParseRFC3339(value any) *time.Time {
+	s := keeperString(value)
+	if s == "" {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil
+	}
+	return &parsed
+}
+
 func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
+		       reset_credit_count, CAST(reset_credits AS TEXT)
 		FROM codex_keeper_auth_states
 		ORDER BY COALESCE(email, ''), auth_name
 	`)
@@ -3036,7 +3235,8 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
+		       reset_credit_count, CAST(reset_credits AS TEXT)
 		FROM codex_keeper_auth_states WHERE auth_name = ?
 	`, name)
 	if err != nil {
@@ -3055,13 +3255,13 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
-	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt sql.NullString
-	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority sql.NullInt64
+	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits sql.NullString
+	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority, resetCreditCount sql.NullInt64
 	err := scanner.Scan(
 		&state.Name, &email, &authIndex, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
 		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
-		&createdAt, &updatedAt,
+		&createdAt, &updatedAt, &resetCreditCount, &resetCredits,
 	)
 	if err != nil {
 		return keeperAuthState{}, err
@@ -3083,6 +3283,8 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 	state.LastCheckedAt = timePtr(lastChecked)
 	state.LastHealthyAt = timePtr(lastHealthy)
 	state.RestorePriority = nullableInt(restorePriority)
+	state.ResetCreditCount = nullableInt(resetCreditCount)
+	state.ResetCredits = parseStoredKeeperResetCredits(resetCredits)
 	if parsed, ok := parseDBTime(createdAt.String); ok {
 		state.CreatedAt = parsed
 	}
@@ -3104,8 +3306,9 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			auth_name, email, auth_index, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
+			reset_credit_count, reset_credits,
 			last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			email = excluded.email,
 			auth_index = excluded.auth_index,
@@ -3127,10 +3330,12 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
+			reset_credit_count = COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count),
+			reset_credits = COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits),
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
 	return err
 }
 

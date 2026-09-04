@@ -1,9 +1,11 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,31 @@ import (
 	"testing"
 	"time"
 )
+
+// keeperTestIsResetCreditsCall reports whether an api-call proxies the
+// rate-limit-reset-credits endpoint. It peeks the body and restores it so the
+// handler can still decode the request afterward.
+func keeperTestIsResetCreditsCall(r *http.Request) bool {
+	if r.Body == nil {
+		return false
+	}
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		return false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	var payload struct {
+		URL string `json:"url"`
+	}
+	_ = json.Unmarshal(raw, &payload)
+	return strings.Contains(payload.URL, "rate-limit-reset-credits")
+}
+
+// keeperTestEmptyResetCreditsPayload is a valid, empty reset-credits api-call
+// response (available_count 0, no credits).
+func keeperTestEmptyResetCreditsPayload() map[string]any {
+	return map[string]any{"status_code": 200, "body": map[string]any{"available_count": 0, "credits": []any{}}}
+}
 
 func TestKeeperUsageTimeoutDefaultIsThirtyButExistingValueIsPreserved(t *testing.T) {
 	cfg, err := defaultConfig()
@@ -833,6 +860,10 @@ func TestAutomaticKeeperRunsRespectCacheButManualRefreshBypasses(t *testing.T) {
 				"access_token": "test-token",
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			if keeperTestIsResetCreditsCall(r) {
+				_ = json.NewEncoder(w).Encode(keeperTestEmptyResetCreditsPayload())
+				return
+			}
 			usageCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status_code": 200,
@@ -1339,6 +1370,10 @@ func TestKeeperAuthDetailRequestFailureCountsAsNetworkError(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
 			http.Error(w, "temporary management failure", http.StatusBadGateway)
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			if keeperTestIsResetCreditsCall(r) {
+				_ = json.NewEncoder(w).Encode(keeperTestEmptyResetCreditsPayload())
+				return
+			}
 			usageCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{}})
 		default:
@@ -1402,6 +1437,10 @@ func TestKeeperRunSkipsInFlightAuthBeforeProcessing(t *testing.T) {
 				"access_token": "test-token",
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			if keeperTestIsResetCreditsCall(r) {
+				_ = json.NewEncoder(w).Encode(keeperTestEmptyResetCreditsPayload())
+				return
+			}
 			usageCalls++
 			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{}})
 		default:
@@ -2004,9 +2043,14 @@ func newKeeperRecoveryTestCPA(t *testing.T, authDetails map[string]map[string]an
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			var payload struct {
 				AuthIndex string `json:"auth_index"`
+				URL       string `json:"url"`
 			}
 			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(keeperTestEmptyResetCreditsPayload())
 				return
 			}
 			cpa.mu.Lock()
