@@ -2884,6 +2884,7 @@ func (stats *keeperStats) add(delta keeperStats) {
 	stats.PriorityRestored += delta.PriorityRestored
 	stats.Skipped += delta.Skipped
 	stats.NetworkError += delta.NetworkError
+	stats.ResetCreditsUnavailable += delta.ResetCreditsUnavailable
 }
 
 func (stats *keeperStats) mergeCachedState(state keeperAuthState) {

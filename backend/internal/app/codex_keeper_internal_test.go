@@ -2644,3 +2644,16 @@ func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
 		t.Fatalf("audit outcome = (%q,%q), want (partial, reset_credits_unavailable)", result, reason)
 	}
 }
+
+// TestKeeperStatsAddSumsEveryField guards keeperStats.add so a newly added counter
+// (e.g. ResetCreditsUnavailable) is not silently dropped by the generalized
+// aggregation. Every field is given a distinct value and must sum.
+func TestKeeperStatsAddSumsEveryField(t *testing.T) {
+	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9}
+	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90}
+	base.add(delta)
+	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99}
+	if base != want {
+		t.Fatalf("add sum = %+v, want %+v", base, want)
+	}
+}
