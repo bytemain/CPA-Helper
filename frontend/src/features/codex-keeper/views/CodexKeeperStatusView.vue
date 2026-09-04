@@ -97,8 +97,8 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1454
-const normalTableScrollX = 1958
+const disabledTableScrollX = 1568
+const normalTableScrollX = 2072
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -979,6 +979,27 @@ function formatQuotaResetTime(value: string | null): string | null {
   }).format(date)
 }
 
+// formatQuotaResetCountdown renders a coarse "in N days / N hours" hint relative to now.
+function formatQuotaResetCountdown(value: string | null): string | null {
+  if (!value) {
+    return null
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return null
+  }
+  const diffMs = date.getTime() - Date.now()
+  if (diffMs <= 0) {
+    return t('已到期', 'due')
+  }
+  const days = Math.floor(diffMs / 86400000)
+  if (days >= 1) {
+    return t(`${days}天后`, `in ${days}d`)
+  }
+  const hours = Math.max(1, Math.floor(diffMs / 3600000))
+  return t(`${hours}小时后`, `in ${hours}h`)
+}
+
 function quotaText(account: CodexKeeperAccount): string {
   const items = quotaWindowItems(account)
   if (items.length === 0) {
@@ -1152,6 +1173,29 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
         ),
       ),
     ),
+  )
+}
+
+// renderQuotaResetScheduleCell lists each quota window's reset time and countdown
+// (the account's own OpenAI quota-reset schedule, populated by inspection).
+function renderQuotaResetScheduleCell(account: CodexKeeperAccount) {
+  const items = quotaWindowItems(account).filter((item) => item.resetAt)
+  if (items.length === 0) {
+    return '-'
+  }
+  return h(
+    'div',
+    { class: 'quota-reset-schedule-cell' },
+    items.map((item, index) => {
+      const resetTime = formatQuotaResetTime(item.resetAt)
+      const countdown = formatQuotaResetCountdown(item.resetAt)
+      return h('div', { class: 'quota-reset-schedule-item' }, [
+        h('span', { class: 'quota-reset-schedule-label' },
+          t(`第 ${index + 1} 次`, `#${index + 1}`)),
+        h('span', { class: 'quota-reset-schedule-time' }, resetTime ?? '-'),
+        countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, countdown) : null,
+      ])
+    }),
   )
 }
 
@@ -1708,10 +1752,10 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     render: (row) => renderQuotaUsageCell(row),
   },
   {
-    title: t('重置次数', 'Resets'),
-    key: 'quota_reset_count',
-    width: 96,
-    render: (row) => String(row.quota_reset_count ?? 0),
+    title: t('配额重置窗口', 'Quota Reset Windows'),
+    key: 'quota_reset_schedule',
+    width: 210,
+    render: (row) => renderQuotaResetScheduleCell(row),
   },
   {
     title: t('最近巡检', 'Last Inspection'),
@@ -3556,6 +3600,34 @@ onBeforeUnmount(() => {
   color: var(--cpa-text-muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-reset-schedule-cell) {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+:global(.quota-reset-schedule-item) {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+:global(.quota-reset-schedule-label) {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+}
+
+:global(.quota-reset-schedule-time) {
+  color: var(--cpa-text);
+}
+
+:global(.quota-reset-schedule-countdown) {
+  color: var(--cpa-text-muted);
+  font-size: 11px;
 }
 
 :global(.quota-window-usage) {
