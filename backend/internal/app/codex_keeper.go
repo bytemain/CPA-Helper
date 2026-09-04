@@ -63,6 +63,10 @@ type keeperStats struct {
 	PriorityRestored int `json:"priority_restored"`
 	Skipped          int `json:"skipped"`
 	NetworkError     int `json:"network_error"`
+	// ResetCreditsUnavailable counts otherwise-healthy accounts whose reset-credit
+	// fetch failed this run (snapshot preserved, health unchanged). Not persisted to
+	// the runs table; used to audit a post-reset refresh as partial.
+	ResetCreditsUnavailable int `json:"reset_credits_unavailable"`
 }
 
 type keeperStatusResponse struct {
@@ -294,6 +298,9 @@ type keeperAccountResult struct {
 	// good data. A successful empty result carries a non-nil count of 0.
 	ResetCreditCount *int
 	ResetCredits     *string
+	// ResetCreditsUnavailable is set when the account is healthy but its reset-credit
+	// fetch failed, so the snapshot was not refreshed this inspection.
+	ResetCreditsUnavailable bool
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -851,6 +858,11 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 	// this is simply "the one account completed".
 	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
 	if okCount > 0 && stats.Total == okCount {
+		// The account(s) inspected healthily, but if the reset-credit fetch itself
+		// failed the snapshot — the whole point of this refresh — was not updated.
+		if stats.ResetCreditsUnavailable > 0 {
+			return "partial", "reset_credits_unavailable"
+		}
 		return "ok", ""
 	}
 	return "skipped", "not_inspected"
@@ -2675,6 +2687,13 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 			payload := string(encoded)
 			result.ResetCredits = &payload
 		}
+	} else {
+		// The usage check succeeded (account is healthy), but the reset-credit fetch
+		// itself failed (inner 401/500, malformed, transport). The snapshot is
+		// preserved (best-effort) and account health is unchanged, but the reset
+		// credits were NOT refreshed — flag it so a post-reset refresh is audited as
+		// partial rather than falsely reported ok.
+		result.ResetCreditsUnavailable = true
 	}
 	result.Result = "healthy"
 
@@ -2850,6 +2869,9 @@ func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {
 		stats.NetworkError++
 	default:
 		stats.Skipped++
+	}
+	if result.ResetCreditsUnavailable {
+		stats.ResetCreditsUnavailable++
 	}
 }
 

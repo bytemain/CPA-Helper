@@ -2563,6 +2563,7 @@ func TestKeeperRefreshAuditOutcome(t *testing.T) {
 		{"per-auth lock skip", keeperStats{Total: 1, Skipped: 1}, nil, "skipped", "account_busy"},
 		{"vanished target not inspected", keeperStats{Total: 0}, nil, "skipped", "not_inspected"},
 		{"inspected ok", keeperStats{Total: 1, Healthy: 1}, nil, "ok", ""},
+		{"healthy but reset-credits unavailable is partial", keeperStats{Total: 1, Healthy: 1, ResetCreditsUnavailable: 1}, nil, "partial", "reset_credits_unavailable"},
 		{"recovered enabled ok", keeperStats{Total: 1, StatusEnabled: 1}, nil, "ok", ""},
 		{"priority degraded ok", keeperStats{Total: 1, PriorityDegraded: 1}, nil, "ok", ""},
 		{"priority restored ok", keeperStats{Total: 1, PriorityRestored: 1}, nil, "ok", ""},
@@ -2577,5 +2578,69 @@ func TestKeeperRefreshAuditOutcome(t *testing.T) {
 				t.Fatalf("got (%q,%q), want (%q,%q)", result, reason, tc.wantResult, tc.wantReason)
 			}
 		})
+	}
+}
+
+// TestKeeperResetCreditsFetchFailureFlagged proves that when usage succeeds but the
+// reset-credit fetch fails (inner 401/malformed/transport), the account stays
+// healthy but the run reports ResetCreditsUnavailable — so a post-reset refresh is
+// audited partial (reset_credits_unavailable), not a false ok.
+func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "creds-fail.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-cf",
+				"email": "cf@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				// Reset-credit fetch fails at the inner layer.
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 401, "body": map[string]any{"detail": "unauth"}})
+				return
+			}
+			// Usage check succeeds -> account healthy.
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	// Usage succeeded, so the account reaches an ok-class outcome (healthy or a
+	// priority action), never disabled/network — the point is the account is fine.
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount != 1 || stats.NetworkError != 0 || stats.StatusDisabled != 0 {
+		t.Fatalf("expected one healthy-class outcome, stats=%+v", stats)
+	}
+	if stats.ResetCreditsUnavailable != 1 {
+		t.Fatalf("ResetCreditsUnavailable = %d, want 1 (reset-credit fetch failed)", stats.ResetCreditsUnavailable)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "partial" || reason != "reset_credits_unavailable" {
+		t.Fatalf("audit outcome = (%q,%q), want (partial, reset_credits_unavailable)", result, reason)
 	}
 }
