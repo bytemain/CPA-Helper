@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -2959,18 +2960,23 @@ func (a *App) fetchKeeperResetCredits(ctx context.Context, cfg AppConfig, detail
 }
 
 // parseKeeperResetCredits validates and projects a rate-limit-reset-credits body.
-// It requires a top-level integer available_count and a credits array; a missing
-// or malformed either fails (ok=false). Entries are kept only when
-// reset_type == codex_rate_limits, status == available, and is_supported_by_plan
-// is not explicitly false. expires_at may be null (never-expiring) — such entries
-// are kept and sorted last. Only id/reset_type/status/granted_at/expires_at/title
-// are projected; profile URL and description are dropped.
+// The top-level available_count must be a JSON integer >= 0; a fractional,
+// negative, missing, or non-numeric count fails the whole snapshot (ok=false) so
+// the previous snapshot is preserved rather than trusting a malformed response.
+// A credits array is likewise required. Entries are kept only when
+// reset_type == codex_rate_limits, status == available, is_supported_by_plan is
+// not explicitly false, AND they pass strict per-entry validation: a non-empty id,
+// a present+parseable granted_at, and an expires_at that is either null/absent
+// (never-expiring, kept and sorted last) or a valid RFC3339 timestamp. A malformed
+// entry is explicitly dropped — never kept with silently nil'd fields — while the
+// authoritative available_count is unaffected. Only id/reset_type/status/
+// granted_at/expires_at/title are projected; profile URL and description dropped.
 func parseKeeperResetCredits(body map[string]any) (int, []keeperResetCredit, bool) {
 	if body == nil {
 		return 0, nil, false
 	}
-	count := keeperIntPtr(body["available_count"])
-	if count == nil {
+	count, ok := keeperStrictNonNegInt(body["available_count"])
+	if !ok {
 		return 0, nil, false
 	}
 	rawCredits, ok := body["credits"].([]any)
@@ -2992,12 +2998,24 @@ func parseKeeperResetCredits(body map[string]any) (int, []keeperResetCredit, boo
 		if v, present := entry["is_supported_by_plan"]; present && !keeperBool(v) {
 			continue
 		}
+		id := keeperString(entry["id"])
+		if id == "" {
+			continue // schema requires an id; drop rather than fabricate identity
+		}
+		granted, ok := keeperParseRequiredTime(entry["granted_at"])
+		if !ok {
+			continue // granted_at must be present and parseable
+		}
+		expires, ok := keeperParseOptionalTime(entry["expires_at"])
+		if !ok {
+			continue // a non-null expires_at that will not parse is malformed
+		}
 		credits = append(credits, keeperResetCredit{
-			ID:        keeperString(entry["id"]),
+			ID:        id,
 			ResetType: keeperString(entry["reset_type"]),
 			Status:    keeperString(entry["status"]),
-			GrantedAt: keeperParseRFC3339(entry["granted_at"]),
-			ExpiresAt: keeperParseRFC3339(entry["expires_at"]),
+			GrantedAt: granted,
+			ExpiresAt: expires,
 			Title:     keeperString(entry["title"]),
 		})
 	}
@@ -3014,7 +3032,7 @@ func parseKeeperResetCredits(body map[string]any) (int, []keeperResetCredit, boo
 		}
 		return a.Before(*b)
 	})
-	return *count, credits, true
+	return count, credits, true
 }
 
 // parseStoredKeeperResetCredits decodes the reset_credits JSON snapshot column
@@ -3030,18 +3048,54 @@ func parseStoredKeeperResetCredits(value sql.NullString) []keeperResetCredit {
 	return credits
 }
 
-// keeperParseRFC3339 parses an RFC3339 timestamp (with optional microseconds),
-// returning nil for null/missing/unparseable values.
-func keeperParseRFC3339(value any) *time.Time {
+// keeperStrictNonNegInt accepts only a JSON integer value (float64 with no
+// fractional part) that is >= 0. It rejects fractional numbers (e.g. 2.5),
+// negatives, strings, and non-numeric values so a malformed available_count fails
+// closed instead of being silently truncated by keeperIntPtr.
+func keeperStrictNonNegInt(value any) (int, bool) {
+	f, ok := value.(float64)
+	if !ok {
+		return 0, false
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	if f < 0 || f != math.Trunc(f) {
+		return 0, false
+	}
+	return int(f), true
+}
+
+// keeperParseRequiredTime requires a present, non-empty, RFC3339-parseable value:
+// (t,true) on success, (nil,false) otherwise.
+func keeperParseRequiredTime(value any) (*time.Time, bool) {
 	s := keeperString(value)
 	if s == "" {
-		return nil
+		return nil, false
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		return nil
+		return nil, false
 	}
-	return &parsed
+	return &parsed, true
+}
+
+// keeperParseOptionalTime treats null/absent/blank as a valid "never expires"
+// (nil,true), a present RFC3339 value as (t,true), and a present-but-unparseable
+// value as malformed (nil,false).
+func keeperParseOptionalTime(value any) (*time.Time, bool) {
+	if value == nil {
+		return nil, true
+	}
+	s := keeperString(value)
+	if s == "" {
+		return nil, true
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil, false
+	}
+	return &parsed, true
 }
 
 func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {

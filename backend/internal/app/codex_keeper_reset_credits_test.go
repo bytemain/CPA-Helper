@@ -71,10 +71,10 @@ func TestParseKeeperResetCreditsFilters(t *testing.T) {
 	body := mustBody(t, `{
 	  "available_count": 1,
 	  "credits": [
-	    {"id":"keep","reset_type":"codex_rate_limits","status":"available"},
-	    {"id":"wrong-type","reset_type":"gpt4_rate_limits","status":"available"},
-	    {"id":"redeemed","reset_type":"codex_rate_limits","status":"redeemed"},
-	    {"id":"unsupported","reset_type":"codex_rate_limits","status":"available","is_supported_by_plan":false}
+	    {"id":"keep","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z"},
+	    {"id":"wrong-type","reset_type":"gpt4_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z"},
+	    {"id":"redeemed","reset_type":"codex_rate_limits","status":"redeemed","granted_at":"2026-08-22T00:08:46.146320Z"},
+	    {"id":"unsupported","reset_type":"codex_rate_limits","status":"available","is_supported_by_plan":false,"granted_at":"2026-08-22T00:08:46.146320Z"}
 	  ]
 	}`)
 	count, credits, ok := parseKeeperResetCredits(body)
@@ -93,9 +93,9 @@ func TestParseKeeperResetCreditsNullExpirySortedLast(t *testing.T) {
 	body := mustBody(t, `{
 	  "available_count": 3,
 	  "credits": [
-	    {"id":"never","reset_type":"codex_rate_limits","status":"available","expires_at":null},
-	    {"id":"later","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-10-04T02:24:33.736521Z"},
-	    {"id":"sooner","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-09-21T00:08:46.146320Z"}
+	    {"id":"never","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":null},
+	    {"id":"later","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-10-04T02:24:33.736521Z"},
+	    {"id":"sooner","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"}
 	  ]
 	}`)
 	_, credits, ok := parseKeeperResetCredits(body)
@@ -118,8 +118,8 @@ func TestParseKeeperResetCreditsTruncatedDetail(t *testing.T) {
 	body := mustBody(t, `{
 	  "available_count": 5,
 	  "credits": [
-	    {"id":"a","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-09-21T00:08:46.146320Z"},
-	    {"id":"b","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-10-04T02:24:33.736521Z"}
+	    {"id":"a","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"},
+	    {"id":"b","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-10-04T02:24:33.736521Z"}
 	  ]
 	}`)
 	count, credits, ok := parseKeeperResetCredits(body)
@@ -149,10 +149,12 @@ func TestParseKeeperResetCreditsEmptyArrayClearsToZero(t *testing.T) {
 
 func TestParseKeeperResetCreditsMalformed(t *testing.T) {
 	cases := map[string]string{
-		"missing available_count": `{"credits":[]}`,
-		"non-int available_count": `{"available_count":"lots","credits":[]}`,
-		"credits not array":       `{"available_count":1,"credits":{}}`,
-		"missing credits":         `{"available_count":1}`,
+		"missing available_count":    `{"credits":[]}`,
+		"non-int available_count":    `{"available_count":"lots","credits":[]}`,
+		"fractional available_count": `{"available_count":2.5,"credits":[]}`,
+		"negative available_count":   `{"available_count":-1,"credits":[]}`,
+		"credits not array":          `{"available_count":1,"credits":{}}`,
+		"missing credits":            `{"available_count":1}`,
 	}
 	for name, raw := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -163,6 +165,39 @@ func TestParseKeeperResetCreditsMalformed(t *testing.T) {
 	}
 	if _, _, ok := parseKeeperResetCredits(nil); ok {
 		t.Fatal("expected ok=false for nil body")
+	}
+}
+
+// TestParseKeeperResetCreditsDropsMalformedEntries pins the strict per-entry
+// validation: an available/codex entry is dropped (not kept with silently nil'd
+// fields) when it has an empty id, a missing/unparseable granted_at, or a non-null
+// but unparseable expires_at. The authoritative available_count is unaffected, and
+// a fully valid entry (including a null "never expires") still survives.
+func TestParseKeeperResetCreditsDropsMalformedEntries(t *testing.T) {
+	body := mustBody(t, `{
+	  "available_count": 5,
+	  "credits": [
+	    {"id":"","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"},
+	    {"id":"no-granted","reset_type":"codex_rate_limits","status":"available","expires_at":"2026-09-21T00:08:46.146320Z"},
+	    {"id":"bad-expiry","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"not-a-date"},
+	    {"id":"good","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":null}
+	  ]
+	}`)
+	count, credits, ok := parseKeeperResetCredits(body)
+	if !ok {
+		t.Fatal("expected ok (malformed entries are dropped, not fail-closed)")
+	}
+	if count != 5 {
+		t.Fatalf("count=%d want 5 (authoritative, unaffected by dropped entries)", count)
+	}
+	if len(credits) != 1 || credits[0].ID != "good" {
+		t.Fatalf("kept credits = %+v, want only the valid 'good' entry", credits)
+	}
+	if credits[0].GrantedAt == nil {
+		t.Fatal("kept entry must carry a parsed granted_at, never nil")
+	}
+	if credits[0].ExpiresAt != nil {
+		t.Fatal("the valid null-expiry entry must keep nil ExpiresAt (never expires)")
 	}
 }
 
