@@ -2567,6 +2567,8 @@ func TestKeeperRefreshAuditOutcome(t *testing.T) {
 		{"priority degraded ok", keeperStats{Total: 1, PriorityDegraded: 1}, nil, "ok", ""},
 		{"priority restored ok", keeperStats{Total: 1, PriorityRestored: 1}, nil, "ok", ""},
 		{"total>0 no outcome not ok", keeperStats{Total: 1}, nil, "skipped", "not_inspected"},
+		{"partial batch not ok", keeperStats{Total: 2, Healthy: 1}, nil, "skipped", "not_inspected"},
+		{"disabled prioritized over skipped", keeperStats{Total: 2, StatusDisabled: 1, Skipped: 1}, nil, "error", "status_disabled"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

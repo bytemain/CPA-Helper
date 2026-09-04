@@ -844,13 +844,16 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 		return "skipped", "account_busy"
 	case stats.Total == 0:
 		return "skipped", "not_inspected"
-	case stats.Healthy > 0 || stats.StatusEnabled > 0 || stats.PriorityDegraded > 0 || stats.PriorityRestored > 0:
-		// Only these post-fetch outcomes mean the snapshot was actually refreshed.
-		return "ok", ""
-	default:
-		// Total>0 but no recognized completion outcome — do not claim a refresh.
-		return "skipped", "not_inspected"
 	}
+	// Only these post-fetch outcomes mean a snapshot was actually refreshed. Require
+	// every inspected account to have completed (Total == okCount) so a partially
+	// completed batch is never reported ok; for the single-account reset refresh
+	// this is simply "the one account completed".
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount > 0 && stats.Total == okCount {
+		return "ok", ""
+	}
+	return "skipped", "not_inspected"
 }
 
 type keeperLogFile struct {
