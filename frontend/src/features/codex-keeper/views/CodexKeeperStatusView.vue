@@ -45,6 +45,7 @@ import {
   getCodexKeeperSettings,
   listCodexKeeperAccounts,
   refreshCodexKeeperAccounts,
+  resetCodexKeeperQuota,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
@@ -71,7 +72,7 @@ type AccountListViewMode = 'table' | 'bar' | 'ring'
 type AccountSortKey = 'quotaDay' | 'quotaWeek' | 'accountType' | 'status' | 'priority' | 'lastCheckedAt'
 type SortDirection = 'asc' | 'desc'
 type PriorityMode = 'low' | 'high' | 'default'
-type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh'
+type AccountAction = 'toggle' | 'priority' | 'delete' | 'refresh' | 'reset-quota'
 type AccountConfirmType = 'default' | 'warning' | 'error' | 'primary'
 type QuotaWindowItem = {
   label: string
@@ -1493,6 +1494,28 @@ function confirmDeleteAccount(account: CodexKeeperAccount) {
   )
 }
 
+function resetQuotaAccount(account: CodexKeeperAccount) {
+  return runAccountAction(
+    account,
+    'reset-quota',
+    () => resetCodexKeeperQuota(account.name),
+    t('配额状态已重置', 'Quota state reset'),
+  )
+}
+
+function confirmResetQuota(account: CodexKeeperAccount) {
+  openAccountConfirm(
+    t('重置配额状态', 'Reset Quota State'),
+    t(
+      `重置 ${account.name} 在 CPA 侧的配额/冷却状态？已重置 ${account.quota_reset_count ?? 0} 次。`,
+      `Reset the CPA-side quota/cooldown state of ${account.name}? Reset ${account.quota_reset_count ?? 0} times so far.`,
+    ),
+    t('确认重置', 'Confirm Reset'),
+    'warning',
+    () => resetQuotaAccount(account),
+  )
+}
+
 function enableAccount(account: CodexKeeperAccount) {
   return runAccountAction(
     account,
@@ -1678,6 +1701,12 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     render: (row) => renderQuotaUsageCell(row),
   },
   {
+    title: t('重置次数', 'Resets'),
+    key: 'quota_reset_count',
+    width: 96,
+    render: (row) => String(row.quota_reset_count ?? 0),
+  },
+  {
     title: t('最近巡检', 'Last Inspection'),
     key: 'last_checked_at',
     width: 150,
@@ -1700,7 +1729,7 @@ const disabledBaseColumns = computed<DataTableColumns<CodexKeeperAccount>>(
 const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
-  width: 224,
+  width: 280,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1749,6 +1778,18 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
             },
             { default: () => t('刷新', 'Refresh') },
           ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              quaternary: true,
+              type: 'warning',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'reset-quota'),
+              onClick: () => confirmResetQuota(row),
+            },
+            { default: () => t('重置', 'Reset') },
+          ),
         ],
       },
     )
@@ -1758,7 +1799,7 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
 const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]>(() => ({
   title: '',
   key: 'actions',
-  width: 232,
+  width: 288,
   fixed: 'right',
   render: (row: CodexKeeperAccount) => {
     return h(
@@ -1804,6 +1845,18 @@ const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]
               onClick: () => refreshAccount(row),
             },
             { default: () => t('刷新', 'Refresh') },
+          ),
+          h(
+            NButton,
+            {
+              size: 'small',
+              quaternary: true,
+              type: 'warning',
+              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+              loading: isActionLoading(row, 'reset-quota'),
+              onClick: () => confirmResetQuota(row),
+            },
+            { default: () => t('重置', 'Reset') },
           ),
         ],
       },
