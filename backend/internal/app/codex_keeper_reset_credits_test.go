@@ -201,6 +201,58 @@ func TestParseKeeperResetCreditsDropsMalformedEntries(t *testing.T) {
 	}
 }
 
+// TestParseKeeperResetCreditsExpiryPresentVsNull pins the strict present-vs-null
+// distinction for expires_at: only JSON null or an absent field mean "never
+// expires" and are kept; a present empty string or a non-string value is malformed
+// and the entry is dropped (not silently treated as never-expiring).
+func TestParseKeeperResetCreditsExpiryPresentVsNull(t *testing.T) {
+	const g = `"granted_at":"2026-08-22T00:08:46.146320Z"`
+	body := mustBody(t, `{
+	  "available_count": 6,
+	  "credits": [
+	    {"id":"null-expiry","reset_type":"codex_rate_limits","status":"available",`+g+`,"expires_at":null},
+	    {"id":"absent-expiry","reset_type":"codex_rate_limits","status":"available",`+g+`},
+	    {"id":"empty-string","reset_type":"codex_rate_limits","status":"available",`+g+`,"expires_at":""},
+	    {"id":"numeric","reset_type":"codex_rate_limits","status":"available",`+g+`,"expires_at":123},
+	    {"id":"valid","reset_type":"codex_rate_limits","status":"available",`+g+`,"expires_at":"2026-09-21T00:08:46.146320Z"}
+	  ]
+	}`)
+	_, credits, ok := parseKeeperResetCredits(body)
+	if !ok {
+		t.Fatal("expected ok")
+	}
+	kept := map[string]*keeperResetCredit{}
+	for i := range credits {
+		kept[credits[i].ID] = &credits[i]
+	}
+	if len(credits) != 3 {
+		t.Fatalf("kept %d credits, want 3 (null-expiry, absent-expiry, valid); got %v", len(credits), keysOf(kept))
+	}
+	if c, present := kept["null-expiry"]; !present || c.ExpiresAt != nil {
+		t.Fatal("null expires_at must be kept as never-expiring")
+	}
+	if c, present := kept["absent-expiry"]; !present || c.ExpiresAt != nil {
+		t.Fatal("absent expires_at must be kept as never-expiring")
+	}
+	if _, present := kept["empty-string"]; present {
+		t.Fatal(`expires_at:"" must be dropped, not treated as never-expiring`)
+	}
+	if _, present := kept["numeric"]; present {
+		t.Fatal("expires_at:123 (non-string) must be dropped, not treated as never-expiring")
+	}
+	if c, present := kept["valid"]; !present || c.ExpiresAt == nil {
+		t.Fatal("valid RFC3339 expires_at must be kept with a parsed time")
+	}
+}
+
+func keysOf(m map[string]*keeperResetCredit) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // fetchResetCreditsCPA builds a fake CLIProxyAPI whose api-call proxy returns the
 // given inner status code and body (an object, or a raw string for malformed cases).
 func fetchResetCreditsCPA(t *testing.T, innerStatus int, innerBody any, outerStatus int) *httptest.Server {

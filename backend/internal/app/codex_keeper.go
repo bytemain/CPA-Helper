@@ -3080,16 +3080,18 @@ func keeperParseRequiredTime(value any) (*time.Time, bool) {
 	return &parsed, true
 }
 
-// keeperParseOptionalTime treats null/absent/blank as a valid "never expires"
-// (nil,true), a present RFC3339 value as (t,true), and a present-but-unparseable
-// value as malformed (nil,false).
+// keeperParseOptionalTime enforces the strict expires_at contract: only JSON null
+// or an absent field (both surface as a nil value) mean "never expires" (nil,true).
+// Any other present value must be a non-empty RFC3339 string; an empty string, a
+// non-string type (e.g. a number), or an unparseable string is malformed
+// (nil,false) so the entry is dropped rather than silently treated as never-expiring.
 func keeperParseOptionalTime(value any) (*time.Time, bool) {
 	if value == nil {
-		return nil, true
+		return nil, true // JSON null or absent field → never expires
 	}
-	s := keeperString(value)
-	if s == "" {
-		return nil, true
+	s, ok := value.(string)
+	if !ok || s == "" {
+		return nil, false // present but not a non-empty string → malformed
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
