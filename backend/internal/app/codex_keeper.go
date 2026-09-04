@@ -1140,6 +1140,7 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		if err := a.updateKeeperAccountPriority(r.Context(), authName, payload.Priority); err != nil {
+			a.auditKeeperOp("priority", authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -3588,6 +3589,7 @@ func (a *App) bulkDeleteKeeperAccounts(w http.ResponseWriter, r *http.Request) e
 	failures := []map[string]string{}
 	for _, name := range names {
 		if err := a.deleteKeeperAccount(r.Context(), name); err != nil {
+			a.auditKeeperOp("delete", name, "result", "error", "reason", keeperSafeReason(err))
 			failures = append(failures, map[string]string{"name": name, "message": err.Error()})
 			continue
 		}
@@ -3612,12 +3614,15 @@ func (a *App) updateKeeperAccountPriority(ctx context.Context, authName string, 
 	if err := a.setKeeperRemotePriority(ctx, cfg, authName, &priority); err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(ctx, `
+	if _, err = a.db.ExecContext(ctx, `
 		UPDATE codex_keeper_auth_states
 		SET priority = ?, restore_priority = NULL, latest_action = NULL, last_error = NULL, updated_at = ?
 		WHERE auth_name = ?
-	`, priority, dbTime(time.Now()), authName)
-	return err
+	`, priority, dbTime(time.Now()), authName); err != nil {
+		return err
+	}
+	a.auditKeeperOp("priority", authName, "result", "ok", "priority", priority)
+	return nil
 }
 
 func (a *App) createKeeperRun(ctx context.Context, mode string) (int, error) {
