@@ -2347,3 +2347,41 @@ func TestUpsertKeeperStatePreservesResetCreditsOnSameIdentity(t *testing.T) {
 		t.Fatalf("same-identity failed fetch must preserve snapshot: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
 	}
 }
+
+// TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity covers the
+// transient-failure path: when getKeeperRemoteAuthFile fails (network_error /
+// 404) the result carries a nil AuthIndex. That unknown identity must NOT clear
+// the previous snapshot — a momentary auth-file read failure on the same account
+// should preserve the schedule, not drop it. Only a KNOWN, different auth_index
+// (a real reassignment) clears it.
+func TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	two := 2
+	if err := app.upsertKeeperState(ctx, healthyResetResult("same.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+		t.Fatalf("upsert idx-1: %v", err)
+	}
+	// A transport/404 failure on the auth-file read: nil AuthIndex, network_error.
+	failed := keeperAccountResult{
+		Name:      "same.json",
+		Result:    "network_error",
+		AuthIndex: nil,
+		CheckedAt: time.Now().In(appTimeLocation),
+	}
+	if err := app.upsertKeeperState(ctx, failed); err != nil {
+		t.Fatalf("upsert network_error: %v", err)
+	}
+	state, err := app.getKeeperState(ctx, "same.json")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if state.ResetCreditCount == nil || *state.ResetCreditCount != 2 || len(state.ResetCredits) != 1 {
+		t.Fatalf("unknown identity (nil auth_index) must preserve snapshot, not clear: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
+	}
+}

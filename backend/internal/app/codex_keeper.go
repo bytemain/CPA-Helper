@@ -3407,20 +3407,20 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
-			-- Preserve-on-failed-fetch is scoped to the SAME auth identity. When the
-			-- stored auth_index still matches the incoming one, a nil (NULL) credit
-			-- field keeps the previous snapshot (COALESCE). When the identity changed
-			-- (auth_name reassigned to a new auth_index), or either index is NULL, the
-			-- '=' is not true and the ELSE writes the incoming value — so a failed
-			-- fetch on the new identity clears the old account's stale credits instead
-			-- of showing its schedule on the new row.
+			-- Preserve-on-failed-fetch, scoped to auth identity. The snapshot is kept
+			-- (COALESCE) when the incoming auth_index is NULL (identity unknown — e.g.
+			-- a transient auth-file read failure on the same account must not drop the
+			-- schedule) OR still matches the stored one. Only a KNOWN, DIFFERENT
+			-- incoming auth_index (a genuine reassignment of auth_name to another
+			-- account) falls to ELSE and writes the incoming value, clearing the old
+			-- account's stale credits so they never surface on the new identity's row.
 			reset_credit_count = CASE
-				WHEN codex_keeper_auth_states.auth_index = excluded.auth_index
+				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
 					THEN COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
 				ELSE excluded.reset_credit_count
 			END,
 			reset_credits = CASE
-				WHEN codex_keeper_auth_states.auth_index = excluded.auth_index
+				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
 					THEN COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
 				ELSE excluded.reset_credits
 			END,
