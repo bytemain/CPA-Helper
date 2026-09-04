@@ -253,6 +253,17 @@ export interface CodexKeeperAccount {
   last_healthy_at: string | null
   quota_reset_count: number
   last_quota_reset_at: string | null
+  reset_credit_count: number | null
+  reset_credits: CodexKeeperResetCredit[] | null
+}
+
+export interface CodexKeeperResetCredit {
+  id: string
+  reset_type: string
+  status: string
+  granted_at: string | null
+  expires_at: string | null
+  title?: string
 }
 
 export interface CodexKeeperAccountsResponse {

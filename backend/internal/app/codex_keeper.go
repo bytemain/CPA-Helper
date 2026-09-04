@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +24,9 @@ import (
 
 const (
 	keeperUsageURL                 = "https://chatgpt.com/backend-api/wham/usage"
+	keeperResetCreditsURL          = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	keeperResetCreditType          = "codex_rate_limits"
+	keeperResetCreditStatus        = "available"
 	keeperLogFilePrefix            = "codex-keeper-"
 	keeperLogComponent             = "codex_keeper"
 	keeperLogRetainedFiles         = 3
@@ -115,26 +119,52 @@ type keeperQuotaResetRequest struct {
 }
 
 type keeperAccount struct {
-	Name                   string     `json:"name"`
-	Email                  *string    `json:"email"`
-	AuthIndex              *string    `json:"auth_index"`
-	AccountType            *string    `json:"account_type"`
-	Disabled               bool       `json:"disabled"`
-	Priority               *int       `json:"priority"`
-	PrimaryUsedPercent     *int       `json:"primary_used_percent"`
-	SecondaryUsedPercent   *int       `json:"secondary_used_percent"`
-	PrimaryResetAt         *time.Time `json:"primary_reset_at"`
-	SecondaryResetAt       *time.Time `json:"secondary_reset_at"`
-	PrimaryWindowSeconds   *int       `json:"primary_window_seconds"`
-	SecondaryWindowSeconds *int       `json:"secondary_window_seconds"`
-	QuotaThreshold         *int       `json:"quota_threshold"`
-	LastStatusCode         *int       `json:"last_status_code"`
-	QuotaResetCount        int        `json:"quota_reset_count"`
-	LastQuotaResetAt       *time.Time `json:"last_quota_reset_at"`
-	LastError              *string    `json:"last_error"`
-	LatestAction           *string    `json:"latest_action"`
-	LastCheckedAt          *time.Time `json:"last_checked_at"`
-	LastHealthyAt          *time.Time `json:"last_healthy_at"`
+	Name                   string              `json:"name"`
+	Email                  *string             `json:"email"`
+	AuthIndex              *string             `json:"auth_index"`
+	AccountType            *string             `json:"account_type"`
+	Disabled               bool                `json:"disabled"`
+	Priority               *int                `json:"priority"`
+	PrimaryUsedPercent     *int                `json:"primary_used_percent"`
+	SecondaryUsedPercent   *int                `json:"secondary_used_percent"`
+	PrimaryResetAt         *time.Time          `json:"primary_reset_at"`
+	SecondaryResetAt       *time.Time          `json:"secondary_reset_at"`
+	PrimaryWindowSeconds   *int                `json:"primary_window_seconds"`
+	SecondaryWindowSeconds *int                `json:"secondary_window_seconds"`
+	QuotaThreshold         *int                `json:"quota_threshold"`
+	LastStatusCode         *int                `json:"last_status_code"`
+	QuotaResetCount        int                 `json:"quota_reset_count"`
+	LastQuotaResetAt       *time.Time          `json:"last_quota_reset_at"`
+	ResetCreditCount       *int                `json:"reset_credit_count"`
+	ResetCredits           []keeperResetCredit `json:"reset_credits"`
+	LastError              *string             `json:"last_error"`
+	LatestAction           *string             `json:"latest_action"`
+	LastCheckedAt          *time.Time          `json:"last_checked_at"`
+	LastHealthyAt          *time.Time          `json:"last_healthy_at"`
+}
+
+// keeperResetCredit is the safe projection of one entry from
+// wham/rate-limit-reset-credits: only identity + status + timestamps are kept,
+// never the profile URL / description. ExpiresAt is nil for a never-expiring
+// credit (upstream expires_at: null), which must still be shown, not dropped.
+type keeperResetCredit struct {
+	ID        string     `json:"id"`
+	ResetType string     `json:"reset_type"`
+	Status    string     `json:"status"`
+	GrantedAt *time.Time `json:"granted_at"`
+	ExpiresAt *time.Time `json:"expires_at"`
+	Title     string     `json:"title,omitempty"`
+}
+
+// keeperResetCreditResponse is the wire shape of one reset credit. Timestamps are
+// formatted for the product timezone; ExpiresAt nil means "never expires".
+type keeperResetCreditResponse struct {
+	ID        string  `json:"id"`
+	ResetType string  `json:"reset_type"`
+	Status    string  `json:"status"`
+	GrantedAt *string `json:"granted_at"`
+	ExpiresAt *string `json:"expires_at"`
+	Title     string  `json:"title,omitempty"`
 }
 
 type keeperAccountResponse struct {
@@ -159,6 +189,8 @@ type keeperAccountResponse struct {
 	LastHealthyAt          *string                         `json:"last_healthy_at"`
 	QuotaResetCount        int                             `json:"quota_reset_count"`
 	LastQuotaResetAt       *string                         `json:"last_quota_reset_at"`
+	ResetCreditCount       *int                            `json:"reset_credit_count"`
+	ResetCredits           []keeperResetCreditResponse     `json:"reset_credits"`
 }
 
 type keeperQuotaWindowUsageResponse struct {
@@ -256,6 +288,12 @@ type keeperAccountResult struct {
 	LastError              *string
 	LatestAction           *string
 	CheckedAt              time.Time
+	// ResetCreditCount / ResetCredits are set only when a reset-credit fetch
+	// succeeds. Left nil (the failure/skip case) they preserve the previous
+	// snapshot in upsertKeeperState via COALESCE, so a failed fetch never wipes
+	// good data. A successful empty result carries a non-nil count of 0.
+	ResetCreditCount *int
+	ResetCredits     *string
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -1081,9 +1119,32 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 			LastHealthyAt:          apiDateTimePtr(account.LastHealthyAt),
 			QuotaResetCount:        account.QuotaResetCount,
 			LastQuotaResetAt:       apiDateTimePtr(account.LastQuotaResetAt),
+			ResetCreditCount:       account.ResetCreditCount,
+			ResetCredits:           keeperResetCreditResponses(account.ResetCredits),
 		})
 	}
 	return responses
+}
+
+// keeperResetCreditResponses formats persisted reset credits for the API, keeping
+// the stored expires_at-ascending order and emitting a nil ExpiresAt (never
+// expires) unchanged so the frontend can render "永不过期".
+func keeperResetCreditResponses(credits []keeperResetCredit) []keeperResetCreditResponse {
+	if len(credits) == 0 {
+		return nil
+	}
+	out := make([]keeperResetCreditResponse, 0, len(credits))
+	for _, credit := range credits {
+		out = append(out, keeperResetCreditResponse{
+			ID:        credit.ID,
+			ResetType: credit.ResetType,
+			Status:    credit.Status,
+			GrantedAt: apiDateTimePtr(credit.GrantedAt),
+			ExpiresAt: apiDateTimePtr(credit.ExpiresAt),
+			Title:     credit.Title,
+		})
+	}
+	return out
 }
 
 func keeperQuotaWindowUsageResponseFrom(usage *keeperQuotaWindowUsage) *keeperQuotaWindowUsageResponse {
@@ -2487,6 +2548,16 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.PrimaryWindowSeconds = usage.PrimaryWindowSeconds
 	result.SecondaryWindowSeconds = usage.SecondaryWindowSeconds
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
+	// Best-effort reset-credit snapshot. A failed/malformed fetch leaves both
+	// fields nil, so upsertKeeperState preserves the previous snapshot instead of
+	// wiping it; a successful empty result carries count 0 and an empty list.
+	if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
+		result.ResetCreditCount = &count
+		if encoded, err := json.Marshal(credits); err == nil {
+			payload := string(encoded)
+			result.ResetCredits = &payload
+		}
+	}
 	result.Result = "healthy"
 
 	if recoverableUnauthorizedDisabled {
@@ -2846,12 +2917,217 @@ func (a *App) checkKeeperUsage(ctx context.Context, cfg AppConfig, detail map[st
 	}
 }
 
+// fetchKeeperResetCredits pulls the account's reset-credit list from
+// wham/rate-limit-reset-credits through the same per-auth api-call egress used by
+// checkKeeperUsage. It is best-effort: any transport error, non-2xx inner status,
+// or malformed/incomplete body returns ok=false so the caller preserves the
+// previous snapshot rather than overwriting it. On success it returns the
+// authoritative available_count (never credits length, which upstream may
+// truncate) and the safe-projected, expires_at-ascending credit list.
+func (a *App) fetchKeeperResetCredits(ctx context.Context, cfg AppConfig, detail map[string]any) (int, []keeperResetCredit, bool) {
+	authIndex := keeperAuthIndex(detail)
+	header := map[string]string{
+		"Authorization": "Bearer $TOKEN$",
+		"Content-Type":  "application/json",
+		"User-Agent":    "codex_cli_rs/0.76.0",
+	}
+	if accountID := keeperString(detail["account_id"]); accountID != "" {
+		header["Chatgpt-Account-Id"] = accountID
+	}
+	body := map[string]any{
+		"auth_index": authIndex,
+		"method":     "GET",
+		"url":        keeperResetCreditsURL,
+		"header":     header,
+		"data":       "",
+	}
+	response, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/api-call", nil, body, time.Duration(cfg.CodexKeeper.UsageTimeoutSeconds)*time.Second)
+	if err != nil {
+		return 0, nil, false
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return 0, nil, false
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		return 0, nil, false
+	}
+	// The inner status must be a strict JSON integer in the 2xx range. Reusing the
+	// lenient keeperIntPtr would let a deceptive status_code of 200.5 (truncated) or
+	// "200" (string) pass as success and overwrite the snapshot, so parse it strictly.
+	if !keeperInnerStatusOK(raw) {
+		return 0, nil, false
+	}
+	return parseKeeperResetCredits(keeperBodyJSON(raw["body"]))
+}
+
+// keeperInnerStatusOK reports whether the api-call wrapper's inner status is a
+// strict non-negative JSON integer in [200,300). It prefers status_code and only
+// falls back to statusCode when status_code is absent; a present-but-malformed
+// status_code (fractional, string, negative, out-of-range) fails closed.
+func keeperInnerStatusOK(raw map[string]any) bool {
+	value, present := raw["status_code"]
+	if !present {
+		value = raw["statusCode"]
+	}
+	status, ok := keeperStrictNonNegInt(value)
+	return ok && status >= 200 && status < 300
+}
+
+// parseKeeperResetCredits validates and projects a rate-limit-reset-credits body.
+// The top-level available_count must be a JSON integer >= 0; a fractional,
+// negative, missing, or non-numeric count fails the whole snapshot (ok=false) so
+// the previous snapshot is preserved rather than trusting a malformed response.
+// A credits array is likewise required. Entries are kept only when
+// reset_type == codex_rate_limits, status == available, is_supported_by_plan is
+// not explicitly false, AND they pass strict per-entry validation: a non-empty id,
+// a present+parseable granted_at, and an expires_at that is either null/absent
+// (never-expiring, kept and sorted last) or a valid RFC3339 timestamp. A malformed
+// entry is explicitly dropped — never kept with silently nil'd fields — while the
+// authoritative available_count is unaffected. Only id/reset_type/status/
+// granted_at/expires_at/title are projected; profile URL and description dropped.
+func parseKeeperResetCredits(body map[string]any) (int, []keeperResetCredit, bool) {
+	if body == nil {
+		return 0, nil, false
+	}
+	count, ok := keeperStrictNonNegInt(body["available_count"])
+	if !ok {
+		return 0, nil, false
+	}
+	rawCredits, ok := body["credits"].([]any)
+	if !ok {
+		return 0, nil, false
+	}
+	credits := make([]keeperResetCredit, 0, len(rawCredits))
+	for _, item := range rawCredits {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		if keeperString(entry["reset_type"]) != keeperResetCreditType {
+			continue
+		}
+		if keeperString(entry["status"]) != keeperResetCreditStatus {
+			continue
+		}
+		if v, present := entry["is_supported_by_plan"]; present && !keeperBool(v) {
+			continue
+		}
+		id := keeperString(entry["id"])
+		if id == "" {
+			continue // schema requires an id; drop rather than fabricate identity
+		}
+		granted, ok := keeperParseRequiredTime(entry["granted_at"])
+		if !ok {
+			continue // granted_at must be present and parseable
+		}
+		expires, ok := keeperParseOptionalTime(entry["expires_at"])
+		if !ok {
+			continue // a non-null expires_at that will not parse is malformed
+		}
+		credits = append(credits, keeperResetCredit{
+			ID:        id,
+			ResetType: keeperString(entry["reset_type"]),
+			Status:    keeperString(entry["status"]),
+			GrantedAt: granted,
+			ExpiresAt: expires,
+			Title:     keeperString(entry["title"]),
+		})
+	}
+	sort.SliceStable(credits, func(i, j int) bool {
+		a, b := credits[i].ExpiresAt, credits[j].ExpiresAt
+		if a == nil && b == nil {
+			return false
+		}
+		if a == nil { // never-expiring sorts last
+			return false
+		}
+		if b == nil {
+			return true
+		}
+		return a.Before(*b)
+	})
+	return count, credits, true
+}
+
+// parseStoredKeeperResetCredits decodes the reset_credits JSON snapshot column
+// back into projected credits, returning nil for NULL/empty/invalid JSON.
+func parseStoredKeeperResetCredits(value sql.NullString) []keeperResetCredit {
+	if !value.Valid || strings.TrimSpace(value.String) == "" {
+		return nil
+	}
+	var credits []keeperResetCredit
+	if err := json.Unmarshal([]byte(value.String), &credits); err != nil {
+		return nil
+	}
+	return credits
+}
+
+// keeperMaxSafeCount is the largest count we accept: 2^53-1, the JSON
+// safe-integer limit. A float64 represents integers exactly only up to this
+// bound, so a larger value cannot be trusted as an exact count (and int(f) could
+// overflow), and available_count is realistically tiny anyway.
+const keeperMaxSafeCount = 1<<53 - 1
+
+// keeperStrictNonNegInt accepts only a JSON integer value (float64 with no
+// fractional part) in [0, 2^53-1]. It rejects fractional numbers (e.g. 2.5),
+// negatives, out-of-range/NaN/Inf, strings, and non-numeric values so a malformed
+// available_count fails closed instead of being silently truncated by keeperIntPtr.
+func keeperStrictNonNegInt(value any) (int, bool) {
+	f, ok := value.(float64)
+	if !ok {
+		return 0, false
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	if f < 0 || f > keeperMaxSafeCount || f != math.Trunc(f) {
+		return 0, false
+	}
+	return int(f), true
+}
+
+// keeperParseRequiredTime requires a present, non-empty, RFC3339-parseable value:
+// (t,true) on success, (nil,false) otherwise.
+func keeperParseRequiredTime(value any) (*time.Time, bool) {
+	s := keeperString(value)
+	if s == "" {
+		return nil, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil, false
+	}
+	return &parsed, true
+}
+
+// keeperParseOptionalTime enforces the strict expires_at contract: only JSON null
+// or an absent field (both surface as a nil value) mean "never expires" (nil,true).
+// Any other present value must be a non-empty RFC3339 string; an empty string, a
+// non-string type (e.g. a number), or an unparseable string is malformed
+// (nil,false) so the entry is dropped rather than silently treated as never-expiring.
+func keeperParseOptionalTime(value any) (*time.Time, bool) {
+	if value == nil {
+		return nil, true // JSON null or absent field → never expires
+	}
+	s, ok := value.(string)
+	if !ok || s == "" {
+		return nil, false // present but not a non-empty string → malformed
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return nil, false
+	}
+	return &parsed, true
+}
+
 func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
+		       reset_credit_count, CAST(reset_credits AS TEXT)
 		FROM codex_keeper_auth_states
 		ORDER BY COALESCE(email, ''), auth_name
 	`)
@@ -3036,7 +3312,8 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
-		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT)
+		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
+		       reset_credit_count, CAST(reset_credits AS TEXT)
 		FROM codex_keeper_auth_states WHERE auth_name = ?
 	`, name)
 	if err != nil {
@@ -3055,13 +3332,13 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
-	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt sql.NullString
-	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority sql.NullInt64
+	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits sql.NullString
+	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority, resetCreditCount sql.NullInt64
 	err := scanner.Scan(
 		&state.Name, &email, &authIndex, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
 		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
-		&createdAt, &updatedAt,
+		&createdAt, &updatedAt, &resetCreditCount, &resetCredits,
 	)
 	if err != nil {
 		return keeperAuthState{}, err
@@ -3083,6 +3360,8 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 	state.LastCheckedAt = timePtr(lastChecked)
 	state.LastHealthyAt = timePtr(lastHealthy)
 	state.RestorePriority = nullableInt(restorePriority)
+	state.ResetCreditCount = nullableInt(resetCreditCount)
+	state.ResetCredits = parseStoredKeeperResetCredits(resetCredits)
 	if parsed, ok := parseDBTime(createdAt.String); ok {
 		state.CreatedAt = parsed
 	}
@@ -3104,8 +3383,9 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			auth_name, email, auth_index, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
+			reset_credit_count, reset_credits,
 			last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			email = excluded.email,
 			auth_index = excluded.auth_index,
@@ -3127,10 +3407,27 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
+			-- Preserve-on-failed-fetch, scoped to auth identity. The snapshot is kept
+			-- (COALESCE) when the incoming auth_index is NULL (identity unknown — e.g.
+			-- a transient auth-file read failure on the same account must not drop the
+			-- schedule) OR still matches the stored one. Only a KNOWN, DIFFERENT
+			-- incoming auth_index (a genuine reassignment of auth_name to another
+			-- account) falls to ELSE and writes the incoming value, clearing the old
+			-- account's stale credits so they never surface on the new identity's row.
+			reset_credit_count = CASE
+				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
+					THEN COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
+				ELSE excluded.reset_credit_count
+			END,
+			reset_credits = CASE
+				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
+					THEN COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
+				ELSE excluded.reset_credits
+			END,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
 	return err
 }
 

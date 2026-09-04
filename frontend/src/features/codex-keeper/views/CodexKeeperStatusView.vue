@@ -97,8 +97,8 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1568
-const normalTableScrollX = 2072
+const disabledTableScrollX = 1588
+const normalTableScrollX = 2092
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -151,6 +151,11 @@ const priorityDialog = reactive({
 })
 let refreshPollToken = 0
 let keeperStatusTimer: number | undefined
+// nowMs is a reactive clock so the reset-credit countdown cells re-render as time
+// passes without waiting for a data refresh.
+const nowMs = ref(Date.now())
+let nowTickTimer: number | undefined
+const RESET_CREDIT_CLOCK_TICK_MS = 60000
 
 const priorityRuleMap = computed(() =>
   Object.fromEntries(priorityRules.value.map((rule) => [rule.account_type, rule.priority])),
@@ -979,7 +984,8 @@ function formatQuotaResetTime(value: string | null): string | null {
   }).format(date)
 }
 
-// formatQuotaResetCountdown renders a coarse "in N days / N hours" hint relative to now.
+// formatQuotaResetCountdown renders a coarse "in N days / N hours" hint relative to
+// the reactive clock (nowMs), so the cell ticks down without a data refresh.
 function formatQuotaResetCountdown(value: string | null): string | null {
   if (!value) {
     return null
@@ -988,7 +994,7 @@ function formatQuotaResetCountdown(value: string | null): string | null {
   if (Number.isNaN(date.getTime())) {
     return null
   }
-  const diffMs = date.getTime() - Date.now()
+  const diffMs = date.getTime() - nowMs.value
   if (diffMs <= 0) {
     return t('已到期', 'due')
   }
@@ -1176,27 +1182,44 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
   )
 }
 
-// renderQuotaResetScheduleCell lists each quota window's reset time and countdown
-// (the account's own OpenAI quota-reset schedule, populated by inspection).
-function renderQuotaResetScheduleCell(account: CodexKeeperAccount) {
-  const items = quotaWindowItems(account).filter((item) => item.resetAt)
-  if (items.length === 0) {
-    return '-'
+// renderResetCreditScheduleCell lists each active reset credit's expiry time and
+// countdown — the account's "主动重置过期时间" from wham/rate-limit-reset-credits.
+// A null expires_at means the credit never expires; such entries are still shown.
+function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
+  const credits = account.reset_credits ?? []
+  const count = account.reset_credit_count
+  if (credits.length === 0) {
+    // Authoritative count with no detail rows still deserves a "0 次" / count line
+    // rather than a bare dash, so a truncated-but-nonzero snapshot is visible.
+    if (count === null || count === undefined) {
+      return '-'
+    }
+    return h('div', { class: 'quota-reset-schedule-cell' }, [
+      h('span', { class: 'quota-reset-schedule-label' }, t(`主动重置次数：${count}`, `Manual resets: ${count}`)),
+    ])
   }
-  return h(
-    'div',
-    { class: 'quota-reset-schedule-cell' },
-    items.map((item, index) => {
-      const resetTime = formatQuotaResetTime(item.resetAt)
-      const countdown = formatQuotaResetCountdown(item.resetAt)
-      return h('div', { class: 'quota-reset-schedule-item' }, [
-        h('span', { class: 'quota-reset-schedule-label' },
-          t(`第 ${index + 1} 次`, `#${index + 1}`)),
-        h('span', { class: 'quota-reset-schedule-time' }, resetTime ?? '-'),
-        countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, countdown) : null,
-      ])
-    }),
+  const header = h(
+    'span',
+    { class: 'quota-reset-schedule-label' },
+    t(`主动重置次数：${count ?? credits.length}`, `Manual resets: ${count ?? credits.length}`),
   )
+  const rows = credits.map((credit, index) => {
+    const label = t(`第 ${index + 1} 次`, `#${index + 1}`)
+    if (!credit.expires_at) {
+      return h('div', { class: 'quota-reset-schedule-item' }, [
+        h('span', { class: 'quota-reset-schedule-label' }, label),
+        h('span', { class: 'quota-reset-schedule-time' }, t('永不过期', 'never expires')),
+      ])
+    }
+    const resetTime = formatQuotaResetTime(credit.expires_at)
+    const countdown = formatQuotaResetCountdown(credit.expires_at)
+    return h('div', { class: 'quota-reset-schedule-item' }, [
+      h('span', { class: 'quota-reset-schedule-label' }, label),
+      h('span', { class: 'quota-reset-schedule-time' }, resetTime ?? '-'),
+      countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, `（${countdown}）`) : null,
+    ])
+  })
+  return h('div', { class: 'quota-reset-schedule-cell' }, [header, ...rows])
 }
 
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
@@ -1752,10 +1775,10 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     render: (row) => renderQuotaUsageCell(row),
   },
   {
-    title: t('配额重置窗口', 'Quota Reset Windows'),
-    key: 'quota_reset_schedule',
-    width: 210,
-    render: (row) => renderQuotaResetScheduleCell(row),
+    title: t('主动重置过期时间', 'Manual Reset Expiry'),
+    key: 'reset_credit_schedule',
+    width: 230,
+    render: (row) => renderResetCreditScheduleCell(row),
   },
   {
     title: t('最近巡检', 'Last Inspection'),
@@ -1961,12 +1984,18 @@ onMounted(() => {
   keeperStatusTimer = window.setInterval(() => {
     void loadKeeperStatus()
   }, KEEPER_STATUS_POLL_INTERVAL_MS)
+  nowTickTimer = window.setInterval(() => {
+    nowMs.value = Date.now()
+  }, RESET_CREDIT_CLOCK_TICK_MS)
 })
 
 onBeforeUnmount(() => {
   refreshPollToken += 1
   if (keeperStatusTimer !== undefined) {
     window.clearInterval(keeperStatusTimer)
+  }
+  if (nowTickTimer !== undefined) {
+    window.clearInterval(nowTickTimer)
   }
 })
 </script>

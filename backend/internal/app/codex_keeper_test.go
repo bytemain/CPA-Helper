@@ -375,8 +375,13 @@ func TestKeeperRunMaintainsSystemPriorityRules(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			var payload struct {
 				AuthIndex string `json:"auth_index"`
+				URL       string `json:"url"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 0, "credits": []any{}}})
+				return
+			}
 			usedPercent := usagePercents[payload.AuthIndex]
 			if usedPercent == 0 {
 				usedPercent = 10
@@ -526,8 +531,13 @@ func TestKeeperRefreshAccountsOnlyProcessesSelectedAuths(t *testing.T) {
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			var payload struct {
 				AuthIndex string `json:"auth_index"`
+				URL       string `json:"url"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 0, "credits": []any{}}})
+				return
+			}
 			mu.Lock()
 			usageCalls[payload.AuthIndex]++
 			mu.Unlock()
@@ -640,8 +650,13 @@ func TestKeeperRefreshAccountsDisablesBadCredentialAndAppliesPriorityPolicy(t *t
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			var payload struct {
 				AuthIndex string `json:"auth_index"`
+				URL       string `json:"url"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 0, "credits": []any{}}})
+				return
+			}
 			statusCode := 200
 			usedPercent := 100
 			if payload.AuthIndex == "bad-token.json" {
