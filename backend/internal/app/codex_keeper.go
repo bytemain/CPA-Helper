@@ -2565,7 +2565,11 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	// state that never reached the DB is not later reported as a healthy refresh.
 	persistState := func(r keeperAccountResult) keeperAccountResult {
 		if err := a.upsertKeeperState(ctx, r); err != nil {
-			logFn(r.Name + ": 状态写回失败：" + err.Error())
+			// Keep the raw DB error out of the user-visible Keeper log (and the
+			// audit) — surface only a stable marker there; the raw detail goes to the
+			// server process log for diagnostics.
+			logFn(r.Name + "：状态写回失败（state_write_error）")
+			log.Printf("codex keeper state write-back failed for %s: %v", r.Name, err)
 			r.StateWriteFailed = true
 		}
 		return r

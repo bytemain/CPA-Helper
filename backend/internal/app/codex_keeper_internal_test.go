@@ -2746,4 +2746,23 @@ func TestKeeperResetInspectStateWriteFailure(t *testing.T) {
 	if before.LastCheckedAt == nil || after.LastCheckedAt == nil || !before.LastCheckedAt.Equal(*after.LastCheckedAt) {
 		t.Fatalf("last_checked_at changed despite a failed write: before=%v after=%v", before.LastCheckedAt, after.LastCheckedAt)
 	}
+
+	// The raw DB error (the trigger's RAISE text) must NOT reach the Keeper UI log;
+	// only the stable marker is user-visible.
+	lines, err := app.loadKeeperLogLines(500)
+	if err != nil {
+		t.Fatalf("load keeper log lines: %v", err)
+	}
+	sawMarker := false
+	for _, line := range lines {
+		if strings.Contains(line, "blocked") {
+			t.Fatalf("raw DB error leaked into Keeper log: %q", line)
+		}
+		if strings.Contains(line, "state_write_error") {
+			sawMarker = true
+		}
+	}
+	if !sawMarker {
+		t.Fatal("expected a stable state_write_error marker in the Keeper log")
+	}
 }
