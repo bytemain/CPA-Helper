@@ -836,12 +836,20 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 		return "error", reason
 	case stats.NetworkError > 0:
 		return "error", "network_error"
+	case stats.StatusDisabled > 0:
+		// The account was disabled during the inspect (invalid/expired credentials)
+		// before the usage + reset-credit fetch could refresh the snapshot.
+		return "error", "status_disabled"
 	case stats.Skipped > 0:
 		return "skipped", "account_busy"
 	case stats.Total == 0:
 		return "skipped", "not_inspected"
-	default:
+	case stats.Healthy > 0 || stats.StatusEnabled > 0 || stats.PriorityDegraded > 0 || stats.PriorityRestored > 0:
+		// Only these post-fetch outcomes mean the snapshot was actually refreshed.
 		return "ok", ""
+	default:
+		// Total>0 but no recognized completion outcome — do not claim a refresh.
+		return "skipped", "not_inspected"
 	}
 }
 

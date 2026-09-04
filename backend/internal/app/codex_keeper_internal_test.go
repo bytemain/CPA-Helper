@@ -2559,9 +2559,14 @@ func TestKeeperRefreshAuditOutcome(t *testing.T) {
 		{"validation is error", keeperStats{}, validationError("bad"), "error", "validation_error"},
 		{"opaque run error", keeperStats{}, errors.New("dial cpa.internal token=sk"), "error", "internal_error"},
 		{"network error", keeperStats{Total: 1, NetworkError: 1}, nil, "error", "network_error"},
+		{"status disabled (bad creds)", keeperStats{Total: 1, StatusDisabled: 1}, nil, "error", "status_disabled"},
 		{"per-auth lock skip", keeperStats{Total: 1, Skipped: 1}, nil, "skipped", "account_busy"},
 		{"vanished target not inspected", keeperStats{Total: 0}, nil, "skipped", "not_inspected"},
 		{"inspected ok", keeperStats{Total: 1, Healthy: 1}, nil, "ok", ""},
+		{"recovered enabled ok", keeperStats{Total: 1, StatusEnabled: 1}, nil, "ok", ""},
+		{"priority degraded ok", keeperStats{Total: 1, PriorityDegraded: 1}, nil, "ok", ""},
+		{"priority restored ok", keeperStats{Total: 1, PriorityRestored: 1}, nil, "ok", ""},
+		{"total>0 no outcome not ok", keeperStats{Total: 1}, nil, "skipped", "not_inspected"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
