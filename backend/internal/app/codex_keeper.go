@@ -3384,8 +3384,23 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
-			reset_credit_count = COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count),
-			reset_credits = COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits),
+			-- Preserve-on-failed-fetch is scoped to the SAME auth identity. When the
+			-- stored auth_index still matches the incoming one, a nil (NULL) credit
+			-- field keeps the previous snapshot (COALESCE). When the identity changed
+			-- (auth_name reassigned to a new auth_index), or either index is NULL, the
+			-- '=' is not true and the ELSE writes the incoming value — so a failed
+			-- fetch on the new identity clears the old account's stale credits instead
+			-- of showing its schedule on the new row.
+			reset_credit_count = CASE
+				WHEN codex_keeper_auth_states.auth_index = excluded.auth_index
+					THEN COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
+				ELSE excluded.reset_credit_count
+			END,
+			reset_credits = CASE
+				WHEN codex_keeper_auth_states.auth_index = excluded.auth_index
+					THEN COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
+				ELSE excluded.reset_credits
+			END,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at

@@ -2258,3 +2258,92 @@ func keeperWebsocketUsageSuccessPayload(usedPercent int) map[string]any {
 		},
 	}
 }
+
+// resetCreditSnapshotJSON is a single valid projected reset credit for identity tests.
+const resetCreditSnapshotJSON = `[{"id":"c1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"}]`
+
+func healthyResetResult(name, authIndex string, count *int, credits *string) keeperAccountResult {
+	return keeperAccountResult{
+		Name:             name,
+		Result:           "healthy",
+		AuthIndex:        stringPtr(authIndex),
+		CheckedAt:        time.Now().In(appTimeLocation),
+		ResetCreditCount: count,
+		ResetCredits:     credits,
+	}
+}
+
+// TestUpsertKeeperStateClearsResetCreditsOnIdentityChange pins the identity
+// boundary: when an auth_name is reassigned a new auth_index and the new account's
+// reset-credit fetch fails (nil count/credits), the previous identity's snapshot
+// must NOT be preserved by COALESCE — it must be cleared so the wrong account's
+// schedule never surfaces on the new index's row.
+func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	// idx-1 inspects healthy with a populated reset-credit snapshot.
+	two := 2
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+		t.Fatalf("upsert idx-1: %v", err)
+	}
+	state, err := app.getKeeperState(ctx, "reused.json")
+	if err != nil {
+		t.Fatalf("get after idx-1: %v", err)
+	}
+	if state.ResetCreditCount == nil || *state.ResetCreditCount != 2 || len(state.ResetCredits) != 1 {
+		t.Fatalf("idx-1 snapshot not stored: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
+	}
+
+	// Same auth_name reassigned to idx-2; the new identity's fetch failed (nil).
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-2", nil, nil)); err != nil {
+		t.Fatalf("upsert idx-2: %v", err)
+	}
+	state, err = app.getKeeperState(ctx, "reused.json")
+	if err != nil {
+		t.Fatalf("get after idx-2: %v", err)
+	}
+	if state.AuthIndex == nil || *state.AuthIndex != "idx-2" {
+		t.Fatalf("auth_index = %v, want idx-2", state.AuthIndex)
+	}
+	if state.ResetCreditCount != nil {
+		t.Fatalf("reset_credit_count = %d, want nil (stale snapshot must be cleared on identity change)", *state.ResetCreditCount)
+	}
+	if len(state.ResetCredits) != 0 {
+		t.Fatalf("reset_credits = %+v, want empty (must not show old account's schedule)", state.ResetCredits)
+	}
+}
+
+// TestUpsertKeeperStatePreservesResetCreditsOnSameIdentity is the companion: a
+// failed fetch on the SAME auth_index keeps the last good snapshot (the intended
+// preserve-on-failure semantics), so the boundary fix does not over-clear.
+func TestUpsertKeeperStatePreservesResetCreditsOnSameIdentity(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	two := 2
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+		t.Fatalf("upsert first: %v", err)
+	}
+	// Same identity, failed fetch (nil count/credits).
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", nil, nil)); err != nil {
+		t.Fatalf("upsert second: %v", err)
+	}
+	state, err := app.getKeeperState(ctx, "stable.json")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if state.ResetCreditCount == nil || *state.ResetCreditCount != 2 || len(state.ResetCredits) != 1 {
+		t.Fatalf("same-identity failed fetch must preserve snapshot: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
+	}
+}
