@@ -97,8 +97,8 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1302
-const normalTableScrollX = 1816
+const disabledTableScrollX = 1454
+const normalTableScrollX = 1958
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -1635,7 +1635,7 @@ function isActionLoading(account: CodexKeeperAccount, action: AccountAction): bo
 }
 
 function isRowActing(account: CodexKeeperAccount): boolean {
-  return (['toggle', 'priority', 'delete', 'refresh'] as const).some((action) =>
+  return (['toggle', 'priority', 'delete', 'refresh', 'reset-quota'] as const).some((action) =>
     isActionLoading(account, action),
   )
 }

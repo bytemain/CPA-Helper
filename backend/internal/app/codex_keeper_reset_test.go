@@ -31,6 +31,16 @@ type keeperResetAccountsResponse struct {
 // a successful CLIProxyAPI reset-quota call increments the per-auth counter
 // (visible via /accounts), a CLIProxyAPI failure surfaces the error WITHOUT
 // incrementing, and bad requests are rejected before any CLIProxyAPI call.
+func accountsResetCount(t *testing.T, handler http.Handler, cookies []*http.Cookie) int {
+	t.Helper()
+	accounts := keeperResetAccountsResponse{}
+	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &accounts)
+	if len(accounts.Items) != 1 {
+		t.Fatalf("accounts listing has %d items, want 1", len(accounts.Items))
+	}
+	return accounts.Items[0].QuotaResetCount
+}
+
 func TestKeeperQuotaReset(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -48,7 +58,7 @@ func TestKeeperQuotaReset(t *testing.T) {
 
 	var mu sync.Mutex
 	resetCalls := []string{}
-	failResets := false
+	resetMode := "ok" // ok | http-fail | empty-body | wrong-index | bad-status
 
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -77,16 +87,23 @@ func TestKeeperQuotaReset(t *testing.T) {
 				return
 			}
 			mu.Lock()
-			shouldFail := failResets
-			if !shouldFail {
+			mode := resetMode
+			if mode == "ok" {
 				resetCalls = append(resetCalls, payload.AuthIndex)
 			}
 			mu.Unlock()
-			if shouldFail {
+			switch mode {
+			case "http-fail":
 				http.Error(w, "boom", http.StatusBadRequest)
-				return
+			case "empty-body":
+				_, _ = w.Write([]byte(`{}`))
+			case "wrong-index":
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": "someone-else", "models": []string{}})
+			case "bad-status":
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "error", "auth_index": payload.AuthIndex})
+			default:
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": payload.AuthIndex, "models": []string{}})
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": payload.AuthIndex, "models": []string{}})
 		default:
 			http.NotFound(w, r)
 		}
@@ -136,30 +153,51 @@ func TestKeeperQuotaReset(t *testing.T) {
 	}
 	mu.Unlock()
 
-	// Second reset increments to 2.
+	// Wire minimalism: the reset response must not leak internal account fields.
+	raw := map[string]json.RawMessage{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &raw)
+	var accountFields map[string]any
+	if err := json.Unmarshal(raw["account"], &accountFields); err != nil {
+		t.Fatalf("decode reset account payload: %v", err)
+	}
+	for key := range accountFields {
+		switch key {
+		case "name", "quota_reset_count", "last_quota_reset_at":
+		default:
+			t.Fatalf("reset response leaks internal field %q (payload %v)", key, accountFields)
+		}
+	}
+
+	// Third reset (after the wire-minimalism reset above) increments to 3.
 	reset = keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Account.QuotaResetCount != 2 {
-		t.Fatalf("second reset count = %d, want 2", reset.Account.QuotaResetCount)
+	if reset.Account.QuotaResetCount != 3 {
+		t.Fatalf("third reset count = %d, want 3", reset.Account.QuotaResetCount)
 	}
 
-	// The accounts listing carries the counter.
+	// The accounts listing carries the counter (3 successful resets so far).
 	accounts := keeperResetAccountsResponse{}
 	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &accounts)
-	if len(accounts.Items) != 1 || accounts.Items[0].QuotaResetCount != 2 || accounts.Items[0].LastQuotaResetAt == nil {
-		t.Fatalf("accounts listing = %+v, want quota_reset_count 2 with timestamp", accounts.Items)
+	if len(accounts.Items) != 1 || accounts.Items[0].QuotaResetCount != 3 || accounts.Items[0].LastQuotaResetAt == nil {
+		t.Fatalf("accounts listing = %+v, want quota_reset_count 3 with timestamp", accounts.Items)
 	}
 
-	// CLIProxyAPI failure surfaces an error and must NOT increment the counter.
-	mu.Lock()
-	failResets = true
-	mu.Unlock()
-	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
-	accounts = keeperResetAccountsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &accounts)
-	if accounts.Items[0].QuotaResetCount != 2 {
-		t.Fatalf("count after failed reset = %d, want unchanged 2", accounts.Items[0].QuotaResetCount)
+	// Any CLIProxyAPI outcome short of a confirmed reset (HTTP failure, or a
+	// deceptive 2xx whose body lacks status=ok for our exact auth_index) must
+	// surface an error and must NOT increment the counter.
+	baseline := accountsResetCount(t, handler, cookies)
+	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status"} {
+		mu.Lock()
+		resetMode = mode
+		mu.Unlock()
+		requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+		if got := accountsResetCount(t, handler, cookies); got != baseline {
+			t.Fatalf("count after %s reset = %d, want unchanged %d", mode, got, baseline)
+		}
 	}
+	mu.Lock()
+	resetMode = "ok"
+	mu.Unlock()
 
 	// Bad requests are rejected before any CLIProxyAPI call.
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": ""}, cookies, http.StatusUnprocessableEntity)
