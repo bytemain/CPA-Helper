@@ -358,23 +358,24 @@ func (r *KeeperRunner) StartAccounts(authNames []string) error {
 	return nil
 }
 
-// RunAccountsSync inspects the given accounts synchronously through the same
-// runner discipline as StartAccounts — it acquires the global "accounts" mode
-// (so status/running_modes reflect it and a conflicting daemon/once tick backs
-// off) and wires the per-auth locks (so it never double-inspects an account a
-// background run already holds). Unlike StartAccounts it blocks until the run
-// finishes, so a caller (e.g. reset-quota) can guarantee the fresh state is
-// written before it responds. Returns conflictError when another run holds a
-// conflicting mode; the caller decides whether that is fatal.
-func (r *KeeperRunner) RunAccountsSync(authNames []string) (keeperStats, error) {
+// InspectAccountsLocked inspects the given accounts synchronously using ONLY the
+// per-auth locks — deliberately not the global "accounts" mode. The per-auth lock
+// is the correctness-critical guard (it never double-inspects an account another
+// run already holds, and prevents a stale concurrent write from clobbering a fresh
+// snapshot). Skipping the global mutex means a targeted reset refresh of account B
+// is not blocked by an unrelated run inspecting account A — that unrelated run
+// would never refresh B, so blocking would leave B's post-reset snapshot stale.
+// It blocks until done so the caller (reset-quota) can guarantee the write first.
+func (r *KeeperRunner) InspectAccountsLocked(authNames []string) (keeperStats, error) {
 	names, err := normalizeKeeperAuthNames(authNames)
 	if err != nil {
 		return keeperStats{}, err
 	}
-	if !r.markRunning("accounts") {
-		return keeperStats{}, conflictError("Codex Keeper 正在运行")
-	}
-	return r.runAccounts("accounts", names)
+	options := keeperRunOptionsForMode("accounts", names)
+	options.TryLockAuthName = r.tryLockAuthName
+	options.UnlockAuthName = r.unlockAuthName
+	stats, _, err := r.app.executeKeeperRunWithOptions(context.Background(), options, r.log)
+	return stats, err
 }
 
 func (r *KeeperRunner) StartDaemon() error {
@@ -1040,12 +1041,12 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		// reset-credit state is refreshed in the DB (a reset consumes a credit and
 		// clears the cooldown). The frontend reloads accounts right after a successful
 		// reset, so it then shows the fresh state instead of the stale pre-reset
-		// snapshot. This goes through the runner (RunAccountsSync) so it holds the
-		// global "accounts" mode and the per-auth lock — it never runs concurrently
-		// with a background inspection of the same account. Best-effort: the reset
-		// already succeeded, so the refresh outcome is audited (skipped/error/ok) but
-		// never fails the response — a conflicting background run will refresh it.
-		stats, ierr := a.keeper.RunAccountsSync([]string{name})
+		// snapshot. InspectAccountsLocked holds the per-auth lock (never concurrent
+		// with a background inspection of the same account) but not the global
+		// "accounts" mode, so an unrelated run inspecting a different account does not
+		// block this one. Best-effort: the reset already succeeded, so the refresh
+		// outcome is audited (skipped/error/ok) but never fails the response.
+		stats, ierr := a.keeper.InspectAccountsLocked([]string{name})
 		if result, reason := keeperRefreshAuditOutcome(stats, ierr); reason != "" {
 			a.auditKeeperOp("reset-quota-refresh", name, "result", result, "reason", reason)
 		} else {
