@@ -153,6 +153,7 @@ func TestParseKeeperResetCreditsMalformed(t *testing.T) {
 		"non-int available_count":    `{"available_count":"lots","credits":[]}`,
 		"fractional available_count": `{"available_count":2.5,"credits":[]}`,
 		"negative available_count":   `{"available_count":-1,"credits":[]}`,
+		"oversized available_count":  `{"available_count":1e19,"credits":[]}`,
 		"credits not array":          `{"available_count":1,"credits":{}}`,
 		"missing credits":            `{"available_count":1}`,
 	}

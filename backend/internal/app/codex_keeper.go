@@ -3048,10 +3048,16 @@ func parseStoredKeeperResetCredits(value sql.NullString) []keeperResetCredit {
 	return credits
 }
 
+// keeperMaxSafeCount is the largest count we accept: 2^53-1, the JSON
+// safe-integer limit. A float64 represents integers exactly only up to this
+// bound, so a larger value cannot be trusted as an exact count (and int(f) could
+// overflow), and available_count is realistically tiny anyway.
+const keeperMaxSafeCount = 1<<53 - 1
+
 // keeperStrictNonNegInt accepts only a JSON integer value (float64 with no
-// fractional part) that is >= 0. It rejects fractional numbers (e.g. 2.5),
-// negatives, strings, and non-numeric values so a malformed available_count fails
-// closed instead of being silently truncated by keeperIntPtr.
+// fractional part) in [0, 2^53-1]. It rejects fractional numbers (e.g. 2.5),
+// negatives, out-of-range/NaN/Inf, strings, and non-numeric values so a malformed
+// available_count fails closed instead of being silently truncated by keeperIntPtr.
 func keeperStrictNonNegInt(value any) (int, bool) {
 	f, ok := value.(float64)
 	if !ok {
@@ -3060,7 +3066,7 @@ func keeperStrictNonNegInt(value any) (int, bool) {
 	if math.IsNaN(f) || math.IsInf(f, 0) {
 		return 0, false
 	}
-	if f < 0 || f != math.Trunc(f) {
+	if f < 0 || f > keeperMaxSafeCount || f != math.Trunc(f) {
 		return 0, false
 	}
 	return int(f), true
