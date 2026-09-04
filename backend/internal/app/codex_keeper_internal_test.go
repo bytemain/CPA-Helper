@@ -2385,3 +2385,97 @@ func TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity(t *testing.T) {
 		t.Fatalf("unknown identity (nil auth_index) must preserve snapshot, not clear: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
 	}
 }
+
+// TestKeeperResetInspectHonorsPerAuthLock proves the fix for the concurrency
+// blocker: the reset-triggered inspection now goes through RunAccountsSync, which
+// wires the runner's per-auth lock. When a background run already holds the lock
+// for the account, the sync inspect must SKIP it (no concurrent usage request),
+// instead of the old direct executeKeeperRunForAccounts call that bypassed the
+// lock and issued a second in-flight usage request for the same account.
+func TestKeeperResetInspectHonorsPerAuthLock(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "locked.json"
+	var mu sync.Mutex
+	usageCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-lock",
+				"email": "lock@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			mu.Lock()
+			usageCalls++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	// A background daemon run holds the per-auth lock for this account.
+	if !app.keeper.markRunning("daemon") {
+		t.Fatal("could not mark daemon running")
+	}
+	if !app.keeper.tryLockAuthName("daemon", authName) {
+		t.Fatal("could not acquire per-auth lock for the simulated background run")
+	}
+
+	// The reset-triggered sync inspect must skip the locked account: "accounts" does
+	// not conflict with "daemon" at the mode level, so markRunning succeeds and the
+	// per-auth lock is the guard that must prevent a concurrent inspection.
+	if err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
+		t.Fatalf("RunAccountsSync returned %v; expected it to run and skip the locked account", err)
+	}
+	mu.Lock()
+	got := usageCalls
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("usage calls = %d, want 0 — the sync inspect bypassed the per-auth lock and inspected a locked account", got)
+	}
+
+	// Once the background run releases the lock, a fresh sync inspect proceeds.
+	app.keeper.unlockAuthName(authName)
+	if err := app.keeper.RunAccountsSync([]string{authName}); err != nil {
+		t.Fatalf("RunAccountsSync after unlock: %v", err)
+	}
+	mu.Lock()
+	got = usageCalls
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("usage calls still 0 after unlock — the sync inspect never ran even when the lock was free")
+	}
+}
+
+// TestRunAccountsSyncRejectsConflictingMode proves a second "accounts" run (the
+// same mode) is rejected rather than run concurrently.
+func TestRunAccountsSyncRejectsConflictingMode(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	if !app.keeper.markRunning("accounts") {
+		t.Fatal("could not mark accounts running")
+	}
+	if err := app.keeper.RunAccountsSync([]string{"whatever.json"}); err == nil {
+		t.Fatal("expected conflictError when an accounts run is already active")
+	}
+}

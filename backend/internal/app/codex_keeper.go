@@ -358,6 +358,26 @@ func (r *KeeperRunner) StartAccounts(authNames []string) error {
 	return nil
 }
 
+// RunAccountsSync inspects the given accounts synchronously through the same
+// runner discipline as StartAccounts — it acquires the global "accounts" mode
+// (so status/running_modes reflect it and a conflicting daemon/once tick backs
+// off) and wires the per-auth locks (so it never double-inspects an account a
+// background run already holds). Unlike StartAccounts it blocks until the run
+// finishes, so a caller (e.g. reset-quota) can guarantee the fresh state is
+// written before it responds. Returns conflictError when another run holds a
+// conflicting mode; the caller decides whether that is fatal.
+func (r *KeeperRunner) RunAccountsSync(authNames []string) error {
+	names, err := normalizeKeeperAuthNames(authNames)
+	if err != nil {
+		return err
+	}
+	if !r.markRunning("accounts") {
+		return conflictError("Codex Keeper 正在运行")
+	}
+	r.runAccounts("accounts", names)
+	return nil
+}
+
 func (r *KeeperRunner) StartDaemon() error {
 	cfg, err := r.app.loadConfig(context.Background())
 	if err != nil {
@@ -975,10 +995,13 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		// reset-credit state is refreshed in the DB (a reset consumes a credit and
 		// clears the cooldown). The frontend reloads accounts right after a successful
 		// reset, so it then shows the fresh state instead of the stale pre-reset
-		// snapshot. Best-effort: the reset already succeeded, so an inspection error is
-		// logged but does not fail the response.
-		if _, _, ierr := a.executeKeeperRunForAccounts(r.Context(), "accounts", []string{name}, a.keeper.log); ierr != nil {
-			a.auditKeeperOp("reset-quota-refresh", name, "result", "error", "error", ierr.Error())
+		// snapshot. This goes through the runner (RunAccountsSync) so it holds the
+		// global "accounts" mode and the per-auth lock — it never runs concurrently
+		// with a background inspection of the same account. Best-effort: the reset
+		// already succeeded, so a conflict or inspection error is logged (the running
+		// background run will refresh the account) but does not fail the response.
+		if ierr := a.keeper.RunAccountsSync([]string{name}); ierr != nil {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", "skipped", "reason", ierr.Error())
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
 		return nil
