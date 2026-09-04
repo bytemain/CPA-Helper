@@ -297,6 +297,53 @@ func TestFetchKeeperResetCreditsSuccess(t *testing.T) {
 	}
 }
 
+// TestFetchKeeperResetCreditsRejectsDeceptiveInnerStatus pins strict inner-status
+// parsing: an outer 2xx api-call whose inner status_code is a fractional number,
+// a numeric string, or negative must NOT be accepted as success (which would
+// overwrite the snapshot). Only a strict integer in [200,300) succeeds.
+func TestFetchKeeperResetCreditsRejectsDeceptiveInnerStatus(t *testing.T) {
+	var body map[string]any
+	_ = json.Unmarshal([]byte(realResetCreditsBody), &body)
+
+	rawStatusCPA := func(statusValue any) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			// Encode status_code as the raw JSON provided so a non-integer survives.
+			payload := `{"status_code":` + statusValue.(string) + `,"body":` + mustMarshal(body) + `}`
+			_, _ = w.Write([]byte(payload))
+		}))
+	}
+	reject := []struct {
+		name      string
+		statusRaw string
+	}{
+		{"fractional 200.5", "200.5"},
+		{"string \"200\"", `"200"`},
+		{"negative -1", "-1"},
+		{"null", "null"},
+	}
+	for _, tc := range reject {
+		t.Run(tc.name, func(t *testing.T) {
+			cpa := rawStatusCPA(tc.statusRaw)
+			defer cpa.Close()
+			if _, _, ok := (&App{}).fetchKeeperResetCredits(context.Background(), fetchResetCreditsCfg(cpa.URL), map[string]any{"auth_index": "idx-1"}); ok {
+				t.Fatalf("%s: expected ok=false (deceptive inner status must not be accepted)", tc.name)
+			}
+		})
+	}
+	// Sanity: a strict integer 200 still succeeds.
+	cpa := rawStatusCPA("200")
+	defer cpa.Close()
+	if _, _, ok := (&App{}).fetchKeeperResetCredits(context.Background(), fetchResetCreditsCfg(cpa.URL), map[string]any{"auth_index": "idx-1"}); !ok {
+		t.Fatal("strict integer status_code 200 should succeed")
+	}
+}
+
+func mustMarshal(v any) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
 func TestFetchKeeperResetCreditsInnerErrorsPreserve(t *testing.T) {
 	var body map[string]any
 	_ = json.Unmarshal([]byte(realResetCreditsBody), &body)

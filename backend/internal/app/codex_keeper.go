@@ -2952,11 +2952,26 @@ func (a *App) fetchKeeperResetCredits(ctx context.Context, cfg AppConfig, detail
 	if err := json.Unmarshal(payload, &raw); err != nil {
 		return 0, nil, false
 	}
-	statusCode := keeperIntPtr(raw["status_code"], raw["statusCode"])
-	if statusCode == nil || *statusCode < 200 || *statusCode >= 300 {
+	// The inner status must be a strict JSON integer in the 2xx range. Reusing the
+	// lenient keeperIntPtr would let a deceptive status_code of 200.5 (truncated) or
+	// "200" (string) pass as success and overwrite the snapshot, so parse it strictly.
+	if !keeperInnerStatusOK(raw) {
 		return 0, nil, false
 	}
 	return parseKeeperResetCredits(keeperBodyJSON(raw["body"]))
+}
+
+// keeperInnerStatusOK reports whether the api-call wrapper's inner status is a
+// strict non-negative JSON integer in [200,300). It prefers status_code and only
+// falls back to statusCode when status_code is absent; a present-but-malformed
+// status_code (fractional, string, negative, out-of-range) fails closed.
+func keeperInnerStatusOK(raw map[string]any) bool {
+	value, present := raw["status_code"]
+	if !present {
+		value = raw["statusCode"]
+	}
+	status, ok := keeperStrictNonNegInt(value)
+	return ok && status >= 200 && status < 300
 }
 
 // parseKeeperResetCredits validates and projects a rate-limit-reset-credits body.
