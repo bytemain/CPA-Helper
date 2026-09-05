@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -2383,5 +2384,385 @@ func TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity(t *testing.T) {
 	}
 	if state.ResetCreditCount == nil || *state.ResetCreditCount != 2 || len(state.ResetCredits) != 1 {
 		t.Fatalf("unknown identity (nil auth_index) must preserve snapshot, not clear: count=%v credits=%d", state.ResetCreditCount, len(state.ResetCredits))
+	}
+}
+
+// TestKeeperResetInspectHonorsPerAuthLock proves the fix for the concurrency
+// blocker: the reset-triggered inspection goes through InspectAccountsLocked, which
+// wires the runner's per-auth lock. When a background run already holds the lock
+// for the account, the sync inspect must SKIP it (no concurrent usage request),
+// instead of the old direct executeKeeperRunForAccounts call that bypassed the
+// lock and issued a second in-flight usage request for the same account.
+func TestKeeperResetInspectHonorsPerAuthLock(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "locked.json"
+	var mu sync.Mutex
+	usageCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-lock",
+				"email": "lock@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			mu.Lock()
+			usageCalls++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	// A background run holds the per-auth lock for this account.
+	if !app.keeper.tryLockAuthName("daemon", authName) {
+		t.Fatal("could not acquire per-auth lock for the simulated background run")
+	}
+
+	// The reset-triggered sync inspect must skip the locked account — the per-auth
+	// lock is the guard that prevents a concurrent inspection of the same account.
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("InspectAccountsLocked returned %v; expected it to run and skip the locked account", err)
+	}
+	mu.Lock()
+	got := usageCalls
+	mu.Unlock()
+	if got != 0 {
+		t.Fatalf("usage calls = %d, want 0 — the sync inspect bypassed the per-auth lock and inspected a locked account", got)
+	}
+
+	// Once the background run releases the lock, a fresh sync inspect proceeds.
+	app.keeper.unlockAuthName(authName)
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("InspectAccountsLocked after unlock: %v", err)
+	}
+	mu.Lock()
+	got = usageCalls
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("usage calls still 0 after unlock — the sync inspect never ran even when the lock was free")
+	}
+}
+
+// TestKeeperResetInspectNotBlockedByUnrelatedRun proves a targeted reset refresh
+// is NOT blocked by an unrelated run occupying the global "accounts" mode: the
+// account is still inspected (per-auth lock only, no global mode gate). Under the
+// old RunAccountsSync (markRunning "accounts") this returned conflict and left the
+// target's post-reset snapshot stale — this test would then show 0 usage calls.
+func TestKeeperResetInspectNotBlockedByUnrelatedRun(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const target = "target.json"
+	var mu sync.Mutex
+	usageCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": target, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": target, "type": "codex", "auth_index": "idx-target",
+				"email": "t@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			mu.Lock()
+			usageCalls++
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	// An unrelated manual refresh already occupies the global "accounts" mode.
+	if !app.keeper.markRunning("accounts") {
+		t.Fatal("could not mark accounts running")
+	}
+	// The targeted reset refresh of a DIFFERENT account must still run.
+	if _, err := app.keeper.InspectAccountsLocked([]string{target}); err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	mu.Lock()
+	got := usageCalls
+	mu.Unlock()
+	if got == 0 {
+		t.Fatal("usage calls = 0 — the reset refresh was blocked by an unrelated accounts run")
+	}
+}
+
+// TestKeeperSafeReason proves audit reasons are stable machine codes and never
+// leak a raw error message (which could carry a URL/token/upstream detail).
+func TestKeeperSafeReason(t *testing.T) {
+	if got := keeperSafeReason(nil); got != "ok" {
+		t.Fatalf("nil -> %q, want ok", got)
+	}
+	if got := keeperSafeReason(validationError("auth_index missing")); got != "validation_error" {
+		t.Fatalf("validationError -> %q, want validation_error", got)
+	}
+	if got := keeperSafeReason(notFoundError("gone")); got != "not_found" {
+		t.Fatalf("notFoundError -> %q, want not_found", got)
+	}
+	if got := keeperSafeReason(conflictError("busy")); got != "conflict" {
+		t.Fatalf("conflictError -> %q, want conflict", got)
+	}
+	raw := errors.New("dial https://cpa.internal:8317 failed: token=sk-secret")
+	got := keeperSafeReason(raw)
+	if got != "internal_error" {
+		t.Fatalf("opaque error -> %q, want internal_error", got)
+	}
+	if strings.Contains(got, "token") || strings.Contains(got, "cpa.internal") || strings.Contains(got, "sk-secret") {
+		t.Fatalf("safe reason leaked raw error content: %q", got)
+	}
+}
+
+// TestKeeperRefreshAuditOutcome pins the post-reset refresh audit classification so
+// the reconciliation log never misreports: a mode conflict is skipped (not error),
+// a real run error is error, a vanished target (Total==0) is skipped/not_inspected
+// (not ok), and only a genuine inspection is ok.
+func TestKeeperRefreshAuditOutcome(t *testing.T) {
+	cases := []struct {
+		name       string
+		stats      keeperStats
+		err        error
+		wantResult string
+		wantReason string
+	}{
+		{"conflict is skipped", keeperStats{}, conflictError("busy"), "skipped", "conflict"},
+		{"validation is error", keeperStats{}, validationError("bad"), "error", "validation_error"},
+		{"opaque run error", keeperStats{}, errors.New("dial cpa.internal token=sk"), "error", "internal_error"},
+		{"network error", keeperStats{Total: 1, NetworkError: 1}, nil, "error", "network_error"},
+		{"status disabled (bad creds)", keeperStats{Total: 1, StatusDisabled: 1}, nil, "error", "status_disabled"},
+		{"healthy but state write failed", keeperStats{Total: 1, Healthy: 1, StateWriteError: 1}, nil, "error", "state_write_error"},
+		{"per-auth lock skip", keeperStats{Total: 1, Skipped: 1}, nil, "skipped", "account_busy"},
+		{"vanished target not inspected", keeperStats{Total: 0}, nil, "skipped", "not_inspected"},
+		{"inspected ok", keeperStats{Total: 1, Healthy: 1}, nil, "ok", ""},
+		{"healthy but reset-credits unavailable is partial", keeperStats{Total: 1, Healthy: 1, ResetCreditsUnavailable: 1}, nil, "partial", "reset_credits_unavailable"},
+		{"recovered enabled ok", keeperStats{Total: 1, StatusEnabled: 1}, nil, "ok", ""},
+		{"priority degraded ok", keeperStats{Total: 1, PriorityDegraded: 1}, nil, "ok", ""},
+		{"priority restored ok", keeperStats{Total: 1, PriorityRestored: 1}, nil, "ok", ""},
+		{"total>0 no outcome not ok", keeperStats{Total: 1}, nil, "skipped", "not_inspected"},
+		{"partial batch not ok", keeperStats{Total: 2, Healthy: 1}, nil, "skipped", "not_inspected"},
+		{"disabled prioritized over skipped", keeperStats{Total: 2, StatusDisabled: 1, Skipped: 1}, nil, "error", "status_disabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result, reason := keeperRefreshAuditOutcome(tc.stats, tc.err)
+			if result != tc.wantResult || reason != tc.wantReason {
+				t.Fatalf("got (%q,%q), want (%q,%q)", result, reason, tc.wantResult, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestKeeperResetCreditsFetchFailureFlagged proves that when usage succeeds but the
+// reset-credit fetch fails (inner 401/malformed/transport), the account stays
+// healthy but the run reports ResetCreditsUnavailable — so a post-reset refresh is
+// audited partial (reset_credits_unavailable), not a false ok.
+func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "creds-fail.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-cf",
+				"email": "cf@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				// Reset-credit fetch fails at the inner layer.
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 401, "body": map[string]any{"detail": "unauth"}})
+				return
+			}
+			// Usage check succeeds -> account healthy.
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	// Usage succeeded, so the account reaches an ok-class outcome (healthy or a
+	// priority action), never disabled/network — the point is the account is fine.
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount != 1 || stats.NetworkError != 0 || stats.StatusDisabled != 0 {
+		t.Fatalf("expected one healthy-class outcome, stats=%+v", stats)
+	}
+	if stats.ResetCreditsUnavailable != 1 {
+		t.Fatalf("ResetCreditsUnavailable = %d, want 1 (reset-credit fetch failed)", stats.ResetCreditsUnavailable)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "partial" || reason != "reset_credits_unavailable" {
+		t.Fatalf("audit outcome = (%q,%q), want (partial, reset_credits_unavailable)", result, reason)
+	}
+}
+
+// TestKeeperStatsAddSumsEveryField guards keeperStats.add so a newly added counter
+// (e.g. ResetCreditsUnavailable) is not silently dropped by the generalized
+// aggregation. Every field is given a distinct value and must sum.
+func TestKeeperStatsAddSumsEveryField(t *testing.T) {
+	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9, StateWriteError: 11}
+	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90, StateWriteError: 110}
+	base.add(delta)
+	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99, StateWriteError: 121}
+	if base != want {
+		t.Fatalf("add sum = %+v, want %+v", base, want)
+	}
+}
+
+// TestKeeperResetInspectStateWriteFailure proves a DB write-back failure is not
+// swallowed: with a BEFORE UPDATE trigger aborting the upsert, the account still
+// inspects healthy, but the run reports StateWriteError, the stored snapshot is
+// unchanged, and the audit outcome is error/state_write_error (never ok).
+func TestKeeperResetInspectStateWriteFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	const authName = "writefail.json"
+	credit := map[string]any{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": "2026-09-21T00:08:46.146320Z"}
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-wf",
+				"email": "wf@example.com", "account_type": "pro", "disabled": false,
+				"priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var payload struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 1, "credits": []map[string]any{credit}}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+			}})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+
+	// First inspection creates the row (INSERT, before the trigger exists).
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+	before, err := app.getKeeperState(context.Background(), authName)
+	if err != nil {
+		t.Fatalf("get before: %v", err)
+	}
+
+	// Make every subsequent UPDATE fail, as the review probe did.
+	if _, err := app.db.ExecContext(context.Background(),
+		`CREATE TRIGGER block_keeper_update BEFORE UPDATE ON codex_keeper_auth_states BEGIN SELECT RAISE(ABORT, 'blocked'); END;`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+
+	// Second inspection: usage/reset-credits succeed, but the upsert (now an UPDATE)
+	// aborts. The failure must surface, not be swallowed.
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("second inspect: %v", err)
+	}
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount < 1 {
+		t.Fatalf("expected a healthy-class outcome, stats=%+v", stats)
+	}
+	if stats.StateWriteError != 1 {
+		t.Fatalf("StateWriteError = %d, want 1 (write-back failure must be recorded)", stats.StateWriteError)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "state_write_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, state_write_error)", result, reason)
+	}
+
+	// The stored snapshot must be unchanged (the aborted UPDATE wrote nothing).
+	after, err := app.getKeeperState(context.Background(), authName)
+	if err != nil {
+		t.Fatalf("get after: %v", err)
+	}
+	if before.LastCheckedAt == nil || after.LastCheckedAt == nil || !before.LastCheckedAt.Equal(*after.LastCheckedAt) {
+		t.Fatalf("last_checked_at changed despite a failed write: before=%v after=%v", before.LastCheckedAt, after.LastCheckedAt)
+	}
+
+	// The raw DB error (the trigger's RAISE text) must NOT reach the Keeper UI log;
+	// only the stable marker is user-visible.
+	lines, err := app.loadKeeperLogLines(500)
+	if err != nil {
+		t.Fatalf("load keeper log lines: %v", err)
+	}
+	sawMarker := false
+	for _, line := range lines {
+		if strings.Contains(line, "blocked") {
+			t.Fatalf("raw DB error leaked into Keeper log: %q", line)
+		}
+		if strings.Contains(line, "state_write_error") {
+			sawMarker = true
+		}
+	}
+	if !sawMarker {
+		t.Fatal("expected a stable state_write_error marker in the Keeper log")
 	}
 }

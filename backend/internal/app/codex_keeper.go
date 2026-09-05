@@ -63,6 +63,14 @@ type keeperStats struct {
 	PriorityRestored int `json:"priority_restored"`
 	Skipped          int `json:"skipped"`
 	NetworkError     int `json:"network_error"`
+	// ResetCreditsUnavailable counts otherwise-healthy accounts whose reset-credit
+	// fetch failed this run (snapshot preserved, health unchanged). Not persisted to
+	// the runs table; used to audit a post-reset refresh as partial.
+	ResetCreditsUnavailable int `json:"reset_credits_unavailable"`
+	// StateWriteError counts accounts whose state write-back to the DB failed this
+	// run. The inspection may have looked healthy, but nothing was persisted — so a
+	// post-reset refresh must be audited as error, not ok.
+	StateWriteError int `json:"state_write_error"`
 }
 
 type keeperStatusResponse struct {
@@ -294,6 +302,12 @@ type keeperAccountResult struct {
 	// good data. A successful empty result carries a non-nil count of 0.
 	ResetCreditCount *int
 	ResetCredits     *string
+	// ResetCreditsUnavailable is set when the account is healthy but its reset-credit
+	// fetch failed, so the snapshot was not refreshed this inspection.
+	ResetCreditsUnavailable bool
+	// StateWriteFailed is set when persisting this result to the DB failed, so the
+	// inspection did not actually update the stored state.
+	StateWriteFailed bool
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -356,6 +370,26 @@ func (r *KeeperRunner) StartAccounts(authNames []string) error {
 	}
 	go r.runAccounts("accounts", names)
 	return nil
+}
+
+// InspectAccountsLocked inspects the given accounts synchronously using ONLY the
+// per-auth locks — deliberately not the global "accounts" mode. The per-auth lock
+// is the correctness-critical guard (it never double-inspects an account another
+// run already holds, and prevents a stale concurrent write from clobbering a fresh
+// snapshot). Skipping the global mutex means a targeted reset refresh of account B
+// is not blocked by an unrelated run inspecting account A — that unrelated run
+// would never refresh B, so blocking would leave B's post-reset snapshot stale.
+// It blocks until done so the caller (reset-quota) can guarantee the write first.
+func (r *KeeperRunner) InspectAccountsLocked(authNames []string) (keeperStats, error) {
+	names, err := normalizeKeeperAuthNames(authNames)
+	if err != nil {
+		return keeperStats{}, err
+	}
+	options := keeperRunOptionsForMode("accounts", names)
+	options.TryLockAuthName = r.tryLockAuthName
+	options.UnlockAuthName = r.unlockAuthName
+	stats, _, err := r.app.executeKeeperRunWithOptions(context.Background(), options, r.log)
+	return stats, err
 }
 
 func (r *KeeperRunner) StartDaemon() error {
@@ -691,7 +725,7 @@ func (r *KeeperRunner) run(mode string) {
 	r.runAccounts(mode, nil)
 }
 
-func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
+func (r *KeeperRunner) runAccounts(mode string, authNames []string) (keeperStats, error) {
 	options := keeperRunOptionsForMode(mode, authNames)
 	options.TryLockAuthName = r.tryLockAuthName
 	options.UnlockAuthName = r.unlockAuthName
@@ -725,6 +759,7 @@ func (r *KeeperRunner) runAccounts(mode string, authNames []string) {
 	if strings.TrimSpace(logMessage) != "" {
 		r.log(logMessage)
 	}
+	return stats, err
 }
 
 func (r *KeeperRunner) log(message string) {
@@ -760,6 +795,88 @@ func formatKeeperLogLine(timestamp time.Time, message string) string {
 	record.AddAttrs(slog.String("component", keeperLogComponent))
 	_ = handler.Handle(context.Background(), record)
 	return strings.TrimSuffix(output.String(), "\n")
+}
+
+// auditKeeperOp records a successful single-account operation (reset-quota, enable,
+// disable, delete, …) to both the Keeper run log (UI + rotating log file) and the
+// process log (journalctl). CPA-Helper previously logged only on error/panic, so
+// HTTP-200 mutations left no per-account audit trail; this closes that gap for
+// troubleshooting and reconciliation. kv are alternating key/value pairs.
+func (a *App) auditKeeperOp(op, authName string, kv ...any) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "[%s] %s", op, authName)
+	for i := 0; i+1 < len(kv); i += 2 {
+		fmt.Fprintf(&b, " %v=%v", kv[i], kv[i+1])
+	}
+	if a.keeper != nil {
+		a.keeper.log(b.String())
+	}
+	args := append([]any{"op", op, "account", authName}, kv...)
+	slog.Info("codex_keeper op", args...)
+}
+
+// keeperSafeReason maps an error to a stable, non-sensitive reason code for audit
+// logs. Known AppErrors expose their machine code (e.g. not_found, conflict,
+// validation_error); anything else collapses to "internal_error" so a raw error
+// message (which could carry a URL, token, or upstream detail) never reaches the log.
+func keeperSafeReason(err error) string {
+	if err == nil {
+		return "ok"
+	}
+	var appErr *AppError
+	if errors.As(err, &appErr) && appErr.Code != "" {
+		return appErr.Code
+	}
+	return "internal_error"
+}
+
+// keeperRefreshAuditOutcome classifies the result of the post-reset single-account
+// re-inspection for the audit log, so the trail never misreports a refresh:
+//   - a mode conflict (a background run holds "accounts") is skipped, not an error —
+//     that run will refresh the account;
+//   - any other run error (auth-file list transport/parse, normalize) is a real error;
+//   - a network error during the inspect is an error;
+//   - a per-auth lock skip is skipped/account_busy;
+//   - Total==0 means the account was absent from the remote list, so nothing was
+//     inspected — skipped/not_inspected, NOT ok;
+//   - otherwise the account was inspected and written: ok.
+func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, reason string) {
+	switch {
+	case err != nil:
+		reason = keeperSafeReason(err)
+		if reason == "conflict" {
+			return "skipped", "conflict"
+		}
+		return "error", reason
+	case stats.StateWriteError > 0:
+		// The inspection may have looked healthy, but the state write-back to the DB
+		// failed — nothing was persisted, so this is never a successful refresh.
+		return "error", "state_write_error"
+	case stats.NetworkError > 0:
+		return "error", "network_error"
+	case stats.StatusDisabled > 0:
+		// The account was disabled during the inspect (invalid/expired credentials)
+		// before the usage + reset-credit fetch could refresh the snapshot.
+		return "error", "status_disabled"
+	case stats.Skipped > 0:
+		return "skipped", "account_busy"
+	case stats.Total == 0:
+		return "skipped", "not_inspected"
+	}
+	// Only these post-fetch outcomes mean a snapshot was actually refreshed. Require
+	// every inspected account to have completed (Total == okCount) so a partially
+	// completed batch is never reported ok; for the single-account reset refresh
+	// this is simply "the one account completed".
+	okCount := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okCount > 0 && stats.Total == okCount {
+		// The account(s) inspected healthily, but if the reset-credit fetch itself
+		// failed the snapshot — the whole point of this refresh — was not updated.
+		if stats.ResetCreditsUnavailable > 0 {
+			return "partial", "reset_credits_unavailable"
+		}
+		return "ok", ""
+	}
+	return "skipped", "not_inspected"
 }
 
 type keeperLogFile struct {
@@ -945,12 +1062,29 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		if err := decodeJSON(r, &payload); err != nil {
 			return err
 		}
-		if strings.TrimSpace(payload.AuthName) == "" {
+		name := strings.TrimSpace(payload.AuthName)
+		if name == "" {
 			return validationError("auth_name 不能为空")
 		}
-		result, err := a.resetKeeperQuota(r.Context(), strings.TrimSpace(payload.AuthName))
+		result, err := a.resetKeeperQuota(r.Context(), name)
 		if err != nil {
+			a.auditKeeperOp("reset-quota", name, "result", "error", "reason", keeperSafeReason(err))
 			return err
+		}
+		// Immediately re-inspect just this account so its post-reset usage / window /
+		// reset-credit state is refreshed in the DB (a reset consumes a credit and
+		// clears the cooldown). The frontend reloads accounts right after a successful
+		// reset, so it then shows the fresh state instead of the stale pre-reset
+		// snapshot. InspectAccountsLocked holds the per-auth lock (never concurrent
+		// with a background inspection of the same account) but not the global
+		// "accounts" mode, so an unrelated run inspecting a different account does not
+		// block this one. Best-effort: the reset already succeeded, so the refresh
+		// outcome is audited (skipped/error/ok) but never fails the response.
+		stats, ierr := a.keeper.InspectAccountsLocked([]string{name})
+		if result, reason := keeperRefreshAuditOutcome(stats, ierr); reason != "" {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", result, "reason", reason)
+		} else {
+			a.auditKeeperOp("reset-quota-refresh", name, "result", result)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok", "account": result})
 		return nil
@@ -1028,6 +1162,11 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		}
 		disabled := parts[2] == "disable"
 		if err := a.setKeeperAccountDisabled(r.Context(), authName, disabled); err != nil {
+			op := "enable"
+			if disabled {
+				op = "disable"
+			}
+			a.auditKeeperOp(op, authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		if disabled {
@@ -1042,6 +1181,7 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return validationError("账号名称无效")
 		}
 		if err := a.deleteKeeperAccount(r.Context(), authName); err != nil {
+			a.auditKeeperOp("delete", authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -1059,6 +1199,7 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 			return err
 		}
 		if err := a.updateKeeperAccountPriority(r.Context(), authName, payload.Priority); err != nil {
+			a.auditKeeperOp("priority", authName, "result", "error", "reason", keeperSafeReason(err))
 			return err
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -2419,13 +2560,27 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		name = "unknown"
 	}
 	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now}
+	// persistState writes the result to the DB and, if that fails, records the
+	// failure on the result (and logs it) rather than swallowing the error — so a
+	// state that never reached the DB is not later reported as a healthy refresh.
+	persistState := func(r keeperAccountResult) keeperAccountResult {
+		if err := a.upsertKeeperState(ctx, r); err != nil {
+			// Keep the raw DB error out of the user-visible Keeper log (and the
+			// audit) — surface only a stable marker there; the raw detail goes to the
+			// server process log for diagnostics.
+			logFn(r.Name + "：状态写回失败（state_write_error）")
+			log.Printf("codex keeper state write-back failed for %s: %v", r.Name, err)
+			r.StateWriteFailed = true
+		}
+		return r
+	}
 	detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, name)
 	if err != nil {
 		message := "读取 auth file 详情失败：" + err.Error()
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + message)
 		return result
 	}
@@ -2434,7 +2589,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	merged := mergeKeeperObjects(authInfo, detail)
@@ -2454,7 +2609,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	if disabled && !manualRefresh && !recoverableUnauthorizedDisabled {
 		result.Result = "disabled"
 		a.preserveKeeperBadCredentialDiagnosis(ctx, &result)
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	if keeperString(merged["access_token"]) == "" {
@@ -2466,7 +2621,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 					message = "禁用坏凭证失败：" + err.Error()
 					result.LastError = &message
 					result.Result = "network_error"
-					_ = a.upsertKeeperState(ctx, result)
+					result = persistState(result)
 					return result
 				}
 			}
@@ -2481,7 +2636,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "status_disabled"
 		result.LastError = &message
 		result.LatestAction = &action
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2492,7 +2647,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + message)
 		return result
 	}
@@ -2509,7 +2664,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 					message = "禁用坏凭证失败：" + err.Error()
 					result.Result = "network_error"
 					result.LastError = &message
-					_ = a.upsertKeeperState(ctx, result)
+					result = persistState(result)
 					return result
 				}
 			}
@@ -2524,7 +2679,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "status_disabled"
 		result.LastError = &message
 		result.LatestAction = &action
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2536,7 +2691,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.Result = "network_error"
 		result.LastError = &message
 		result.LatestAction = &message
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		return result
 	}
 	usage := parseKeeperUsageInfo(usageResult.JSONData)
@@ -2557,6 +2712,13 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 			payload := string(encoded)
 			result.ResetCredits = &payload
 		}
+	} else {
+		// The usage check succeeded (account is healthy), but the reset-credit fetch
+		// itself failed (inner 401/500, malformed, transport). The snapshot is
+		// preserved (best-effort) and account health is unchanged, but the reset
+		// credits were NOT refreshed — flag it so a post-reset refresh is audited as
+		// partial rather than falsely reported ok.
+		result.ResetCreditsUnavailable = true
 	}
 	result.Result = "healthy"
 
@@ -2568,7 +2730,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 				result.Result = "network_error"
 				result.LastError = &message
 				result.LatestAction = &message
-				_ = a.upsertKeeperState(ctx, result)
+				result = persistState(result)
 				logFn(name + ": " + message)
 				return result
 			}
@@ -2581,7 +2743,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.LatestAction = &action
 		result.ClearRestorePriority = true
 		result.LastError = nil
-		_ = a.upsertKeeperState(ctx, result)
+		result = persistState(result)
 		logFn(name + ": " + action)
 		return result
 	}
@@ -2617,7 +2779,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.ClearRestorePriority = true
 	}
 	result.LastError = nil
-	_ = a.upsertKeeperState(ctx, result)
+	result = persistState(result)
 	return result
 }
 
@@ -2733,6 +2895,12 @@ func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {
 	default:
 		stats.Skipped++
 	}
+	if result.ResetCreditsUnavailable {
+		stats.ResetCreditsUnavailable++
+	}
+	if result.StateWriteFailed {
+		stats.StateWriteError++
+	}
 }
 
 func (stats *keeperStats) add(delta keeperStats) {
@@ -2744,6 +2912,8 @@ func (stats *keeperStats) add(delta keeperStats) {
 	stats.PriorityRestored += delta.PriorityRestored
 	stats.Skipped += delta.Skipped
 	stats.NetworkError += delta.NetworkError
+	stats.ResetCreditsUnavailable += delta.ResetCreditsUnavailable
+	stats.StateWriteError += delta.StateWriteError
 }
 
 func (stats *keeperStats) mergeCachedState(state keeperAuthState) {
@@ -3250,6 +3420,7 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	if err := a.db.QueryRowContext(ctx, `SELECT reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets WHERE auth_name = ?`, authName).Scan(&count, &lastAt); err != nil {
 		return keeperQuotaResetResult{}, err
 	}
+	a.auditKeeperOp("reset-quota", authName, "result", "ok", "reset_count", count, "auth_index", authIndex)
 	return keeperQuotaResetResult{
 		Name:             authName,
 		QuotaResetCount:  count,
@@ -3460,7 +3631,15 @@ func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, dis
 		    last_checked_at = ?, last_healthy_at = COALESCE(?, last_healthy_at), updated_at = ?
 		WHERE auth_name = ?
 	`, disabled, disabled, disabled, disabled, disabled, disabled, checkedAt, lastHealthy, now, state.Name)
-	return err
+	if err != nil {
+		return err
+	}
+	op := "enable"
+	if disabled {
+		op = "disable"
+	}
+	a.auditKeeperOp(op, authName, "result", "ok")
+	return nil
 }
 
 func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
@@ -3478,8 +3657,11 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName)
-	return err
+	if _, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName); err != nil {
+		return err
+	}
+	a.auditKeeperOp("delete", authName, "result", "ok")
+	return nil
 }
 
 func (a *App) bulkDeleteKeeperAccounts(w http.ResponseWriter, r *http.Request) error {
@@ -3495,6 +3677,7 @@ func (a *App) bulkDeleteKeeperAccounts(w http.ResponseWriter, r *http.Request) e
 	failures := []map[string]string{}
 	for _, name := range names {
 		if err := a.deleteKeeperAccount(r.Context(), name); err != nil {
+			a.auditKeeperOp("delete", name, "result", "error", "reason", keeperSafeReason(err))
 			failures = append(failures, map[string]string{"name": name, "message": err.Error()})
 			continue
 		}
@@ -3519,12 +3702,15 @@ func (a *App) updateKeeperAccountPriority(ctx context.Context, authName string, 
 	if err := a.setKeeperRemotePriority(ctx, cfg, authName, &priority); err != nil {
 		return err
 	}
-	_, err = a.db.ExecContext(ctx, `
+	if _, err = a.db.ExecContext(ctx, `
 		UPDATE codex_keeper_auth_states
 		SET priority = ?, restore_priority = NULL, latest_action = NULL, last_error = NULL, updated_at = ?
 		WHERE auth_name = ?
-	`, priority, dbTime(time.Now()), authName)
-	return err
+	`, priority, dbTime(time.Now()), authName); err != nil {
+		return err
+	}
+	a.auditKeeperOp("priority", authName, "result", "ok", "priority", priority)
+	return nil
 }
 
 func (a *App) createKeeperRun(ctx context.Context, mode string) (int, error) {
