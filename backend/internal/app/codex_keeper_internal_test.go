@@ -3256,13 +3256,25 @@ func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
 	configureKeeperTestCPA(t, app, cpa.URL, nil)
 	ctx := context.Background()
 
-	// Seed a good prior snapshot for account B (auth_index idx-1, reset_credit_count 5).
+	// Seed a FULL good prior snapshot for account B: every business column set, so we can
+	// prove the identity-conflict write preserves all of them, not just reset credits.
 	idx, acctB, count := "idx-1", "acct-DETAIL-B", 5
+	email, acctType := "b@example.com", "pro"
+	prio, prim, sec, qt := 1, 40, 20, 80
+	dis := false
+	healthyAt := time.Now().Add(-time.Hour).Truncate(time.Second)
+	sub := time.Now().Add(720 * time.Hour).Truncate(time.Second)
 	if err := app.upsertKeeperState(ctx, keeperAccountResult{
-		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &acctB,
-		ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+		Name: authName, Result: "healthy", CheckedAt: healthyAt, Email: &email, AuthIndex: &idx,
+		AccountID: &acctB, AccountType: &acctType, Disabled: &dis, Priority: &prio,
+		PrimaryUsedPercent: &prim, SecondaryUsedPercent: &sec, QuotaThreshold: &qt,
+		SubscriptionActiveUntil: &sub, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
 	}); err != nil {
 		t.Fatalf("seed snapshot: %v", err)
+	}
+	before, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("read seeded state: %v", err)
 	}
 
 	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
@@ -3281,15 +3293,39 @@ func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
 	if fetches != 0 {
 		t.Fatalf("reset-credit fetched %d times on identity conflict; must not fetch from a mixed detail", fetches)
 	}
-	// The prior snapshot must be preserved (not overwritten/cleared).
+	// EVERY business column of the prior snapshot must survive intact — an identity
+	// conflict must not clobber email/auth_index/account_id/account_type/disabled/priority/
+	// usage/quota/reset-credit/subscription to NULL (a cleared auth_index would also block a
+	// later reset). Only last_error/latest_action/last_checked_at may change.
 	st, err := app.getKeeperState(ctx, authName)
 	if err != nil {
 		t.Fatalf("get state: %v", err)
 	}
-	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
-		t.Fatalf("snapshot not preserved on conflict: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	if st.Email == nil || *st.Email != "b@example.com" || st.AuthIndex == nil || *st.AuthIndex != "idx-1" ||
+		st.AccountID == nil || *st.AccountID != "acct-DETAIL-B" || st.AccountType == nil || *st.AccountType != "pro" ||
+		st.Disabled != false || st.Priority == nil || *st.Priority != 1 {
+		t.Fatalf("identity fields not preserved on conflict: %+v", st)
 	}
+	if st.PrimaryUsedPercent == nil || *st.PrimaryUsedPercent != 40 ||
+		st.SecondaryUsedPercent == nil || *st.SecondaryUsedPercent != 20 ||
+		st.QuotaThreshold == nil || *st.QuotaThreshold != 80 {
+		t.Fatalf("usage/quota not preserved on conflict: %+v", st)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
+		t.Fatalf("reset credits not preserved on conflict: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(*before.SubscriptionActiveUntil) {
+		t.Fatalf("subscription not preserved on conflict: got=%v want=%v", st.SubscriptionActiveUntil, before.SubscriptionActiveUntil)
+	}
+	// last_healthy_at must NOT advance (a conflict is not a healthy refresh).
+	if st.LastHealthyAt == nil || before.LastHealthyAt == nil || !st.LastHealthyAt.Equal(*before.LastHealthyAt) {
+		t.Fatalf("last_healthy_at changed on conflict: got=%v want=%v", st.LastHealthyAt, before.LastHealthyAt)
+	}
+	// The error/latest_action IS updated, and the check time advances.
 	if st.LastError == nil {
 		t.Fatal("identity conflict did not record an error on the account")
+	}
+	if st.LastCheckedAt == nil || !st.LastCheckedAt.After(healthyAt) {
+		t.Fatalf("last_checked_at not advanced on conflict: got=%v seed=%v", st.LastCheckedAt, healthyAt)
 	}
 }

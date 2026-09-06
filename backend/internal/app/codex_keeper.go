@@ -2687,7 +2687,20 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		result.LastError = &message
 		result.LatestAction = &message
 		result.SubscriptionKnown = false
-		result = persistState(result)
+		// The merged detail mixes two accounts, so every business column (email,
+		// auth_index, account_id, account_type, disabled, priority, usage, quota,
+		// reset credits, subscription) on `result` is empty/ambiguous here. Persisting
+		// it through the normal upsert (which is `= excluded.*` for those columns) would
+		// clobber the prior good snapshot to NULL/false — which also breaks a later reset
+		// that needs the stored auth_index. Preserve ALL existing state and only stamp the
+		// error/latest_action and the check time. If no row exists yet (first-ever
+		// inspection hits a conflict) there is nothing trustworthy to insert, so this
+		// touches zero rows rather than manufacturing an incomplete identity row.
+		if err := a.markKeeperIdentityError(ctx, name, &message, result.CheckedAt); err != nil {
+			logFn(name + "：状态写回失败（state_write_error）")
+			log.Printf("codex keeper identity-error write-back failed for %s: %v", name, err)
+			result.StateWriteFailed = true
+		}
 		logFn(name + "：" + message)
 		return result
 	}
@@ -4260,6 +4273,24 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
 	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, dbTimePtr(result.SubscriptionActiveUntil), result.AccountID, checkedAt, lastHealthy, now, now, result.ClearRestorePriority, boolValue(&result.SubscriptionKnown))
+	return err
+}
+
+// markKeeperIdentityError records an identity-conflict inspection outcome WITHOUT touching
+// any business column. A list/detail identity conflict means the merged detail mixes two
+// accounts, so the incoming email/auth_index/account_id/account_type/disabled/priority/usage/
+// quota/reset-credit/subscription values are untrustworthy; the prior snapshot is authoritative
+// and must survive intact (a cleared auth_index would also block a later reset). This only
+// stamps last_error/latest_action and the check time. It deliberately does NOT set
+// last_healthy_at (an identity conflict is never a healthy refresh) and does NOT INSERT: if no
+// row exists yet it touches zero rows rather than persisting a partial/ambiguous identity.
+func (a *App) markKeeperIdentityError(ctx context.Context, authName string, message *string, checkedAt time.Time) error {
+	now := dbTime(time.Now())
+	_, err := a.db.ExecContext(ctx, `
+		UPDATE codex_keeper_auth_states
+		SET last_error = ?, latest_action = ?, last_checked_at = ?, updated_at = ?
+		WHERE auth_name = ?
+	`, message, message, dbTime(checkedAt), now, authName)
 	return err
 }
 
