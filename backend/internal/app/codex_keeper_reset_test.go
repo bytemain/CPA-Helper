@@ -1145,3 +1145,125 @@ func TestKeeperResetReplaysPendingAcrossIndexChange(t *testing.T) {
 		t.Fatalf("index change lost the pending key: first %q, replay %q (should reuse the same key)", lostID, replayID)
 	}
 }
+
+// newTwoFileSameAccountCPA serves two auth files (fileA idx-A, fileB idx-B) that BOTH map to
+// the same OpenAI account_id, so a test can exercise the account-level fence: the fresh
+// reset-credit fetch is gated (fileA blocks in it while holding the account lock).
+func newTwoFileSameAccountCPA(t *testing.T, fileA, fileB, accountID string, ctrl *keeperResetControl) *httptest.Server {
+	t.Helper()
+	detailFor := func(name, idx string) map[string]any {
+		return map[string]any{
+			"name": name, "type": "codex", "auth_index": idx, "account_id": accountID,
+			"account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+		}
+	}
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": fileA, "type": "codex"}, {"name": fileB, "type": "codex"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			name := r.URL.Query().Get("name")
+			idx := "idx-A"
+			if name == fileB {
+				idx = "idx-B"
+			}
+			_ = json.NewEncoder(w).Encode(detailFor(name, idx))
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			switch {
+			case strings.Contains(p.URL, "rate-limit-reset-credits/consume"):
+				ctrl.mu.Lock()
+				ctrl.consumeCalls++
+				ctrl.mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "reset", "windows_reset": []any{}}})
+			case strings.Contains(p.URL, "rate-limit-reset-credits"):
+				ctrl.mu.Lock()
+				gReached, gRelease, gOnce := ctrl.gateReached, ctrl.gateRelease, ctrl.gateOnce
+				ctrl.mu.Unlock()
+				if gRelease != nil {
+					gOnce.Do(func() { close(gReached) })
+					<-gRelease
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 2, "credits": []map[string]any{{"id": "c1", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-08-22T00:08:46Z", "expires_at": "2026-09-21T00:08:46Z"}}}})
+			default:
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+			}
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/reset-quota":
+			var payload struct {
+				AuthIndex string `json:"auth_index"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			ctrl.mu.Lock()
+			ctrl.resetQuotaCalls = append(ctrl.resetQuotaCalls, payload.AuthIndex)
+			ctrl.mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": payload.AuthIndex, "models": []string{}})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// TestKeeperResetAccountFenceAcrossTwoFiles proves the account-level fence: two different
+// files (auth_names) that map to the SAME OpenAI account cannot both consume concurrently.
+// While fileA holds the account fence (blocked in its fresh fetch), a reset of fileB — a
+// different auth_name, same account — is refused (409), so at most one credit is consumed.
+func TestKeeperResetAccountFenceAcrossTwoFiles(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	ctrl := &keeperResetControl{}
+	cpa := newTwoFileSameAccountCPA(t, "a.json", "b.json", "acct-shared", ctrl)
+	defer cpa.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin", "password": "test-password", "nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url": cpa.URL, "management_key": "test-management-key", "collector_enabled": false,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
+		"schedule_cron": "0 0 29 2 *", "dry_run": false, "quota_threshold": 100,
+		"worker_threads": 1, "cpa_timeout_seconds": 1,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
+	waitForKeeperAccounts(t, handler, cookies, 2)
+
+	// Both files were inspected (state.AccountID = acct-shared for each). Arm the gate so the
+	// first reset blocks inside its fresh fetch while holding the account fence.
+	ctrl.mu.Lock()
+	ctrl.gateReached = make(chan struct{})
+	ctrl.gateRelease = make(chan struct{})
+	ctrl.gateOnce = &sync.Once{}
+	ctrl.mu.Unlock()
+
+	winnerCh := make(chan int, 1)
+	go func() { winnerCh <- postKeeperReset(handler, cookies, "a.json") }()
+	<-ctrl.gateReached // fileA now holds the account fence, blocked in fetch
+
+	// fileB (different auth_name, SAME account) must be refused while fileA holds the fence.
+	if s := postKeeperReset(handler, cookies, "b.json"); s != http.StatusConflict {
+		t.Fatalf("second file for the same account = %d, want 409 (account fence)", s)
+	}
+
+	close(ctrl.gateRelease)
+	if s := <-winnerCh; s != http.StatusOK {
+		t.Fatalf("fileA reset = %d, want 200", s)
+	}
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 1 {
+		t.Fatalf("consume calls across two files of one account = %d, want exactly 1", ctrl.consumeCalls)
+	}
+}

@@ -53,20 +53,21 @@ const (
 )
 
 type KeeperRunner struct {
-	app            *App
-	mu             sync.Mutex
-	daemonStop     chan struct{}
-	daemonDone     chan struct{}
-	running        bool
-	runningModes   map[string]struct{}
-	inFlightAuths  map[string]string
-	state          string
-	detail         string
-	mode           *string
-	lastStartedAt  *time.Time
-	lastFinishedAt *time.Time
-	stats          keeperStats
-	logs           []string
+	app              *App
+	mu               sync.Mutex
+	daemonStop       chan struct{}
+	daemonDone       chan struct{}
+	running          bool
+	runningModes     map[string]struct{}
+	inFlightAuths    map[string]string
+	inFlightAccounts map[string]bool
+	state            string
+	detail           string
+	mode             *string
+	lastStartedAt    *time.Time
+	lastFinishedAt   *time.Time
+	stats            keeperStats
+	logs             []string
 }
 
 type keeperStats struct {
@@ -679,6 +680,39 @@ func (r *KeeperRunner) unlockAuthName(name string) {
 		return
 	}
 	delete(r.inFlightAuths, name)
+}
+
+// tryLockAccountID / unlockAccountID guard the RESOURCE (an OpenAI account_id), separately
+// from the auth_name (file) lock. Two different filenames/routes for the SAME account
+// (rename overlap, duplicate import) take different auth_name locks but the SAME account_id
+// lock, so a reset that redeems a credit for an account excludes any other concurrent reset
+// of the same account — without this a second route could consume a second credit even in a
+// single process. Non-blocking: a contended reset returns a conflict.
+func (r *KeeperRunner) tryLockAccountID(accountID string) bool {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlightAccounts == nil {
+		r.inFlightAccounts = map[string]bool{}
+	}
+	if r.inFlightAccounts[accountID] {
+		return false
+	}
+	r.inFlightAccounts[accountID] = true
+	return true
+}
+
+func (r *KeeperRunner) unlockAccountID(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.inFlightAccounts, accountID)
 }
 
 func keeperModeOrder(mode string) int {
@@ -3550,6 +3584,18 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_mismatch", "auth_index", authIndex)
 		return keeperQuotaResetResult{}, validationError("账号身份已变化（account_id 不一致），请刷新账号列表后重试")
 	}
+	// Hold the ACCOUNT-level fence (in addition to the per-auth_name lock) across the whole
+	// pending-lookup → fetch → claim → consume → cooldown → finish sequence. The paid,
+	// limited credit is the ACCOUNT's, so two different filenames/routes for the SAME
+	// account (rename overlap / duplicate import) must be mutually exclusive even though
+	// they hold different auth_name locks — otherwise the second route could redeem a second
+	// credit. Non-blocking: a contended reset of the same account returns a conflict.
+	if !a.keeper.tryLockAccountID(identity.accountID) {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_busy", "auth_index", authIndex)
+		return keeperQuotaResetResult{}, conflictError("同一 OpenAI 账号的另一路由正在重置，请稍后重试")
+	}
+	defer a.keeper.unlockAccountID(identity.accountID)
+
 	// A normalized detail carrying ONLY the validated identity, so the fetch/consume
 	// never re-derive an index from a name fallback or a conflicting field.
 	identDetail := map[string]any{"auth_index": identity.authIndex, "account_id": identity.accountID}

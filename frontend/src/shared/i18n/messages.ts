@@ -15,6 +15,7 @@ const exactServerMessages: MessagePair[] = [
   ['该账号缺少 auth_index，请先刷新账号列表', 'This account has no auth_index yet; refresh the account list first'],
   // Reset-quota (real credit consume) errors — busy / identity / ledger / fail-closed.
   ['账号正在巡检或重置中，请稍后重试', 'The account is being inspected or reset. Try again shortly.'],
+  ['同一 OpenAI 账号的另一路由正在重置，请稍后重试', 'Another route for the same OpenAI account is being reset. Try again shortly.'],
   ['账号在远端列表中不存在，请刷新后重试', 'The account is not in the remote list. Refresh and try again.'],
   ['读取账号详情失败，未执行主动重置', 'Failed to read account detail; the reset was not performed.'],
   ['当前为 dry-run 模式，已阻止真实核销/重置；请关闭 dry-run 后重试', 'Dry-run mode blocked the real redemption/reset. Turn dry-run off and try again.'],
