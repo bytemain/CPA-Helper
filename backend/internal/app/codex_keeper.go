@@ -3847,77 +3847,71 @@ func keeperInnerStatusCode(raw map[string]any) int {
 // on the fresh credit count, so a lost-response pending can be replayed even when the
 // count endpoint is temporarily unavailable. Callers MUST hold the per-auth lock.
 func (a *App) lookupPendingKeeperRedeem(ctx context.Context, authName, authIndex, accountID string) (redeemID string, ok bool, err error) {
-	var storedIdx, storedAcct, id, status string
-	qerr := a.db.QueryRowContext(ctx, `SELECT auth_index, account_id, redeem_request_id, status FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName).Scan(&storedIdx, &storedAcct, &id, &status)
+	var id, status string
+	qerr := a.db.QueryRowContext(ctx, `SELECT redeem_request_id, status FROM codex_keeper_reset_redeems WHERE auth_name = ? AND auth_index = ? AND account_id = ?`, authName, authIndex, accountID).Scan(&id, &status)
 	if qerr != nil && !errors.Is(qerr, sql.ErrNoRows) {
 		return "", false, qerr
 	}
-	if qerr == nil && status == keeperRedeemStatusPending && strings.TrimSpace(id) != "" &&
-		storedIdx == authIndex && storedAcct == accountID {
+	if qerr == nil && status == keeperRedeemStatusPending && strings.TrimSpace(id) != "" {
 		return id, true, nil
 	}
 	return "", false, nil
 }
 
-// hasPendingKeeperRedeem reports whether authName has an unresolved (pending) redeem in
-// the ledger. This is a PERSISTENT check (survives restarts / an empty in-memory lock
-// table), so a destructive removal never drops the sole idempotency key of an in-flight
-// redeem. Returns false when the table is absent (pre-ledger DB).
+// hasPendingKeeperRedeem reports whether authName has ANY unresolved (pending) redeem in
+// the ledger, across all identities that share the auth_name. This is a PERSISTENT check
+// (survives restarts / an empty in-memory lock table), so a destructive removal never
+// drops the sole idempotency key of an in-flight redeem. Returns false when the table is
+// absent (pre-ledger DB).
 func (a *App) hasPendingKeeperRedeem(ctx context.Context, authName string) (bool, error) {
-	var status string
-	err := a.db.QueryRowContext(ctx, `SELECT status FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName).Scan(&status)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	var n int
+	err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM codex_keeper_reset_redeems WHERE auth_name = ? AND status = ?`, authName, keeperRedeemStatusPending).Scan(&n)
 	if err != nil {
 		return false, err
 	}
-	return status == keeperRedeemStatusPending, nil
+	return n > 0, nil
 }
 
 // createKeeperRedeem atomically claims a fresh pending redeem_request_id for the given
-// identity and returns the WINNING row's id. The upsert overwrites the row ONLY when it
-// is not already a same-identity pending redeem (i.e. it is absent, terminal, or a stale
-// different-identity row); a concurrent same-identity pending row is left untouched. So
-// two claimers that both find no pending (e.g. blue/green instances sharing the DB, or
-// this instance racing another) converge on ONE redeem_request_id — the first writer's —
-// and OpenAI dedups the same key rather than burning two credits. SQLite serializes the
-// writes, so the second upsert observes the first's committed row. The per-auth lock
-// serializes same-instance callers.
+// FULL identity (auth_name + auth_index + account_id) and returns the WINNING row's id.
+// The ledger is keyed by the full identity, so a different identity sharing the auth_name
+// is a SEPARATE row that is NEVER overwritten — an old identity's unresolved pending key
+// survives even after the auth_name is rebuilt onto another account, so a later return of
+// the original account reuses its key idempotently instead of minting a second one. The
+// upsert overwrites only this identity's own non-pending (terminal) row; a concurrent
+// same-identity pending row is left untouched, so two claimers (e.g. blue/green instances
+// sharing the DB) converge on ONE request_id. SQLite serializes the writes, so the second
+// upsert observes the first's committed row; the per-auth lock serializes same-instance
+// callers.
 //
-// This HARDENS the concurrent-overlap window but does NOT make the ledger a full
-// cross-process operation lease: if one instance finalizes a redeem (terminal row) and a
-// second, delayed request then claims, it legitimately starts a NEW operation (a new
-// key) and could consume again. CPA-Helper's contract is a SINGLE ACTIVE INSTANCE on its
-// single-writer SQLite (no overlapping ingress during a blue/green swap); true
-// cross-process single-operation idempotency would require a client-supplied idempotency
-// key spanning the HTTP request, which is out of scope for this single-admin backend.
+// This HARDENS the concurrent-overlap window but is NOT a full cross-process operation
+// lease: if one instance finalizes a redeem (terminal row) and a second, delayed request
+// then claims, it legitimately starts a NEW operation. CPA-Helper's contract is a SINGLE
+// ACTIVE INSTANCE on single-writer SQLite (no overlapping ingress during a blue/green
+// swap); true cross-process single-operation idempotency would need a client-supplied
+// idempotency key spanning the HTTP request, out of scope for this single-admin backend.
 func (a *App) createKeeperRedeem(ctx context.Context, authName, authIndex, accountID string) (string, error) {
 	newID := uuid.NewString()
 	now := dbTime(time.Now())
 	if _, err := a.db.ExecContext(ctx, `
 		INSERT INTO codex_keeper_reset_redeems (auth_name, auth_index, account_id, redeem_request_id, status, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(auth_name) DO UPDATE SET
-			auth_index = excluded.auth_index,
-			account_id = excluded.account_id,
+		ON CONFLICT(auth_name, auth_index, account_id) DO UPDATE SET
 			redeem_request_id = excluded.redeem_request_id,
 			status = excluded.status,
 			updated_at = excluded.updated_at
 		WHERE codex_keeper_reset_redeems.status != ?
-			OR codex_keeper_reset_redeems.auth_index != excluded.auth_index
-			OR codex_keeper_reset_redeems.account_id != excluded.account_id
 	`, authName, authIndex, accountID, newID, keeperRedeemStatusPending, now, keeperRedeemStatusPending); err != nil {
 		return "", err
 	}
-	// Read the winning row. It must now be a same-identity pending redeem — either ours
-	// (INSERT / overwrite won) or a concurrent claimer's (its same-identity pending was
-	// preserved by the guard). Anything else is a lost race we must not consume against.
-	var storedIdx, storedAcct, id, status string
-	if err := a.db.QueryRowContext(ctx, `SELECT auth_index, account_id, redeem_request_id, status FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName).Scan(&storedIdx, &storedAcct, &id, &status); err != nil {
+	// Read this identity's winning row. It must now be pending — either ours (INSERT /
+	// terminal-overwrite won) or a concurrent same-identity claimer's (preserved by the
+	// guard). Anything else is a lost race we must not consume against.
+	var id, status string
+	if err := a.db.QueryRowContext(ctx, `SELECT redeem_request_id, status FROM codex_keeper_reset_redeems WHERE auth_name = ? AND auth_index = ? AND account_id = ?`, authName, authIndex, accountID).Scan(&id, &status); err != nil {
 		return "", err
 	}
-	if status != keeperRedeemStatusPending || storedIdx != authIndex || storedAcct != accountID || strings.TrimSpace(id) == "" {
+	if status != keeperRedeemStatusPending || strings.TrimSpace(id) == "" {
 		return "", validationError("重置额度核销状态异常，请稍后重试")
 	}
 	return id, nil

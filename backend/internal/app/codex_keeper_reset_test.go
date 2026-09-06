@@ -1101,3 +1101,58 @@ func TestKeeperDeleteConflictsWithInFlightReset(t *testing.T) {
 		t.Fatalf("reset winner = %d, want 200", s)
 	}
 }
+
+// TestKeeperResetPreservesOtherIdentityPendingKey proves the multi-row ledger keeps each
+// identity's key: after an unknown-outcome redeem leaves identity A pending, a reset under
+// a DIFFERENT identity B (same auth_name) does NOT overwrite A's key, and when the original
+// account (A) returns, its ORIGINAL redeem_request_id is replayed (idempotent) rather than a
+// fresh key that could double-consume.
+func TestKeeperResetPreservesOtherIdentityPendingKey(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "multi-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-multi",
+		"email": "multi@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-A",
+	}
+	ctrl := &keeperResetControl{availableCount: 3, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Identity A: consume response lost → A pending.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	ctrl.mu.Lock()
+	idA := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	// The auth_name is now backed by identity B; its consume succeeds.
+	ctrl.accountIDOverride = "acct-B"
+	ctrl.consumeMode = "ok"
+	ctrl.consumeSuccessCode = "reset"
+	ctrl.mu.Unlock()
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Account.Outcome != "reset" {
+		t.Fatalf("identity B reset = %+v, want reset", reset)
+	}
+	ctrl.mu.Lock()
+	idB := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	// The original account (A) returns; its pending redeem must still be here to replay.
+	ctrl.accountIDOverride = ""
+	ctrl.consumeSuccessCode = "already_redeemed"
+	ctrl.mu.Unlock()
+	reset = keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Account.Outcome != "already_redeemed" {
+		t.Fatalf("returned identity A reset = %+v, want already_redeemed (replay of A's key)", reset)
+	}
+	ctrl.mu.Lock()
+	idAReplay := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	ctrl.mu.Unlock()
+	if idB == idA {
+		t.Fatalf("identity B reused A's key %q; identities must have separate keys", idA)
+	}
+	if idAReplay != idA {
+		t.Fatalf("returned identity A did not replay its original key: original %q, replay %q (key was overwritten by B)", idA, idAReplay)
+	}
+}
