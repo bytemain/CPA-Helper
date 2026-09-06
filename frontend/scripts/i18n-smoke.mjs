@@ -143,6 +143,36 @@ try {
     localizedServerMessage('该账号缺少 auth_index，请先刷新账号列表'),
     'This account has no auth_index yet; refresh the account list first',
   )
+  // Reset-quota (real credit consume) errors must localize to specific recovery
+  // guidance, not degrade to the generic validation message.
+  assert.equal(
+    localizedServerMessage('账号正在巡检或重置中，请稍后重试'),
+    'The account is being inspected or reset. Try again shortly.',
+  )
+  assert.equal(
+    localizedServerMessage('账号 auth_index 已变化，请刷新账号列表后重试'),
+    'The account auth_index has changed. Refresh the account list and try again.',
+  )
+  assert.equal(
+    localizedServerMessage('账号 account_id 身份冲突（列表与详情不一致），请刷新后重试'),
+    'Account account_id identity conflict (list and detail disagree). Refresh and try again.',
+  )
+  assert.equal(
+    localizedServerMessage('账号缺少 account_id，无法安全核销，请刷新后重试'),
+    'The account has no account_id; a safe redemption is not possible. Refresh and try again.',
+  )
+  assert.equal(
+    localizedServerMessage('无法确认可用重置额度（快照未知），请刷新后重试'),
+    'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.',
+  )
+  assert.equal(
+    localizedServerMessage('核销主动重置额度失败：网络异常，未确认是否已核销'),
+    'Failed to redeem the reset credit: network error; redemption is unconfirmed.',
+  )
+  assert.equal(
+    localizedServerMessage('核销主动重置额度失败：OpenAI 拒绝核销'),
+    'Failed to redeem the reset credit: OpenAI rejected the redemption.',
+  )
   assert.equal(localizedServerMessage('auth_name 不能为空'), 'auth_name must not be empty')
   assert.equal(localizedServerMessage('账号不存在'), 'Account not found')
   assert.equal(localizedKeeperStatusDetail(null), 'Not running')

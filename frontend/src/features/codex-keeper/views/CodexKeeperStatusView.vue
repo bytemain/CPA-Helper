@@ -1188,20 +1188,21 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
 function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
   const credits = account.reset_credits ?? []
   const count = account.reset_credit_count
+  // The authoritative count is reset_credit_count. When it is null the snapshot is
+  // unknown/stale — NEVER substitute credits.length (a possibly-truncated detail list)
+  // for it; show "未知/陈旧" so a stale count is not misread as an exact number.
+  const countText = count === null || count === undefined
+    ? t('未知（快照陈旧）', 'unknown (stale)')
+    : String(count)
   if (credits.length === 0) {
-    // Authoritative count with no detail rows still deserves a "0 次" / count line
-    // rather than a bare dash, so a truncated-but-nonzero snapshot is visible.
-    if (count === null || count === undefined) {
-      return '-'
-    }
     return h('div', { class: 'quota-reset-schedule-cell' }, [
-      h('span', { class: 'quota-reset-schedule-label' }, t(`可用重置额度：${count}`, `Available credits: ${count}`)),
+      h('span', { class: 'quota-reset-schedule-label' }, t(`可用重置额度：${countText}`, `Available credits: ${countText}`)),
     ])
   }
   const header = h(
     'span',
     { class: 'quota-reset-schedule-label' },
-    t(`可用重置额度：${count ?? credits.length}`, `Available credits: ${count ?? credits.length}`),
+    t(`可用重置额度：${countText}`, `Available credits: ${countText}`),
   )
   const rows = credits.map((credit, index) => {
     const label = t(`第 ${index + 1} 次`, `#${index + 1}`)
@@ -1236,6 +1237,18 @@ function renderSubscriptionCell(account: CodexKeeperAccount) {
     h('span', { class: 'quota-reset-schedule-time' }, time ?? '-'),
     countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, `（${countdown}）`) : null,
   ])
+}
+
+// subscriptionDetailText renders the subscription renewal time plus countdown for the
+// account detail drawer (task #77 requires the renewal on both the list and the drawer).
+function subscriptionDetailText(account: CodexKeeperAccount): string {
+  const value = account.subscription_active_until
+  if (!value) {
+    return '-'
+  }
+  const time = formatQuotaResetTime(value) ?? formatDateTime(value)
+  const countdown = formatQuotaResetCountdown(value)
+  return countdown ? `${time}（${countdown}）` : time
 }
 
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
@@ -1589,7 +1602,10 @@ function resetQuotaAccount(account: CodexKeeperAccount) {
     account,
     'reset-quota',
     () => resetCodexKeeperQuota(account.name),
-    t('配额状态已重置', 'Quota state reset'),
+    (result) =>
+      result.account.consumed
+        ? t('已真实核销 1 次主动重置额度，并清理了冷却', 'Redeemed one reset credit and cleared the cooldown')
+        : t('无可用额度，仅清理了本地冷却', 'No credit available; only the local cooldown was cleared'),
   )
 }
 
@@ -1597,8 +1613,8 @@ function confirmResetQuota(account: CodexKeeperAccount) {
   openAccountConfirm(
     t('重置配额状态', 'Reset Quota State'),
     t(
-      `确认重置 ${account.name} 的配额与冷却状态？当前可用重置额度 ${account.reset_credit_count ?? 0}，有额度时会真实消耗 1 次。`,
-      `Reset the quota/cooldown state of ${account.name}? Available reset credits: ${account.reset_credit_count ?? 0}; one is really consumed when available.`,
+      `确认重置 ${account.name} 的配额与冷却状态？当前可用重置额度 ${account.reset_credit_count ?? '未知'}，有额度时会真实消耗 1 次。`,
+      `Reset the quota/cooldown state of ${account.name}? Available reset credits: ${account.reset_credit_count ?? 'unknown'}; one is really consumed when available.`,
     ),
     t('确认重置', 'Confirm Reset'),
     'warning',
@@ -1730,11 +1746,11 @@ function isRowActing(account: CodexKeeperAccount): boolean {
   )
 }
 
-async function runAccountAction(
+async function runAccountAction<T>(
   account: CodexKeeperAccount,
   actionType: AccountAction,
-  action: () => Promise<void>,
-  successText: string,
+  action: () => Promise<T>,
+  successText: string | ((result: T) => string),
 ) {
   const key = accountActionKey(account, actionType)
   if (actingActions.value.has(key)) {
@@ -1742,8 +1758,8 @@ async function runAccountAction(
   }
   actingActions.value = new Set(actingActions.value).add(key)
   try {
-    await action()
-    message.success(successText)
+    const result = await action()
+    message.success(typeof successText === 'function' ? successText(result) : successText)
     await loadAccounts()
     if (selectedAccount.value?.name === account.name) {
       const freshAccount = accounts.value.find((item) => item.name === account.name) ?? null
@@ -2582,6 +2598,9 @@ onBeforeUnmount(() => {
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近巡检', 'Last Inspection')">
             {{ formatDateTime(selectedAccount.last_checked_at) }}
+          </NDescriptionsItem>
+          <NDescriptionsItem :label="t('续期时间', 'Renews At')">
+            {{ subscriptionDetailText(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近操作', 'Latest Action')">
             {{ latestActionText(selectedAccount) }}

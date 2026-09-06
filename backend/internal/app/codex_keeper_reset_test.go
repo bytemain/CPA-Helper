@@ -26,15 +26,39 @@ type keeperResetResponse struct {
 // how the consume endpoint replies, and how /reset-quota replies. It also records
 // call counts so a test can assert fail-closed ordering (e.g. a failed consume
 // must never reach /reset-quota).
+// keeperConsumeSensitiveSentinel is a fake sensitive token embedded in the mock's
+// inner consume error body; the redaction canary asserts it NEVER reaches the log.
+const keeperConsumeSensitiveSentinel = "SENSITIVE-sk-consume-secret-zzz"
+
 type keeperResetControl struct {
-	mu               sync.Mutex
-	availableCount   int    // authoritative available_count returned by the fresh fetch
-	fetchMode        string // ok | fail (fresh reset-credit GET)
-	consumeMode      string // ok | http-fail | unknown-code | no-credit
-	resetMode        string // ok | http-fail | empty-body | wrong-index | bad-status | padded-index
-	consumeCalls     int
-	resetCreditFetch int
-	resetQuotaCalls  []string
+	mu                 sync.Mutex
+	availableCount     int    // authoritative available_count returned by the fresh fetch
+	fetchMode          string // ok | fail (fresh reset-credit GET)
+	consumeMode        string // ok | http-fail | unknown-code | no-credit | lost
+	consumeSuccessCode string // terminal code returned on a successful consume (default "reset")
+	resetMode          string // ok | http-fail | empty-body | wrong-index | bad-status | padded-index
+	consumeCalls       int
+	consumeRequestIDs  []string // redeem_request_id seen on each consume call, in order
+	resetCreditFetch   int
+	resetQuotaCalls    []string
+	// Concurrency gate: when armed, the first fresh reset-credit fetch to run under
+	// the per-auth lock signals gateReached (once) then blocks on gateRelease, so a
+	// test can deterministically hold the winner in-lock while contending requests hit
+	// tryLock and 409.
+	gateReached chan struct{}
+	gateRelease chan struct{}
+	gateOnce    *sync.Once
+	// authIndexOverride, when non-empty, replaces the downloaded detail's auth_index
+	// so a test can simulate a reassignment (fresh auth_index != stored DB row).
+	authIndexOverride string
+	// accountIDOverride, when non-empty, replaces the downloaded detail's account_id
+	// so a test can simulate an account_id change on the same auth_index.
+	accountIDOverride string
+	// omitAccountID drops account_id from the downloaded detail entirely.
+	omitAccountID bool
+	// listAccountIDClaim, when non-empty, adds id_token.chatgpt_account_id to the
+	// list entry so a test can exercise the list-vs-download account_id cross-check.
+	listAccountIDClaim string
 }
 
 func newKeeperResetCPA(t *testing.T, authName string, authDetail map[string]any, ctrl *keeperResetControl) *httptest.Server {
@@ -49,42 +73,92 @@ func newKeeperResetCPA(t *testing.T, authName string, authDetail map[string]any,
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
-			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
+			entry := map[string]any{"name": authName, "type": "codex"}
+			ctrl.mu.Lock()
+			claim := ctrl.listAccountIDClaim
+			ctrl.mu.Unlock()
+			if claim != "" {
+				entry["id_token"] = map[string]any{"chatgpt_account_id": claim}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{entry}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
-			_ = json.NewEncoder(w).Encode(authDetail)
+			detail := map[string]any{}
+			for k, v := range authDetail {
+				detail[k] = v
+			}
+			ctrl.mu.Lock()
+			ovr := ctrl.authIndexOverride
+			acctOvr := ctrl.accountIDOverride
+			omitAcct := ctrl.omitAccountID
+			ctrl.mu.Unlock()
+			if ovr != "" {
+				detail["auth_index"] = ovr
+			}
+			if acctOvr != "" {
+				detail["account_id"] = acctOvr
+			}
+			if omitAcct {
+				delete(detail, "account_id")
+			}
+			_ = json.NewEncoder(w).Encode(detail)
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			var p struct {
-				URL string `json:"url"`
+				URL  string `json:"url"`
+				Data string `json:"data"`
 			}
 			_ = json.NewDecoder(r.Body).Decode(&p)
 			switch {
 			// The consume URL also contains "rate-limit-reset-credits", so match the
 			// more specific "/consume" suffix first.
 			case strings.Contains(p.URL, "rate-limit-reset-credits/consume"):
+				var d struct {
+					RedeemRequestID string `json:"redeem_request_id"`
+				}
+				_ = json.Unmarshal([]byte(p.Data), &d)
 				ctrl.mu.Lock()
 				ctrl.consumeCalls++
+				ctrl.consumeRequestIDs = append(ctrl.consumeRequestIDs, d.RedeemRequestID)
 				mode := ctrl.consumeMode
-				// A real consume decrements the authoritative count.
-				if mode == "ok" && ctrl.availableCount > 0 {
+				successCode := ctrl.consumeSuccessCode
+				// A real reset consumes one credit.
+				if mode == "ok" && (successCode == "" || successCode == "reset") && ctrl.availableCount > 0 {
 					ctrl.availableCount--
 				}
 				ctrl.mu.Unlock()
+				if mode == "lost" {
+					// Every attempt of this operation loses its response (outer 5xx):
+					// even keeperRequest's idempotent retries fail, so the whole operation
+					// is unknown and the ledger stays pending for the next operation.
+					http.Error(w, "gateway", http.StatusBadGateway)
+					return
+				}
 				switch mode {
 				case "http-fail":
-					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": map[string]any{"error": map[string]any{"message": "forbidden"}}})
+					// Inner non-2xx carrying a sensitive sentinel: the canary asserts it
+					// never reaches the log.
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": map[string]any{"error": map[string]any{"message": keeperConsumeSensitiveSentinel}}})
 				case "unknown-code":
-					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "surprise"}})
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "surprise", "detail": keeperConsumeSensitiveSentinel}})
 				case "no-credit":
 					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "no_credit"}})
 				default:
-					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "reset", "windows_reset": []any{}}})
+					code := successCode
+					if code == "" {
+						code = "reset"
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": code, "windows_reset": []any{}}})
 				}
 			case strings.Contains(p.URL, "rate-limit-reset-credits"):
 				ctrl.mu.Lock()
 				ctrl.resetCreditFetch++
 				n := ctrl.availableCount
 				mode := ctrl.fetchMode
+				gReached, gRelease, gOnce := ctrl.gateReached, ctrl.gateRelease, ctrl.gateOnce
 				ctrl.mu.Unlock()
+				if gRelease != nil {
+					gOnce.Do(func() { close(gReached) })
+					<-gRelease
+				}
 				if mode == "fail" {
 					http.Error(w, "boom", http.StatusInternalServerError)
 					return
@@ -345,5 +419,368 @@ func TestKeeperResetQuotaTriggersInspection(t *testing.T) {
 	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &after)
 	if len(after.Items) != 1 || after.Items[0].ResetCreditCount == nil || *after.Items[0].ResetCreditCount != 1 {
 		t.Fatalf("post-reset reset_credit_count = %+v, want 1 (refreshed by the chained inspection)", after.Items)
+	}
+}
+
+// postKeeperReset drives the reset route and returns only the HTTP status, so it
+// is safe to call from goroutines (no t.Fatal off the test goroutine).
+func postKeeperReset(handler http.Handler, cookies []*http.Cookie, authName string) int {
+	req := httptest.NewRequest(http.MethodPost, "/api/codex-keeper/reset-quota", strings.NewReader(`{"auth_name":"`+authName+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestKeeperResetConcurrentSingleConsume proves the per-auth lock makes concurrent
+// resets of the SAME account redeem at most one credit: while one request holds the
+// lock (blocked in its fresh reset-credit fetch), every contending request returns
+// 409 without reaching consume.
+func TestKeeperResetConcurrentSingleConsume(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "race-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-race",
+		"email": "race@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-race",
+	}
+	ctrl := &keeperResetControl{availableCount: 3, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Arm the gate only AFTER setup, so the run-once inspection's fetch is not held.
+	ctrl.mu.Lock()
+	ctrl.gateReached = make(chan struct{})
+	ctrl.gateRelease = make(chan struct{})
+	ctrl.gateOnce = &sync.Once{}
+	ctrl.mu.Unlock()
+
+	// Winner: acquires the per-auth lock and blocks inside its fresh fetch.
+	winnerCh := make(chan int, 1)
+	go func() { winnerCh <- postKeeperReset(handler, cookies, authName) }()
+	<-ctrl.gateReached // the winner now holds the per-auth lock
+
+	// Contenders: fire concurrently while the winner holds the lock; all must 409.
+	const contenders = 4
+	var wg sync.WaitGroup
+	statuses := make([]int, contenders)
+	for i := 0; i < contenders; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			statuses[idx] = postKeeperReset(handler, cookies, authName)
+		}(i)
+	}
+	wg.Wait()
+	for i, s := range statuses {
+		if s != http.StatusConflict {
+			t.Fatalf("contender %d status = %d, want 409 (per-auth lock held)", i, s)
+		}
+	}
+
+	close(ctrl.gateRelease) // let the winner finish
+	if s := <-winnerCh; s != http.StatusOK {
+		t.Fatalf("winner status = %d, want 200", s)
+	}
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 1 {
+		t.Fatalf("consume calls under concurrency = %d, want exactly 1", ctrl.consumeCalls)
+	}
+}
+
+// TestKeeperResetLostResponseReusesRedeemID proves the persistent redeem ledger
+// closes the cross-operation double-consume window: when a consume's response is
+// lost (outer 5xx = unknown), the redeem stays pending and the NEXT reset reuses the
+// SAME redeem_request_id (OpenAI then returns already_redeemed idempotently) instead
+// of minting a new key that could burn a second credit.
+func TestKeeperResetLostResponseReusesRedeemID(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "lost-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-lost",
+		"email": "lost@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-lost",
+	}
+	ctrl := &keeperResetControl{
+		availableCount: 2, fetchMode: "ok", consumeMode: "lost", resetMode: "ok",
+	}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// First attempt: every consume attempt loses its response (unknown) → fail closed,
+	// ledger left pending.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	// The account recovers; the next attempt must reuse the pending redeem_request_id
+	// so OpenAI resolves it idempotently as already_redeemed instead of burning a
+	// second credit.
+	ctrl.mu.Lock()
+	ctrl.consumeMode = "ok"
+	ctrl.consumeSuccessCode = "already_redeemed"
+	ctrl.mu.Unlock()
+
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Status != "ok" || !reset.Account.Consumed {
+		t.Fatalf("retry reset = %+v, want ok/consumed", reset)
+	}
+
+	ctrl.mu.Lock()
+	ids := append([]string{}, ctrl.consumeRequestIDs...)
+	ctrl.mu.Unlock()
+	if len(ids) < 2 {
+		t.Fatalf("consume calls = %d, want >= 2 (lost + retry)", len(ids))
+	}
+	// Every consume attempt (the lost operation's retries AND the recovery operation)
+	// must carry the exact same redeem_request_id.
+	for i, id := range ids {
+		if id == "" || id != ids[0] {
+			t.Fatalf("redeem_request_id not reused (call %d = %q, first = %q); all=%v", i, id, ids[0], ids)
+		}
+	}
+}
+
+// TestKeeperResetConsumeLogRedaction is the canary: a failed consume whose inner
+// body carries a sensitive sentinel must never write that raw body to the Keeper
+// log; only a stable classification (reset-consume … inner_status) is recorded.
+func TestKeeperResetConsumeLogRedaction(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "redact-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-redact",
+		"email": "redact@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-redact",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "http-fail", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	var status struct {
+		Logs []string `json:"logs"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/status", nil, cookies, &status)
+	joined := strings.Join(status.Logs, "\n")
+	if strings.Contains(joined, keeperConsumeSensitiveSentinel) {
+		t.Fatalf("sensitive inner body leaked into Keeper log")
+	}
+	if !strings.Contains(joined, "reset-consume") || !strings.Contains(joined, "inner_status") {
+		t.Fatalf("expected stable reset-consume/inner_status classification in log; logs=%v", status.Logs)
+	}
+}
+
+// TestKeeperResetAuthIndexMismatch proves the exact same-row binding: when the fresh
+// merged detail's auth_index no longer matches the stored DB row (a reassignment),
+// the reset fails closed and never fetches credits, consumes, or clears the cooldown.
+func TestKeeperResetAuthIndexMismatch(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "moved-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-orig",
+		"email": "moved@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-moved",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// The account was inspected with idx-orig; now the fresh detail reports a
+	// different auth_index (reassignment).
+	ctrl.mu.Lock()
+	ctrl.authIndexOverride = "idx-different"
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 0 {
+		t.Fatalf("consume happened on auth_index mismatch (%d calls); must fail closed", ctrl.consumeCalls)
+	}
+	if len(ctrl.resetQuotaCalls) != 0 {
+		t.Fatalf("cooldown cleared on auth_index mismatch; must fail closed")
+	}
+}
+
+// TestKeeperResetMissingAccountID proves the reset fails closed when no account_id can
+// be resolved (the consume header requires it) — no consume, no cooldown clear.
+func TestKeeperResetMissingAccountID(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "noacct-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-noacct",
+		"email": "noacct@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-noacct",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Now the fresh detail drops account_id (the list entry never had one).
+	ctrl.mu.Lock()
+	ctrl.omitAccountID = true
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 0 || len(ctrl.resetQuotaCalls) != 0 {
+		t.Fatalf("missing account_id must fail closed (consume=%d, reset-quota=%v)", ctrl.consumeCalls, ctrl.resetQuotaCalls)
+	}
+}
+
+// TestKeeperResetLedgerIdentityChangeMintsFresh proves the ledger never reuses a
+// pending redeem_request_id across an identity change: after a lost consume leaves a
+// pending row bound to one account_id, a later reset whose account_id has changed (same
+// auth_index) mints a FRESH id rather than replaying the previous account's key.
+func TestKeeperResetLedgerIdentityChangeMintsFresh(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "switch-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-switch",
+		"email": "switch@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-A",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// First reset: consume is lost → pending row bound to account_id acct-A.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	// The auth_name is now backed by a different account (same auth_index) and the
+	// consume succeeds.
+	ctrl.mu.Lock()
+	firstIDs := append([]string{}, ctrl.consumeRequestIDs...)
+	ctrl.accountIDOverride = "acct-B"
+	ctrl.consumeMode = "ok"
+	ctrl.mu.Unlock()
+
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Status != "ok" || !reset.Account.Consumed {
+		t.Fatalf("post-switch reset = %+v, want ok/consumed", reset)
+	}
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if len(firstIDs) == 0 {
+		t.Fatal("no consume recorded for the lost first attempt")
+	}
+	newID := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	if newID == firstIDs[0] {
+		t.Fatalf("identity change reused the previous account's redeem_request_id %q", newID)
+	}
+}
+
+// TestKeeperResetPendingReplayedWhenCountZero pins the control-flow rule that an
+// identity-matched pending redeem is replayed with its original key even when the
+// fresh available_count is 0: a lost first response that actually consumed the LAST
+// credit is recovered as already_redeemed (consumed=true), never short-circuited into
+// a cooldown-only clear.
+func TestKeeperResetPendingReplayedWhenCountZero(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "zero-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-zero",
+		"email": "zero@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-zero",
+	}
+	ctrl := &keeperResetControl{availableCount: 1, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// First reset: the only credit's consume response is lost → pending, fail closed.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	ctrl.mu.Lock()
+	lostIDs := append([]string{}, ctrl.consumeRequestIDs...)
+	consumesBefore := ctrl.consumeCalls
+	// The lost attempt actually consumed the last credit, so the fresh count is now 0
+	// and a replay resolves it idempotently.
+	ctrl.availableCount = 0
+	ctrl.consumeMode = "ok"
+	ctrl.consumeSuccessCode = "already_redeemed"
+	ctrl.mu.Unlock()
+
+	// Second reset: count is 0, but the pending redeem MUST still be replayed.
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Status != "ok" || !reset.Account.Consumed {
+		t.Fatalf("count-zero replay = %+v, want ok/consumed (not short-circuited to cooldown-only)", reset)
+	}
+
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls <= consumesBefore {
+		t.Fatalf("pending redeem was NOT replayed at count=0 (consume calls %d -> %d)", consumesBefore, ctrl.consumeCalls)
+	}
+	if len(lostIDs) == 0 || ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1] != lostIDs[0] {
+		t.Fatalf("replay used a different redeem_request_id than the pending one: pending=%v all=%v", lostIDs, ctrl.consumeRequestIDs)
+	}
+}
+
+// TestKeeperResetAccountIDCrossCheck proves the list id_token.chatgpt_account_id is an
+// OPTIONAL second cross-check: a matching claim passes, a conflicting claim fails
+// closed, and (via the other reset tests where the list omits it) an absent claim never
+// blocks a legitimate credential whose download account_id is present.
+func TestKeeperResetAccountIDCrossCheck(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "xcheck-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-xcheck",
+		"email": "xcheck@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-xcheck",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Matching list claim: reset proceeds and consumes.
+	ctrl.mu.Lock()
+	ctrl.listAccountIDClaim = "acct-xcheck"
+	ctrl.mu.Unlock()
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Status != "ok" || !reset.Account.Consumed {
+		t.Fatalf("matching list account_id claim reset = %+v, want ok/consumed", reset)
+	}
+
+	// Conflicting list claim: fail closed, no consume, no cooldown clear.
+	ctrl.mu.Lock()
+	ctrl.listAccountIDClaim = "acct-DIFFERENT"
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 0 || len(ctrl.resetQuotaCalls) != 0 {
+		t.Fatalf("account_id conflict must fail closed (consume=%d, reset-quota=%v)", ctrl.consumeCalls, ctrl.resetQuotaCalls)
 	}
 }

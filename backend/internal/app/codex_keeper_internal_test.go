@@ -2796,6 +2796,17 @@ func TestKeeperSubscriptionActiveUntil(t *testing.T) {
 		{"non-positive", idToken(map[string]any{"chatgpt_subscription_active_until": float64(0)}), nil, false},
 		{"garbage-string", idToken(map[string]any{"chatgpt_subscription_active_until": "not-a-time"}), nil, false},
 		{"wrong-type", idToken(map[string]any{"chatgpt_subscription_active_until": true}), nil, false},
+		// Strict numeric: fractional, non-finite, and out-of-range epochs are rejected.
+		{"fractional", idToken(map[string]any{"chatgpt_subscription_active_until": float64(want.Unix()) + 0.5}), nil, false},
+		{"nan", idToken(map[string]any{"chatgpt_subscription_active_until": math.NaN()}), nil, false},
+		{"positive-inf", idToken(map[string]any{"chatgpt_subscription_active_until": math.Inf(1)}), nil, false},
+		{"negative-inf", idToken(map[string]any{"chatgpt_subscription_active_until": math.Inf(-1)}), nil, false},
+		{"below-range", idToken(map[string]any{"chatgpt_subscription_active_until": float64(100)}), nil, false},        // ~1970
+		{"above-range", idToken(map[string]any{"chatgpt_subscription_active_until": float64(5000000000)}), nil, false}, // ~2128
+		{"max-int64", idToken(map[string]any{"chatgpt_subscription_active_until": float64(math.MaxInt64)}), nil, false},
+		{"negative", idToken(map[string]any{"chatgpt_subscription_active_until": float64(-1)}), nil, false},
+		{"fractional-explicit", idToken(map[string]any{"chatgpt_subscription_active_until": float64(1700000000.5)}), nil, false},
+		{"unix-string-out-of-range", idToken(map[string]any{"chatgpt_subscription_active_until": "100"}), nil, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
