@@ -155,6 +155,13 @@ func MigrateDownTo(ctx context.Context, target int64, allowPending bool) (Migrat
 		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, CurrentVersion: before, TargetVersion: target},
 			fmt.Errorf("current version %d is not newer than target %d; nothing to roll back", before, target)
 	}
+	// Refuse to roll back a DB that is newer than this binary knows about: its embedded
+	// Down migrations would not cover the extra versions, so the rollback would be
+	// incomplete/unsafe. Use a binary that embeds those migrations instead.
+	if before > backendMigrations.LatestVersion {
+		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target},
+			fmt.Errorf("database version %d is newer than this binary (%d); roll back with a binary that embeds those migrations", before, backendMigrations.LatestVersion)
+	}
 	if !allowPending {
 		pending, perr := pendingRedeemCount(ctx, db)
 		if perr != nil {

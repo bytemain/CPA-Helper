@@ -61,6 +61,14 @@ func TestMigrateDownToRollsBackToTarget(t *testing.T) {
 	if err := run(ctx, []string{"migrate", "down-to"}, &bytes.Buffer{}); err == nil {
 		t.Fatal("down-to accepted a missing version")
 	}
+	// A destructive subcommand rejects unknown flags/subcommands instead of silently
+	// ignoring a typo or falling back to Up.
+	if err := run(ctx, []string{"migrate", "down-to", "202609040002", "--typo"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("down-to accepted an unknown flag")
+	}
+	if err := run(ctx, []string{"migrate", "nonsense"}, &bytes.Buffer{}); err == nil {
+		t.Fatal("migrate accepted an unknown subcommand (must not fall back to Up)")
+	}
 }
 
 // TestMigrateDownToRefusesPendingRedeems proves a rollback is refused by default when the

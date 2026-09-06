@@ -41,7 +41,14 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	case "migrate":
 		// `migrate down-to <version>` rolls the schema DOWN to an allowlisted rollback
 		// target (destructive; see docs/migrations-rollback.md). Bare `migrate` runs Up.
-		if len(args) >= 2 && strings.TrimSpace(args[1]) == "down-to" {
+		// A destructive subcommand rejects unknown subcommands/flags rather than silently
+		// falling back to Up or ignoring a typo.
+		if len(args) >= 2 {
+			sub := strings.TrimSpace(args[1])
+			if sub != "down-to" {
+				printUsage(stdout)
+				return fmt.Errorf("unknown migrate subcommand %q", sub)
+			}
 			if len(args) < 3 {
 				printUsage(stdout)
 				return fmt.Errorf("migrate down-to requires a target version")
@@ -52,8 +59,12 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 			}
 			allowPending := false
 			for _, extra := range args[3:] {
-				if strings.TrimSpace(extra) == "--allow-pending" {
+				switch strings.TrimSpace(extra) {
+				case "--allow-pending":
 					allowPending = true
+				default:
+					printUsage(stdout)
+					return fmt.Errorf("unknown flag %q for migrate down-to", extra)
 				}
 			}
 			report, err := backendApp.MigrateDownTo(ctx, target, allowPending)
