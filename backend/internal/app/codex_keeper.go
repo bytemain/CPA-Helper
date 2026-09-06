@@ -3587,19 +3587,20 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 		return keeperQuotaResetResult{}, validationError("当前为 dry-run 模式，已阻止真实核销/重置；请关闭 dry-run 后重试")
 	}
 
-	// The per-auth lock is the concurrency guard for a paid, limited resource, so a
-	// missing runner is fail-closed rather than "proceed unlocked" — never let a
-	// serve/test variant bypass the protection.
+	// A missing runner is fail-closed rather than "proceed unlocked" — never let a serve/test
+	// variant bypass the concurrency guards below.
 	if a.keeper == nil {
 		return keeperQuotaResetResult{}, validationError("Keeper 未初始化，无法安全重置")
 	}
-	// Acquire the per-auth lock FIRST, then read state under it, so the decision never
-	// uses a pre-lock snapshot that a concurrent delete/rebuild could have invalidated.
-	// The lock is held across the whole fresh-count → consume → cooldown sequence so two
-	// concurrent resets of the same account can never each redeem a credit. It is
-	// non-blocking: a contended request returns a conflict rather than serializing into a
-	// second consume. It is released on return, BEFORE the handler's chained
-	// InspectAccountsLocked (which re-acquires it itself).
+	// Acquire the per-auth_name lock FIRST, then read state under it, so the decision never uses
+	// a pre-lock snapshot that a concurrent delete/rebuild could have invalidated. This lock is a
+	// per-FILE/state guard: it serializes operations on THIS auth_name (reset/inspect/delete/…)
+	// so its state row and remote credential are not mutated concurrently. It is NOT by itself the
+	// cross-file monetary guard — two DIFFERENT files that resolve to the same OpenAI account hold
+	// DIFFERENT auth_name locks; the paid-credit mutual exclusion across those routes is the
+	// stored-account_id fence acquired below. Non-blocking: a contended request returns a
+	// conflict. Released on return, BEFORE the handler's chained InspectAccountsLocked (which
+	// re-acquires it itself).
 	if !a.keeper.tryLockAuthName("reset", authName) {
 		return keeperQuotaResetResult{}, conflictError("账号正在巡检或重置中，请稍后重试")
 	}
