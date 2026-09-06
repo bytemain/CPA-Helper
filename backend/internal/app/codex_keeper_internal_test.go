@@ -2901,7 +2901,7 @@ func TestCreateKeeperRedeemConvergesAcrossApps(t *testing.T) {
 	for i := range apps {
 		go func(i int) {
 			defer wg.Done()
-			ids[i], errs[i] = apps[i].createKeeperRedeem(ctx, "shared.json", "idx-shared", "acct-shared")
+			ids[i], errs[i] = apps[i].createKeeperRedeem(ctx, "acct-shared")
 		}(i)
 	}
 	wg.Wait()
@@ -2915,12 +2915,12 @@ func TestCreateKeeperRedeemConvergesAcrossApps(t *testing.T) {
 	}
 }
 
-// keeperInsertPendingRedeem seeds a pending redeem ledger row for a test.
-func keeperInsertPendingRedeem(t *testing.T, app *App, authName, authIndex, accountID, id string) {
+// keeperInsertPendingRedeem seeds a pending redeem ledger row (keyed by account_id).
+func keeperInsertPendingRedeem(t *testing.T, app *App, accountID, id string) {
 	t.Helper()
 	if _, err := app.db.ExecContext(context.Background(),
-		`INSERT INTO codex_keeper_reset_redeems (auth_name, auth_index, account_id, redeem_request_id, status, updated_at) VALUES (?, ?, ?, ?, 'pending', '2026-01-01 00:00:00')`,
-		authName, authIndex, accountID, id); err != nil {
+		`INSERT INTO codex_keeper_reset_redeems (account_id, redeem_request_id, status, updated_at) VALUES (?, ?, 'pending', '2026-01-01 00:00:00')`,
+		accountID, id); err != nil {
 		t.Fatalf("seed pending redeem: %v", err)
 	}
 }
@@ -2934,11 +2934,10 @@ func keeperInsertStateRow(t *testing.T, app *App, authName string) {
 	}
 }
 
-// TestPruneRetainsAccountWithPendingRedeem proves prune never drops an account that still
-// holds a persisted pending redeem — even after a restart (empty in-memory lock table) and
-// a transient/empty remote list — so the sole idempotency key survives. A non-pending
-// stale account is still pruned.
-func TestPruneRetainsAccountWithPendingRedeem(t *testing.T) {
+// TestPruneKeepsAccountLedger proves prune deletes an absent account's STATE row but never
+// touches the account_id-keyed redeem ledger, so a pending idempotency key survives a
+// transient/empty remote list and the account can replay it after re-import.
+func TestPruneKeepsAccountLedger(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
 	if err != nil {
@@ -2947,26 +2946,23 @@ func TestPruneRetainsAccountWithPendingRedeem(t *testing.T) {
 	defer app.Close()
 	ctx := context.Background()
 
-	keeperInsertStateRow(t, app, "keep.json")
-	keeperInsertPendingRedeem(t, app, "keep.json", "idx-keep", "acct-keep", "rid-keep")
-	keeperInsertStateRow(t, app, "drop.json") // no pending redeem
+	keeperInsertStateRow(t, app, "gone.json")
+	keeperInsertPendingRedeem(t, app, "acct-gone", "rid-gone")
 
-	// A transient/empty remote list marks BOTH as stale.
+	// A transient/empty remote list marks the account stale.
 	pruned, err := app.pruneKeeperMissingAuthStates(ctx, map[string]bool{})
 	if err != nil {
 		t.Fatalf("prune: %v", err)
 	}
 	if pruned != 1 {
-		t.Fatalf("pruned = %d, want 1 (only the non-pending account)", pruned)
+		t.Fatalf("pruned = %d, want 1", pruned)
 	}
-	if st, _ := app.getKeeperState(ctx, "keep.json"); st == nil {
-		t.Fatal("account with a pending redeem was pruned; its idempotency key was dropped")
+	if st, _ := app.getKeeperState(ctx, "gone.json"); st != nil {
+		t.Fatal("stale account state should have been pruned")
 	}
-	if ok, _ := app.hasPendingKeeperRedeem(ctx, "keep.json"); !ok {
-		t.Fatal("pending redeem was dropped for the retained account")
-	}
-	if st, _ := app.getKeeperState(ctx, "drop.json"); st != nil {
-		t.Fatal("non-pending stale account should have been pruned")
+	// The account_id-keyed ledger row must survive the prune.
+	if id, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-gone"); !ok || id != "rid-gone" {
+		t.Fatalf("prune dropped the account's ledger key: got (%q,%v), want (rid-gone,true)", id, ok)
 	}
 }
 
@@ -2995,9 +2991,10 @@ func TestPruneFailsClosedWithoutRunner(t *testing.T) {
 	}
 }
 
-// TestDeleteRefusedWithPendingRedeem proves an explicit delete is refused while a pending
-// redeem is unresolved (dropping it would lose the sole idempotency key).
-func TestDeleteRefusedWithPendingRedeem(t *testing.T) {
+// TestDeleteStateRowKeepsLedger proves deleting a file's state row never drops the
+// account_id-keyed redeem ledger, so a re-import (any filename) still replays the pending
+// key rather than minting a new one.
+func TestDeleteStateRowKeepsLedger(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
 	if err != nil {
@@ -3006,25 +3003,17 @@ func TestDeleteRefusedWithPendingRedeem(t *testing.T) {
 	defer app.Close()
 	ctx := context.Background()
 
-	// A disabled account (delete precondition) that still holds a pending redeem.
-	idx := "idx-del"
-	dis := true
-	if err := app.upsertKeeperState(ctx, keeperAccountResult{
-		Name: "del.json", Result: "status_disabled", CheckedAt: time.Now(), AuthIndex: &idx, Disabled: &dis,
-	}); err != nil {
-		t.Fatalf("seed state: %v", err)
-	}
-	keeperInsertPendingRedeem(t, app, "del.json", idx, "acct-del", "rid-del")
+	keeperInsertStateRow(t, app, "del.json")
+	keeperInsertPendingRedeem(t, app, "acct-del", "rid-del")
 
-	err = app.deleteKeeperAccount(ctx, "del.json")
-	if err == nil {
-		t.Fatal("delete succeeded despite a pending redeem; must refuse")
+	if _, err := app.deleteKeeperStateRow(ctx, "del.json"); err != nil {
+		t.Fatalf("delete state row: %v", err)
 	}
-	if st, _ := app.getKeeperState(ctx, "del.json"); st == nil {
-		t.Fatal("state row was deleted despite the refusal")
+	if st, _ := app.getKeeperState(ctx, "del.json"); st != nil {
+		t.Fatal("state row was not deleted")
 	}
-	if ok, _ := app.hasPendingKeeperRedeem(ctx, "del.json"); !ok {
-		t.Fatal("pending redeem was dropped despite the refusal")
+	if id, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-del"); !ok || id != "rid-del" {
+		t.Fatalf("delete dropped the account's ledger key: got (%q,%v), want (rid-del,true)", id, ok)
 	}
 }
 
@@ -3127,5 +3116,90 @@ func TestUpsertResetCreditClearedOnAccountSwapSameIndex(t *testing.T) {
 	}
 	if len(st.ResetCredits) != 0 {
 		t.Fatalf("account swap must clear the inherited reset-credit list; got %v", st.ResetCredits)
+	}
+}
+
+// TestKeeperReconcileInspectionAccountID pins the cross-source identity reconciliation:
+// the list id_token.chatgpt_account_id and the download account_id must AGREE (or only one
+// present) to be trusted; a conflict — or a single source that is self-contradictory —
+// yields (·, false) so the caller treats the identity as unknown.
+func TestKeeperReconcileInspectionAccountID(t *testing.T) {
+	idTokenAcct := func(id string) map[string]any {
+		return map[string]any{"id_token": map[string]any{"chatgpt_account_id": id}}
+	}
+	cases := []struct {
+		name     string
+		authInfo map[string]any
+		detail   map[string]any
+		wantID   string
+		wantOK   bool
+	}{
+		{"agree", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-A"}, "acct-A", true},
+		{"list-only", idTokenAcct("acct-A"), map[string]any{}, "acct-A", true},
+		{"detail-only", map[string]any{}, map[string]any{"account_id": "acct-B"}, "acct-B", true},
+		{"neither", map[string]any{}, map[string]any{}, "", true},
+		{"list-A-detail-B-conflict", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-B"}, "", false},
+		// A single source self-contradicting (top-level vs id_token claim) is also untrusted.
+		{"detail-self-conflict", map[string]any{}, map[string]any{"account_id": "acct-B", "id_token": map[string]any{"chatgpt_account_id": "acct-C"}}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := keeperReconcileInspectionAccountID(tc.authInfo, tc.detail)
+			if ok != tc.wantOK || got != tc.wantID {
+				t.Fatalf("reconcile = (%q,%v), want (%q,%v)", got, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestKeeperLedgerPerAccountAndRouteAgnostic proves the redeem ledger keys on the stable
+// account_id: distinct accounts keep separate rows, the SAME account converges on one key
+// regardless of how it is routed (a claim reusing the same account_id returns the existing
+// pending id), and a resolved (terminal) row lets the next claim mint a fresh id.
+func TestKeeperLedgerPerAccountAndRouteAgnostic(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	// Two distinct accounts get distinct pending rows.
+	idA, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("claim A: %v", err)
+	}
+	idB, err := app.createKeeperRedeem(ctx, "acct-B")
+	if err != nil {
+		t.Fatalf("claim B: %v", err)
+	}
+	if idA == idB {
+		t.Fatalf("distinct accounts share a request_id %q; each must get its own", idA)
+	}
+
+	// The SAME account, however it is now routed, converges on its existing pending id
+	// (route-agnostic) rather than minting a new one.
+	idAAgain, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("re-claim A: %v", err)
+	}
+	if idAAgain != idA {
+		t.Fatalf("re-claim of account A minted a new id %q (want existing %q)", idAAgain, idA)
+	}
+	if got, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-A"); !ok || got != idA {
+		t.Fatalf("account A pending lookup = (%q,%v), want (%q,true)", got, ok, idA)
+	}
+
+	// After A resolves (terminal), the next claim mints a fresh id.
+	if err := app.finishKeeperRedeem(ctx, "acct-A", idA, keeperResetCreditCodeReset); err != nil {
+		t.Fatalf("finish A: %v", err)
+	}
+	idAFresh, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("fresh claim A: %v", err)
+	}
+	if idAFresh == idA {
+		t.Fatalf("claim after a resolved redeem reused the terminal id %q; must mint fresh", idA)
 	}
 }

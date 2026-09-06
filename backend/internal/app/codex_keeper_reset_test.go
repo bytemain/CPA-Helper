@@ -622,10 +622,12 @@ func TestKeeperResetConsumeLogRedaction(t *testing.T) {
 	}
 }
 
-// TestKeeperResetAuthIndexMismatch proves the exact same-row binding: when the fresh
-// merged detail's auth_index no longer matches the stored DB row (a reassignment),
-// the reset fails closed and never fetches credits, consumes, or clears the cooldown.
-func TestKeeperResetAuthIndexMismatch(t *testing.T) {
+// TestKeeperResetAuthIndexChangeProceeds proves auth_index is treated as a ROUTING
+// selector, not the resource identity: when only the auth_index changes (file
+// rename/move/reorder) but the account_id is unchanged, the reset proceeds normally using
+// the fresh auth_index for routing — it does NOT fail closed. (Only an account_id change
+// fails closed; see TestKeeperResetAccountIDMismatchFailsClosed.)
+func TestKeeperResetAuthIndexChangeProceeds(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	authName := "moved-me.json"
 	authDetail := map[string]any{
@@ -639,23 +641,23 @@ func TestKeeperResetAuthIndexMismatch(t *testing.T) {
 	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
 	defer cleanup()
 
-	// The account was inspected with idx-orig; now the fresh detail reports a
-	// different auth_index (reassignment).
+	// The account was inspected with idx-orig; the file is now routed via a different
+	// auth_index, but it is the SAME account (account_id unchanged).
 	ctrl.mu.Lock()
 	ctrl.authIndexOverride = "idx-different"
 	ctrl.consumeCalls = 0
 	ctrl.resetQuotaCalls = nil
 	ctrl.mu.Unlock()
 
-	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
-
+	reset := keeperResetResponse{}
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
+	if reset.Status != "ok" || reset.Account.Outcome != "reset" {
+		t.Fatalf("auth_index-only change reset = %+v, want ok/reset (index is routing, not identity)", reset)
+	}
 	ctrl.mu.Lock()
 	defer ctrl.mu.Unlock()
-	if ctrl.consumeCalls != 0 {
-		t.Fatalf("consume happened on auth_index mismatch (%d calls); must fail closed", ctrl.consumeCalls)
-	}
-	if len(ctrl.resetQuotaCalls) != 0 {
-		t.Fatalf("cooldown cleared on auth_index mismatch; must fail closed")
+	if ctrl.consumeCalls != 1 {
+		t.Fatalf("consume calls = %d, want 1 (index change should proceed)", ctrl.consumeCalls)
 	}
 }
 
@@ -691,11 +693,11 @@ func TestKeeperResetMissingAccountID(t *testing.T) {
 	}
 }
 
-// TestKeeperResetLedgerIdentityChangeMintsFresh proves the ledger never reuses a
-// pending redeem_request_id across an identity change: after a lost consume leaves a
-// pending row bound to one account_id, a later reset whose account_id has changed (same
-// auth_index) mints a FRESH id rather than replaying the previous account's key.
-func TestKeeperResetLedgerIdentityChangeMintsFresh(t *testing.T) {
+// TestKeeperResetAccountIDMismatchFailsClosed proves a stale page cannot reset a
+// swapped-out account: when the fresh account_id differs from the DB row's stored
+// account_id (the file was rebound to a different account under the same auth_index), the
+// reset fails closed (account_id mismatch) and never consumes or clears the cooldown.
+func TestKeeperResetAccountIDMismatchFailsClosed(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	authName := "switch-me.json"
 	authDetail := map[string]any{
@@ -703,37 +705,26 @@ func TestKeeperResetLedgerIdentityChangeMintsFresh(t *testing.T) {
 		"email": "switch@example.com", "account_type": "pro", "disabled": false,
 		"priority": 1, "access_token": "test-token", "account_id": "acct-A",
 	}
-	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
 	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
 	defer cpa.Close()
 	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
 	defer cleanup()
 
-	// First reset: consume is lost → pending row bound to account_id acct-A.
-	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
-
-	// The auth_name is now backed by a different account (same auth_index) and the
-	// consume succeeds.
+	// The run-once inspection stored account_id=acct-A. The file is now rebound to a
+	// different account (same auth_index), but the DB row (and the user's page) still
+	// shows acct-A.
 	ctrl.mu.Lock()
-	firstIDs := append([]string{}, ctrl.consumeRequestIDs...)
 	ctrl.accountIDOverride = "acct-B"
-	ctrl.consumeMode = "ok"
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
 	ctrl.mu.Unlock()
 
-	reset := keeperResetResponse{}
-	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Status != "ok" || reset.Account.Outcome != "reset" {
-		t.Fatalf("post-switch reset = %+v, want outcome=reset", reset)
-	}
-
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
 	ctrl.mu.Lock()
 	defer ctrl.mu.Unlock()
-	if len(firstIDs) == 0 {
-		t.Fatal("no consume recorded for the lost first attempt")
-	}
-	newID := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
-	if newID == firstIDs[0] {
-		t.Fatalf("identity change reused the previous account's redeem_request_id %q", newID)
+	if ctrl.consumeCalls != 0 || len(ctrl.resetQuotaCalls) != 0 {
+		t.Fatalf("account_id mismatch must fail closed (consume=%d, reset-quota=%v)", ctrl.consumeCalls, ctrl.resetQuotaCalls)
 	}
 }
 
@@ -1107,57 +1098,45 @@ func TestKeeperDeleteConflictsWithInFlightReset(t *testing.T) {
 	}
 }
 
-// TestKeeperResetPreservesOtherIdentityPendingKey proves the multi-row ledger keeps each
-// identity's key: after an unknown-outcome redeem leaves identity A pending, a reset under
-// a DIFFERENT identity B (same auth_name) does NOT overwrite A's key, and when the original
-// account (A) returns, its ORIGINAL redeem_request_id is replayed (idempotent) rather than a
-// fresh key that could double-consume.
-func TestKeeperResetPreservesOtherIdentityPendingKey(t *testing.T) {
+// TestKeeperResetReplaysPendingAcrossIndexChange proves the redeem ledger is keyed by the
+// stable account_id, not the routing auth_index: after a lost consume leaves a pending
+// redeem, a later reset whose auth_index has CHANGED (file rename/move/reorder) but whose
+// account_id is unchanged still finds and replays the SAME redeem_request_id (recovered as
+// already_redeemed) rather than minting a new key that could double-consume.
+func TestKeeperResetReplaysPendingAcrossIndexChange(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-	authName := "multi-me.json"
+	authName := "reindex-me.json"
 	authDetail := map[string]any{
-		"name": authName, "type": "codex", "auth_index": "idx-multi",
-		"email": "multi@example.com", "account_type": "pro", "disabled": false,
-		"priority": 1, "access_token": "test-token", "account_id": "acct-A",
+		"name": authName, "type": "codex", "auth_index": "idx-1",
+		"email": "reindex@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-stable",
 	}
-	ctrl := &keeperResetControl{availableCount: 3, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "lost", resetMode: "ok"}
 	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
 	defer cpa.Close()
 	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
 	defer cleanup()
 
-	// Identity A: consume response lost → A pending.
+	// First reset at auth_index idx-1: consume lost → pending (keyed by acct-stable).
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
 	ctrl.mu.Lock()
-	idA := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
-	// The auth_name is now backed by identity B; its consume succeeds.
-	ctrl.accountIDOverride = "acct-B"
+	lostID := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	// The file is renamed/reordered → CPA gives it a NEW auth_index, but it is the SAME
+	// OpenAI account. The account recovers so the replay resolves.
+	ctrl.authIndexOverride = "idx-2"
 	ctrl.consumeMode = "ok"
-	ctrl.consumeSuccessCode = "reset"
-	ctrl.mu.Unlock()
-	reset := keeperResetResponse{}
-	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Account.Outcome != "reset" {
-		t.Fatalf("identity B reset = %+v, want reset", reset)
-	}
-	ctrl.mu.Lock()
-	idB := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
-	// The original account (A) returns; its pending redeem must still be here to replay.
-	ctrl.accountIDOverride = ""
 	ctrl.consumeSuccessCode = "already_redeemed"
 	ctrl.mu.Unlock()
-	reset = keeperResetResponse{}
+
+	reset := keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Account.Outcome != "already_redeemed" {
-		t.Fatalf("returned identity A reset = %+v, want already_redeemed (replay of A's key)", reset)
+	if reset.Status != "ok" || reset.Account.Outcome != "already_redeemed" {
+		t.Fatalf("post-reindex reset = %+v, want already_redeemed (pending replayed across index change)", reset)
 	}
 	ctrl.mu.Lock()
-	idAReplay := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
-	ctrl.mu.Unlock()
-	if idB == idA {
-		t.Fatalf("identity B reused A's key %q; identities must have separate keys", idA)
-	}
-	if idAReplay != idA {
-		t.Fatalf("returned identity A did not replay its original key: original %q, replay %q (key was overwritten by B)", idA, idAReplay)
+	defer ctrl.mu.Unlock()
+	replayID := ctrl.consumeRequestIDs[len(ctrl.consumeRequestIDs)-1]
+	if lostID == "" || replayID != lostID {
+		t.Fatalf("index change lost the pending key: first %q, replay %q (should reuse the same key)", lostID, replayID)
 	}
 }

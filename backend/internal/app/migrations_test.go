@@ -481,4 +481,22 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	if testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
 		t.Fatal("rollback left codex_keeper_auth_states.account_id behind")
 	}
+
+	// Replay: from the prod baseline (202609040002) migrate Up to head again — the whole
+	// release must be re-runnable after a rollback (040002 → head → 040002 → head).
+	if err := goose.UpToContext(ctx, db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("replay up to head after rollback: %v", err)
+	}
+	if v := func() int64 {
+		var v int64
+		_ = db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&v)
+		return v
+	}(); v != backendMigrations.LatestVersion {
+		t.Fatalf("post-replay version = %d, want head %d", v, backendMigrations.LatestVersion)
+	}
+	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") ||
+		!testTableExists(t, db, "codex_keeper_reset_redeems") ||
+		testTableExists(t, db, "codex_keeper_quota_resets") {
+		t.Fatal("replay to head did not restore the full head schema")
+	}
 }

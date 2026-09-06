@@ -89,7 +89,7 @@ func TestMigrateDownToRefusesPendingRedeems(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open db: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO codex_keeper_reset_redeems (auth_name, auth_index, account_id, redeem_request_id, status, updated_at) VALUES ('p.json','i','a','rid','pending','2026-01-01 00:00:00')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO codex_keeper_reset_redeems (account_id, redeem_request_id, status, updated_at) VALUES ('acct-p','rid','pending','2026-01-01 00:00:00')`); err != nil {
 		_ = db.Close()
 		t.Fatalf("insert pending: %v", err)
 	}
