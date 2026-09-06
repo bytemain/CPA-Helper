@@ -3659,6 +3659,21 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	}
 	defer a.keeper.unlockAccountID(identity.accountID)
 
+	// Persist the resolved account_id onto a legacy NULL-account row NOW — inside the account
+	// fence and BEFORE any consume — so a later reset sees the bound identity and the account_id
+	// swap gate above protects it. Otherwise a pre-account_id (NULL) row is treated as
+	// bindable-to-anything on every reset: if the same filename is swapped to a different account
+	// between resets (with no successful inspection persisting the new id in between), the next
+	// reset would consume the WRONG account's credit undetected. CAS on account_id IS NULL; if
+	// the row already carries a DIFFERENT account_id, the identity changed under us → fail closed.
+	if berr := a.bindKeeperAccountID(ctx, authName, identity.accountID); berr != nil {
+		if errors.Is(berr, errKeeperIdentityConflict) {
+			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_mismatch", "auth_index", authIndex)
+			return keeperQuotaResetResult{}, validationError("账号身份已变化（account_id 不一致），请刷新账号列表后重试")
+		}
+		return keeperQuotaResetResult{}, berr
+	}
+
 	// A normalized detail carrying ONLY the validated identity, so the fetch/consume
 	// never re-derive an index from a name fallback or a conflicting field.
 	identDetail := map[string]any{"auth_index": identity.authIndex, "account_id": identity.accountID}
@@ -4393,6 +4408,41 @@ func (a *App) markKeeperIdentityError(ctx context.Context, authName string, mess
 		WHERE auth_name = ?
 	`, message, message, dbTime(checkedAt), now, authName)
 	return err
+}
+
+// bindKeeperAccountID persists a resolved account_id onto a pre-account_id (NULL) state row so
+// a later reset sees the binding and the account_id swap gate can protect it. It CAS-updates
+// only while account_id IS NULL (affected==1 = bound). affected==0 means the row already
+// carries an account_id (or, defensively, no row exists): it re-reads and returns nil only when
+// the stored id already equals accountID, else errKeeperIdentityConflict (the identity changed
+// under us). Callers hold the account fence + per-auth lock, so no concurrent writer races this.
+func (a *App) bindKeeperAccountID(ctx context.Context, authName, accountID string) error {
+	res, err := a.db.ExecContext(ctx, `
+		UPDATE codex_keeper_auth_states SET account_id = ?, updated_at = ?
+		WHERE auth_name = ? AND account_id IS NULL
+	`, accountID, dbTime(time.Now()), authName)
+	if err != nil {
+		return err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if affected == 1 {
+		return nil
+	}
+	var stored sql.NullString
+	qerr := a.db.QueryRowContext(ctx, `SELECT CAST(account_id AS TEXT) FROM codex_keeper_auth_states WHERE auth_name = ?`, authName).Scan(&stored)
+	if errors.Is(qerr, sql.ErrNoRows) {
+		return nil
+	}
+	if qerr != nil {
+		return qerr
+	}
+	if stored.Valid && strings.TrimSpace(stored.String) != "" && strings.TrimSpace(stored.String) != accountID {
+		return errKeeperIdentityConflict
+	}
+	return nil
 }
 
 func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, disabled bool) error {

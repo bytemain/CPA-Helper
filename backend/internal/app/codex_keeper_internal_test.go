@@ -3661,3 +3661,49 @@ func TestKeeperInspectListOnlyAccountIDSetsHeader(t *testing.T) {
 		t.Fatalf("reset-credit snapshot not written: %v", st.ResetCreditCount)
 	}
 }
+
+// TestBindKeeperAccountIDCASAndSwap proves the CAS bind used by the reset path: a pre-account_id
+// (NULL) row binds to the reset's resolved account_id, a re-bind of the SAME id is idempotent,
+// and a re-bind with a DIFFERENT id fails closed — so a NULL row can never stay bindable-to-
+// anything across resets (the fix for the same-name account-swap-between-resets window).
+func TestBindKeeperAccountIDCASAndSwap(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	const authName = "legacy-null.json"
+	idx := "idx-1"
+	// Seed a pre-account_id row (auth_index set, account_id NULL).
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx}); err != nil {
+		t.Fatalf("seed null row: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, authName); st.AccountID != nil {
+		t.Fatalf("seed row must have NULL account_id, got %v", st.AccountID)
+	}
+	// A reset on the NULL row binds the resolved account_id.
+	if err := app.bindKeeperAccountID(ctx, authName, "acct-A"); err != nil {
+		t.Fatalf("bind A: %v", err)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.AccountID == nil || *st.AccountID != "acct-A" {
+		t.Fatalf("account_id not bound to A: %v", st.AccountID)
+	}
+	// Re-binding the SAME account is idempotent.
+	if err := app.bindKeeperAccountID(ctx, authName, "acct-A"); err != nil {
+		t.Fatalf("idempotent re-bind A: %v", err)
+	}
+	// A swap — a different account on the now-bound row — fails closed.
+	if err := app.bindKeeperAccountID(ctx, authName, "acct-B"); !errors.Is(err, errKeeperIdentityConflict) {
+		t.Fatalf("bind B on a row bound to A = %v, want errKeeperIdentityConflict", err)
+	}
+	st, _ = app.getKeeperState(ctx, authName)
+	if st.AccountID == nil || *st.AccountID != "acct-A" {
+		t.Fatalf("swap must not change the stored account_id: %v", st.AccountID)
+	}
+}
