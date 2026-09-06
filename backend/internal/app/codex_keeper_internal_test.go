@@ -3145,6 +3145,15 @@ func TestKeeperReconcileInspectionIdentity(t *testing.T) {
 		{"authindex-conflict", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-B", "account_id": "acct-A"}, "", false},
 		// account AND auth_index agree.
 		{"both-agree", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-A", "account_id": "acct-A"}, "acct-A", true},
+		// A raw JWT id_token string (CLIProxyAPI's real download form) is decoded and its
+		// chatgpt_account_id claim cross-checked against the top-level account_id.
+		{"rawjwt-agree", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"chatgpt_account_id": "acct-A"})}, "acct-A", true},
+		// The deceptive case: top-level account_id A but a raw JWT claim B → conflict, untrusted.
+		{"rawjwt-conflict", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"chatgpt_account_id": "acct-B"})}, "", false},
+		// The claim nested under the OpenAI auth namespace is also cross-checked.
+		{"rawjwt-namespace-conflict", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})}, "", false},
+		// An id_token that is present but unparseable leaves the identity indeterminate → fail closed.
+		{"idtoken-unparseable", map[string]any{}, map[string]any{"account_id": "acct-A", "id_token": "not-a-jwt"}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -3154,6 +3163,22 @@ func TestKeeperReconcileInspectionIdentity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// keeperTestJWT builds a raw JWT string (header.payload.sig, base64url) carrying the given
+// claims — the shape CLIProxyAPI's real download auth JSON uses for id_token, so tests can
+// exercise the raw-JWT identity cross-check. The signature is a placeholder (identity parsing
+// reads the payload, it does not verify the signature).
+func keeperTestJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal jwt part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return enc(map[string]any{"alg": "none", "typ": "JWT"}) + "." + enc(claims) + ".sig"
 }
 
 // TestKeeperLedgerPerAccountAndRouteAgnostic proves the redeem ledger keys on the stable
@@ -3434,5 +3459,97 @@ func TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites(t *testing.T) {
 	}
 	if st.AccountID == nil || *st.AccountID != "acct-KNOWN-X" {
 		t.Fatalf("prior account_id not preserved with unknown inspection identity: %v", st.AccountID)
+	}
+}
+
+// TestKeeperInspectRawJWTAccountConflictPreservesSnapshot proves the inspection path also
+// catches a deceptive raw-JWT identity: the download detail has top-level account_id=A but a
+// raw JWT id_token whose account claim (nested under the OpenAI auth namespace — the real
+// on-wire location) is B. The detail is self-contradictory, so the inspection bails as
+// identity_error: NO reset-credit fetch, NO usage/credit snapshot write, the prior snapshot
+// preserved, and the refresh audited as an error.
+func TestKeeperInspectRawJWTAccountConflictPreservesSnapshot(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "jwt-conflict.json"
+	var mu sync.Mutex
+	creditFetches := 0
+	deceptiveJWT := keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Top-level account_id=A, but the raw JWT's own claim is B → self-contradictory.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1", "account_id": "acct-A",
+				"id_token": deceptiveJWT, "email": "j@example.com", "account_type": "pro",
+				"disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 99, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a prior snapshot with a KNOWN usage percent + reset credits to prove they survive.
+	idx, acct, count, used := "idx-1", "acct-A", 5, 42
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &acct,
+		PrimaryUsedPercent: &used, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	if stats.IdentityError != 1 || stats.Healthy != 0 {
+		t.Fatalf("stats = %+v, want IdentityError=1, Healthy=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "identity_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, identity_error)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times on a raw-JWT identity conflict; must not fetch", fetches)
+	}
+	// The usage snapshot must NOT be overwritten by the deceptive inspection's fresh 99%.
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.PrimaryUsedPercent == nil || *st.PrimaryUsedPercent != 42 {
+		t.Fatalf("usage snapshot overwritten on raw-JWT conflict: got=%v want=42", st.PrimaryUsedPercent)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 {
+		t.Fatalf("reset credits not preserved on raw-JWT conflict: %v", st.ResetCreditCount)
+	}
+	if st.LastError == nil {
+		t.Fatal("raw-JWT identity conflict did not record an error")
 	}
 }

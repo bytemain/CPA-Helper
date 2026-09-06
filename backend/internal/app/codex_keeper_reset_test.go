@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,21 @@ import (
 
 	backendApp "cpa-helper/backend/internal/app"
 )
+
+// rawJWTWithClaims builds a raw JWT string (header.payload.sig, base64url) carrying the given
+// claims — the shape CLIProxyAPI's real download auth JSON uses for id_token. The signature is
+// a placeholder; identity parsing reads the payload and does not verify the signature.
+func rawJWTWithClaims(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal jwt part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return enc(map[string]any{"alg": "none", "typ": "JWT"}) + "." + enc(claims) + ".sig"
+}
 
 // keeperResetResponse is the minimal wire shape the reset route returns: only
 // the account name plus whether a real reset credit was consumed this operation.
@@ -73,6 +89,10 @@ type keeperResetControl struct {
 	// detailNameOverride, when non-empty, replaces the download detail's "name" to
 	// simulate a proxy misroute binding another credential's detail to this target.
 	detailNameOverride string
+	// detailIDTokenOverride, when non-empty, sets the download detail's id_token to this
+	// raw value (a JWT string as CLIProxyAPI really returns), so a test can inject a token
+	// whose chatgpt_account_id claim conflicts with the top-level account_id.
+	detailIDTokenOverride string
 }
 
 func newKeeperResetCPA(t *testing.T, authName string, authDetail map[string]any, ctrl *keeperResetControl) *httptest.Server {
@@ -116,9 +136,13 @@ func newKeeperResetCPA(t *testing.T, authName string, authDetail map[string]any,
 			omitToken := ctrl.omitAccessToken
 			aliasConflict := ctrl.detailAliasConflict
 			nameOvr := ctrl.detailNameOverride
+			idTokenOvr := ctrl.detailIDTokenOverride
 			ctrl.mu.Unlock()
 			if nameOvr != "" {
 				detail["name"] = nameOvr
+			}
+			if idTokenOvr != "" {
+				detail["id_token"] = idTokenOvr
 			}
 			if ovr != "" {
 				detail["auth_index"] = ovr
@@ -730,6 +754,43 @@ func TestKeeperResetAccountIDMismatchFailsClosed(t *testing.T) {
 	defer ctrl.mu.Unlock()
 	if ctrl.consumeCalls != 0 || len(ctrl.resetQuotaCalls) != 0 {
 		t.Fatalf("account_id mismatch must fail closed (consume=%d, reset-quota=%v)", ctrl.consumeCalls, ctrl.resetQuotaCalls)
+	}
+}
+
+// TestKeeperResetRawJWTAccountIDConflictFailsClosed proves the deceptive raw-JWT case: the
+// download detail has top-level account_id=A but an id_token raw JWT whose account claim is B,
+// carried in the REAL on-wire location — nested under the OpenAI auth namespace
+// (https://api.openai.com/auth.chatgpt_account_id) rather than a flattened top-level claim (the
+// list endpoint flattens; the raw download JWT nests). The identity resolver decodes the JWT,
+// sees the top-level A conflict with the token's own B, and fails closed — NO consume, NO
+// /reset-quota — instead of acting on A's header/route with B's token.
+func TestKeeperResetRawJWTAccountIDConflictFailsClosed(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "deceptive-jwt.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-jwt",
+		"email": "jwt@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-A",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// After the clean seed inspection, the download starts returning a raw JWT id_token whose
+	// claim (acct-B) contradicts the still-top-level account_id (acct-A) — a deceptive entry.
+	ctrl.mu.Lock()
+	ctrl.detailIDTokenOverride = rawJWTWithClaims(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
+
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 0 || len(ctrl.resetQuotaCalls) != 0 {
+		t.Fatalf("raw-JWT account_id conflict must fail closed (consume=%d, reset-quota=%v)", ctrl.consumeCalls, ctrl.resetQuotaCalls)
 	}
 }
 

@@ -3925,12 +3925,21 @@ func keeperExplicitAuthIndex(o map[string]any) (string, error) {
 	return keeperConsistentValue(keeperString(o["auth_index"]), keeperString(o["authIndex"]), keeperString(o["index"]))
 }
 
-// keeperExplicitAccountID returns an object's account_id, from the top-level field and/or
-// the parsed id_token.chatgpt_account_id claim, validating the two agree when both exist.
+// keeperExplicitAccountID returns an object's account_id, from the top-level field AND the
+// id_token's chatgpt_account_id claim, validating they all agree. The id_token may be a map
+// OR — as in CLIProxyAPI's real download auth JSON — a raw JWT string; both forms are decoded
+// (keeperIDTokenClaims), so a deceptive entry with top-level account_id A but a JWT claim B is
+// caught as a conflict instead of silently trusting A and mixing A's metadata with B's token.
+// An id_token that is present but cannot be parsed leaves the identity INDETERMINATE, so it
+// fails closed (returns a conflict) rather than trusting the un-cross-checked top-level value.
 func keeperExplicitAccountID(o map[string]any) (string, error) {
 	candidates := []string{keeperString(o["account_id"])}
-	if idt, ok := o["id_token"].(map[string]any); ok {
-		candidates = append(candidates, keeperString(idt["chatgpt_account_id"]))
+	if raw, present := o["id_token"]; present && raw != nil {
+		claims := keeperIDTokenClaims(raw)
+		if claims == nil {
+			return "", errKeeperIdentityConflict
+		}
+		candidates = append(candidates, keeperClaimsAccountIDs(claims)...)
 	}
 	return keeperConsistentValue(candidates...)
 }
@@ -4728,6 +4737,18 @@ func keeperIDTokenPlanValues(value any) []string {
 		}
 	}
 	return values
+}
+
+// keeperClaimsAccountIDs pulls chatgpt_account_id from id_token claims, from BOTH the top
+// level and the OpenAI auth namespace claim (https://api.openai.com/auth) where OpenAI's real
+// id_token nests it. Both are returned so keeperConsistentValue validates they agree with each
+// other and with the object's top-level account_id — any disagreement is an identity conflict.
+func keeperClaimsAccountIDs(claims map[string]any) []string {
+	ids := []string{keeperString(claims["chatgpt_account_id"])}
+	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
+		ids = append(ids, keeperString(auth["chatgpt_account_id"]))
+	}
+	return ids
 }
 
 func keeperIDTokenClaims(value any) map[string]any {
