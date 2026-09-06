@@ -2263,8 +2263,8 @@ func keeperWebsocketUsageSuccessPayload(usedPercent int) map[string]any {
 // resetCreditSnapshotJSON is a single valid projected reset credit for identity tests.
 const resetCreditSnapshotJSON = `[{"id":"c1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"}]`
 
-func healthyResetResult(name, authIndex string, count *int, credits *string) keeperAccountResult {
-	return keeperAccountResult{
+func healthyResetResult(name, authIndex, accountID string, count *int, credits *string) keeperAccountResult {
+	r := keeperAccountResult{
 		Name:             name,
 		Result:           "healthy",
 		AuthIndex:        stringPtr(authIndex),
@@ -2272,13 +2272,17 @@ func healthyResetResult(name, authIndex string, count *int, credits *string) kee
 		ResetCreditCount: count,
 		ResetCredits:     credits,
 	}
+	if accountID != "" {
+		r.AccountID = stringPtr(accountID)
+	}
+	return r
 }
 
 // TestUpsertKeeperStateClearsResetCreditsOnIdentityChange pins the identity
-// boundary: when an auth_name is reassigned a new auth_index and the new account's
-// reset-credit fetch fails (nil count/credits), the previous identity's snapshot
-// must NOT be preserved by COALESCE — it must be cleared so the wrong account's
-// schedule never surfaces on the new index's row.
+// boundary: when an auth_name is rebound to a different ACCOUNT (a new account_id)
+// and the new account's reset-credit fetch fails (nil count/credits), the previous
+// account's snapshot must NOT be preserved by COALESCE — it must be cleared so the
+// wrong account's schedule never surfaces on the new identity's row.
 func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -2290,7 +2294,7 @@ func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 
 	// idx-1 inspects healthy with a populated reset-credit snapshot.
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert idx-1: %v", err)
 	}
 	state, err := app.getKeeperState(ctx, "reused.json")
@@ -2302,7 +2306,7 @@ func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 	}
 
 	// Same auth_name reassigned to idx-2; the new identity's fetch failed (nil).
-	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-2", nil, nil)); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-2", "acct-2", nil, nil)); err != nil {
 		t.Fatalf("upsert idx-2: %v", err)
 	}
 	state, err = app.getKeeperState(ctx, "reused.json")
@@ -2333,11 +2337,11 @@ func TestUpsertKeeperStatePreservesResetCreditsOnSameIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert first: %v", err)
 	}
 	// Same identity, failed fetch (nil count/credits).
-	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", nil, nil)); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", "acct-1", nil, nil)); err != nil {
 		t.Fatalf("upsert second: %v", err)
 	}
 	state, err := app.getKeeperState(ctx, "stable.json")
@@ -2365,7 +2369,7 @@ func TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("same.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("same.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert idx-1: %v", err)
 	}
 	// A transport/404 failure on the auth-file read: nil AuthIndex, network_error.
@@ -3070,5 +3074,58 @@ func TestUpsertSubscriptionClearedOnAccountSwapSameIndex(t *testing.T) {
 	}
 	if st, _ := app.getKeeperState(ctx, "swap.json"); st.SubscriptionActiveUntil != nil {
 		t.Fatalf("account swap must clear the inherited renewal date; got %v", st.SubscriptionActiveUntil)
+	}
+}
+
+// TestUpsertResetCreditClearedOnAccountSwapSameIndex proves the reset-credit snapshot is
+// scoped to the ACCOUNT (account_id), not just auth_index: when the same auth_name+index is
+// swapped to a different account and the new fetch failed, the old account's count/credits
+// are cleared (not inherited); the same-account failed fetch still preserves.
+func TestUpsertResetCreditClearedOnAccountSwapSameIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-rc"
+	acctA := "acct-A"
+	acctB := "acct-B"
+	count := 2
+	credits := `[{"id":"c1","reset_type":"codex_rate_limits","status":"available"}]`
+
+	// Account A stores a reset-credit snapshot.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, ResetCreditCount: &count, ResetCredits: &credits,
+	}); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+
+	// Same account, fetch failed (nil snapshot) → preserve.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, ResetCreditCount: nil, ResetCredits: nil,
+	}); err != nil {
+		t.Fatalf("same-account failed fetch: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "rc.json"); st.ResetCreditCount == nil || *st.ResetCreditCount != 2 {
+		t.Fatalf("same-account failed fetch must preserve count; got %v", st.ResetCreditCount)
+	}
+
+	// Same auth_index, DIFFERENT account, fetch failed → clear (do not inherit).
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctB, ResetCreditCount: nil, ResetCredits: nil,
+	}); err != nil {
+		t.Fatalf("swap failed fetch: %v", err)
+	}
+	st, _ := app.getKeeperState(ctx, "rc.json")
+	if st.ResetCreditCount != nil {
+		t.Fatalf("account swap must clear the inherited reset-credit count; got %v", *st.ResetCreditCount)
+	}
+	if len(st.ResetCredits) != 0 {
+		t.Fatalf("account swap must clear the inherited reset-credit list; got %v", st.ResetCredits)
 	}
 }

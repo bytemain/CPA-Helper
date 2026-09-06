@@ -4150,22 +4150,27 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
-			-- Preserve-on-failed-fetch, scoped to auth identity. The snapshot is kept
-			-- (COALESCE) when the incoming auth_index is NULL (identity unknown — e.g.
-			-- a transient auth-file read failure on the same account must not drop the
-			-- schedule) OR still matches the stored one. Only a KNOWN, DIFFERENT
-			-- incoming auth_index (a genuine reassignment of auth_name to another
-			-- account) falls to ELSE and writes the incoming value, clearing the old
-			-- account's stale credits so they never surface on the new identity's row.
+			-- Preserve-on-failed-fetch, scoped to ACCOUNT identity (account_id) — CPA's file
+			-- auth_index is a hash of provider+path and stays the same when a filename is
+			-- swapped to a different account, so auth_index alone can't detect a swap:
+			--   1. identity unconfirmed (auth_index NULL, detail read failed) → preserve.
+			--   2. confirmed account SWAP (both account_ids known and DIFFERENT) → write the
+			--      incoming value, clearing the old account's stale credits (a failed fetch
+			--      writes NULL rather than inheriting the previous account's count/schedule).
+			--   3. same/undeterminable account → COALESCE: write a fresh fetch, else preserve.
 			reset_credit_count = CASE
-				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
-					THEN COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
-				ELSE excluded.reset_credit_count
+				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credit_count
+				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
+					AND codex_keeper_auth_states.account_id <> excluded.account_id
+					THEN excluded.reset_credit_count
+				ELSE COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
 			END,
 			reset_credits = CASE
-				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
-					THEN COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
-				ELSE excluded.reset_credits
+				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credits
+				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
+					AND codex_keeper_auth_states.account_id <> excluded.account_id
+					THEN excluded.reset_credits
+				ELSE COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
 			END,
 			-- Tri-state, scoped to ACCOUNT identity (account_id), because CPA's file
 			-- auth_index is a hash of provider+path and stays the same when a filename is
