@@ -2706,8 +2706,23 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	}
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
 	result.AuthIndex = keeperRemoteAuthIndex(merged)
-	if acct != "" {
+	// accountIDKnown gates the account-scoped work below. keeperReconcileInspectionIdentity
+	// returns ("", true) when NEITHER source carries an account_id (e.g. a legacy auth_index-only
+	// credential): the identity is consistent (nothing to conflict) but UNKNOWN. Without a stable
+	// account_id we cannot attribute reset credits to a resource (the api-call would omit the
+	// Chatgpt-Account-Id header and OpenAI would resolve the account from $TOKEN$ alone) nor detect
+	// a same-index account swap in the snapshot CASE. So we still run usage/priority (transient
+	// current state, always overwritten), but skip the reset-credit fetch and the subscription
+	// write and preserve the prior account-scoped snapshot rather than overwrite it blind.
+	accountIDKnown := acct != ""
+	if accountIDKnown {
 		result.AccountID = &acct
+	} else {
+		// Clear the up-front subscription claim so upsertKeeperState's CASE falls through to
+		// COALESCE(NULL, existing) = preserve, instead of binding a renewal date to an
+		// account we cannot identify.
+		result.SubscriptionActiveUntil = nil
+		result.SubscriptionKnown = false
 	}
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
@@ -2821,7 +2836,13 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	// so upsertKeeperState preserves the previous snapshot instead of wiping it; a
 	// successful empty result carries count 0 and an empty list. (An identity conflict has
 	// already bailed out above, so this fetch only runs for a reconciled identity.)
-	if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
+	if !accountIDKnown {
+		// No stable account_id → we cannot safely attribute a reset-credit snapshot to a
+		// resource, so we do NOT fetch it (leaving both fields nil preserves the prior
+		// account-scoped snapshot via the upsert's COALESCE). Flag it unavailable so a
+		// post-reset refresh is audited partial, never a falsely-healthy ok.
+		result.ResetCreditsUnavailable = true
+	} else if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
 		result.ResetCreditCount = &count
 		if encoded, err := json.Marshal(credits); err == nil {
 			payload := string(encoded)

@@ -3329,3 +3329,101 @@ func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
 		t.Fatalf("last_checked_at not advanced on conflict: got=%v seed=%v", st.LastCheckedAt, healthyAt)
 	}
 }
+
+// TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites proves that when neither the list
+// nor the download detail carries an account_id (a legacy auth_index-only credential), the
+// inspection does NOT fetch a reset-credit snapshot (it cannot attribute it to a resource) and
+// does NOT bind the list's subscription claim; it preserves the prior account-scoped snapshot
+// (reset credits, subscription, the previously-known account_id) and reports the refresh as
+// partial/reset_credits_unavailable — never a falsely-healthy ok that overwrote account state.
+func TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "legacy.json"
+	var mu sync.Mutex
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// List entry: auth_index only, NO account_id / id_token claim.
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Download detail: auth_index only, NO account_id.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1",
+				"email": "legacy@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a prior account-scoped snapshot bound to a KNOWN account_id, with reset credits
+	// and a subscription renewal date — none of which this inspection may overwrite.
+	idx, priorAcct, count := "idx-1", "acct-KNOWN-X", 5
+	sub := time.Now().Add(720 * time.Hour).Truncate(time.Second)
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &priorAcct,
+		ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+		SubscriptionActiveUntil: &sub, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	// Usage ran (an ok-family outcome) but the reset-credit snapshot could not be refreshed,
+	// and this is never an identity/network error.
+	okFamily := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okFamily != 1 || stats.ResetCreditsUnavailable != 1 || stats.IdentityError != 0 || stats.NetworkError != 0 {
+		t.Fatalf("stats = %+v, want ok-family=1, ResetCreditsUnavailable=1, IdentityError=0, NetworkError=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "partial" || reason != "reset_credits_unavailable" {
+		t.Fatalf("audit outcome = (%q,%q), want (partial, reset_credits_unavailable)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times with no account_id; must not attribute a snapshot to an unknown resource", fetches)
+	}
+	// The prior account-scoped snapshot must survive: reset credits, subscription, AND the
+	// previously-known account_id (COALESCE preserves it when this inspection had none).
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
+		t.Fatalf("reset credits not preserved with unknown account_id: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(sub) {
+		t.Fatalf("subscription not preserved with unknown account_id: got=%v want=%v", st.SubscriptionActiveUntil, sub)
+	}
+	if st.AccountID == nil || *st.AccountID != "acct-KNOWN-X" {
+		t.Fatalf("prior account_id not preserved with unknown inspection identity: %v", st.AccountID)
+	}
+}
