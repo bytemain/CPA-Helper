@@ -386,13 +386,14 @@ func TestKeeperReset(t *testing.T) {
 	ctrl.mu.Unlock()
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &keeperResetResponse{})
 
-	// Any CLIProxyAPI outcome short of a confirmed reset must surface an error.
+	// A credit is available, so consume succeeds; any CLIProxyAPI outcome short of a
+	// confirmed cooldown clear is then an irreversible PARTIAL (409), not a plain error.
 	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status", "padded-index"} {
 		ctrl.mu.Lock()
 		ctrl.availableCount = 2
 		ctrl.resetMode = mode
 		ctrl.mu.Unlock()
-		requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+		requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusConflict)
 	}
 	ctrl.mu.Lock()
 	ctrl.resetMode = "ok"
@@ -1040,8 +1041,8 @@ func TestKeeperResetPartialAuditOnCooldownFailure(t *testing.T) {
 	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
 	defer cleanup()
 
-	// Consume succeeds (reset) but the cooldown clear fails → error to the caller.
-	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	// Consume succeeds (reset) but the cooldown clear fails → 409 partial to the caller.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusConflict)
 
 	var status struct {
 		Logs []string `json:"logs"`
@@ -1050,6 +1051,10 @@ func TestKeeperResetPartialAuditOnCooldownFailure(t *testing.T) {
 	joined := strings.Join(status.Logs, "\n")
 	if !strings.Contains(joined, "cooldown_failed_after_consume") || !strings.Contains(joined, "result=partial") {
 		t.Fatalf("cooldown-after-consume must audit an irreversible partial; logs=%v", status.Logs)
+	}
+	// The handler must NOT overwrite the partial with a generic result=error line.
+	if strings.Contains(joined, "reset-quota") && strings.Contains(joined, "result=error reason=validation_error") {
+		t.Fatalf("partial was masked by a generic result=error audit; logs=%v", status.Logs)
 	}
 }
 

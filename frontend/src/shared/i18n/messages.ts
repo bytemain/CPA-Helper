@@ -23,6 +23,7 @@ const exactServerMessages: MessagePair[] = [
   ['该账号存在未完成的核销记录，请先对账处理后再删除', 'This account has an unresolved redemption record; reconcile it before deleting.'],
   ['Keeper 未初始化，无法安全操作', 'The keeper is not initialized; this operation is not safe.'],
   ['重置额度核销状态异常，请稍后重试', 'The reset-credit redemption state is inconsistent. Try again shortly.'],
+  ['已消耗 1 次主动重置额度，但清理本地冷却失败；请稍后重试（系统会复用同一凭据幂等重试，不会重复消耗）', 'One reset credit was consumed but clearing the local cooldown failed; retry shortly (it idempotently reuses the same request and will not consume again).'],
   ['账号不是 Codex 类型，无法主动重置', 'This account is not a Codex account and cannot be reset.'],
   ['账号类型冲突（详情非 Codex），请刷新后重试', 'Account type conflict (the detail is not Codex). Refresh and try again.'],
   ['远端存在多个同名账号条目，无法安全重置，请核对后重试', 'The remote list has multiple entries with this name; a safe reset is not possible. Verify and try again.'],

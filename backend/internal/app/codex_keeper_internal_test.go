@@ -3023,3 +3023,52 @@ func TestDeleteRefusedWithPendingRedeem(t *testing.T) {
 		t.Fatal("pending redeem was dropped despite the refusal")
 	}
 }
+
+// TestUpsertSubscriptionClearedOnAccountSwapSameIndex proves the subscription snapshot is
+// scoped to the ACCOUNT, not just auth_index: when the same auth_name+auth_index is swapped
+// to a different account_id and the new claim is unknown, the previous account's renewal
+// date is NOT inherited (it is cleared); the same-account unknown case still preserves.
+func TestUpsertSubscriptionClearedOnAccountSwapSameIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-fixed"
+	acctA := "acct-A"
+	acctB := "acct-B"
+	known := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	// Account A stores a known renewal date.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, SubscriptionActiveUntil: &known, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+
+	// Same auth_index, same account, unknown claim → preserve.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, SubscriptionActiveUntil: nil, SubscriptionKnown: false,
+	}); err != nil {
+		t.Fatalf("same-account unknown: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "swap.json"); st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(known) {
+		t.Fatalf("same-account unknown must preserve; got %v", st.SubscriptionActiveUntil)
+	}
+
+	// Same auth_index but the file now backs a DIFFERENT account, unknown claim → clear
+	// (must not inherit A's renewal date).
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctB, SubscriptionActiveUntil: nil, SubscriptionKnown: false,
+	}); err != nil {
+		t.Fatalf("swap unknown: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "swap.json"); st.SubscriptionActiveUntil != nil {
+		t.Fatalf("account swap must clear the inherited renewal date; got %v", st.SubscriptionActiveUntil)
+	}
+}
