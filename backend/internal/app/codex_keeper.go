@@ -79,6 +79,10 @@ type keeperStats struct {
 	PriorityRestored int `json:"priority_restored"`
 	Skipped          int `json:"skipped"`
 	NetworkError     int `json:"network_error"`
+	// IdentityError counts accounts whose list/detail identity (account_id or auth_index)
+	// conflicted this run, so the snapshot was preserved and NOT refreshed from an
+	// ambiguous mixed detail — a post-reset refresh must be audited as error, not ok.
+	IdentityError int `json:"identity_error"`
 	// ResetCreditsUnavailable counts otherwise-healthy accounts whose reset-credit
 	// fetch failed this run (snapshot preserved, health unchanged). Not persisted to
 	// the runs table; used to audit a post-reset refresh as partial.
@@ -918,6 +922,10 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 		return "error", "state_write_error"
 	case stats.NetworkError > 0:
 		return "error", "network_error"
+	case stats.IdentityError > 0:
+		// The account's list/detail identity conflicted, so its snapshot was preserved
+		// (not refreshed from an ambiguous mixed detail) — never a successful refresh.
+		return "error", "identity_error"
 	case stats.StatusDisabled > 0:
 		// The account was disabled during the inspect (invalid/expired credentials)
 		// before the usage + reset-credit fetch could refresh the snapshot.
@@ -2665,24 +2673,28 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		return result
 	}
 	merged := mergeKeeperObjects(authInfo, detail)
+	// Reconcile the account identity across BOTH sources FIRST — the list entry's explicit
+	// account_id (its id_token.chatgpt_account_id, the same source as the subscription
+	// claim) and auth_index, and the download detail's account_id and auth_index. If either
+	// conflicts (or a single source is self-contradictory), the merged detail mixes two
+	// accounts, so bail out with an identity_error and preserve the prior snapshot rather
+	// than fetching usage / writing account data from an ambiguous mix. This is audited as
+	// an error (never a successful refresh) and never binds a wrong account_id.
+	acct, consistent := keeperReconcileInspectionIdentity(authInfo, detail)
+	if !consistent {
+		message := "账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照"
+		result.Result = "identity_error"
+		result.LastError = &message
+		result.LatestAction = &message
+		result.SubscriptionKnown = false
+		result = persistState(result)
+		logFn(name + "：" + message)
+		return result
+	}
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
 	result.AuthIndex = keeperRemoteAuthIndex(merged)
-	// Reconcile the account identity across BOTH sources: the list entry's
-	// id_token.chatgpt_account_id (which the subscription claim also comes from) and the
-	// download detail's account_id. If they conflict (or a source is self-contradictory),
-	// the identity is untrustworthy — do NOT bind an account_id or trust the list's
-	// subscription, so a mixed A/B response never writes account A's renewal date onto a
-	// row labeled account B. Preserve the previous snapshot instead.
-	identityConflict := false
-	if acct, consistent := keeperReconcileInspectionAccountID(authInfo, detail); consistent {
-		if acct != "" {
-			result.AccountID = &acct
-		}
-	} else {
-		identityConflict = true
-		result.AccountID = nil
-		result.SubscriptionKnown = false
-		logFn(name + ": account identity conflict between list and detail; preserving subscription/reset-credit snapshot")
+	if acct != "" {
+		result.AccountID = &acct
 	}
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
@@ -2794,12 +2806,9 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
 	// Best-effort reset-credit snapshot. A failed/malformed fetch leaves both fields nil,
 	// so upsertKeeperState preserves the previous snapshot instead of wiping it; a
-	// successful empty result carries count 0 and an empty list. When the account identity
-	// is untrustworthy (list vs detail conflict), skip the fetch entirely so another
-	// account's credits are never written onto this row — the previous snapshot is kept.
-	if identityConflict {
-		// nothing: leave ResetCredit* nil → preserve.
-	} else if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
+	// successful empty result carries count 0 and an empty list. (An identity conflict has
+	// already bailed out above, so this fetch only runs for a reconciled identity.)
+	if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
 		result.ResetCreditCount = &count
 		if encoded, err := json.Marshal(credits); err == nil {
 			payload := string(encoded)
@@ -2985,6 +2994,8 @@ func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {
 		stats.PriorityRestored++
 	case "network_error":
 		stats.NetworkError++
+	case "identity_error":
+		stats.IdentityError++
 	default:
 		stats.Skipped++
 	}
@@ -3005,6 +3016,7 @@ func (stats *keeperStats) add(delta keeperStats) {
 	stats.PriorityRestored += delta.PriorityRestored
 	stats.Skipped += delta.Skipped
 	stats.NetworkError += delta.NetworkError
+	stats.IdentityError += delta.IdentityError
 	stats.ResetCreditsUnavailable += delta.ResetCreditsUnavailable
 	stats.StateWriteError += delta.StateWriteError
 }
@@ -3848,21 +3860,26 @@ func keeperConsistentValue(candidates ...string) (string, error) {
 	return agreed, nil
 }
 
-// keeperReconcileInspectionAccountID resolves the account_id to store for a state row
-// during inspection by RECONCILING both sources — the list entry's
-// id_token.chatgpt_account_id (the same source as the subscription claim) and the download
-// detail's account_id. It returns (value, true) when the sources agree (or only one is
-// present, or neither is), and ("", false) when they conflict or a single source is
-// self-contradictory. A false result means the identity is untrustworthy and the caller
-// must not bind account_id or trust the list's subscription.
-func keeperReconcileInspectionAccountID(authInfo, detail map[string]any) (string, bool) {
+// keeperReconcileInspectionIdentity reconciles the account identity across BOTH sources
+// during inspection — the list entry's explicit account_id (its id_token.chatgpt_account_id,
+// the same source as the subscription claim) and auth_index, and the download detail's
+// account_id and auth_index. It returns (account_id, true) when each field agrees (or only
+// one source has it, or neither), and ("", false) when ANY field conflicts across sources
+// or a single source is self-contradictory. A false result means the merged detail mixes
+// two accounts, so the caller must not fetch/write account data from it.
+func keeperReconcileInspectionIdentity(authInfo, detail map[string]any) (string, bool) {
 	listAcct, lerr := keeperExplicitAccountID(authInfo)
 	detailAcct, derr := keeperExplicitAccountID(detail)
-	if lerr != nil || derr != nil {
+	listIdx, lierr := keeperExplicitAuthIndex(authInfo)
+	detailIdx, dierr := keeperExplicitAuthIndex(detail)
+	if lerr != nil || derr != nil || lierr != nil || dierr != nil {
 		return "", false
 	}
 	reconciled, rerr := keeperReconcileIdentityField(listAcct, detailAcct)
 	if rerr != nil {
+		return "", false
+	}
+	if _, ierr := keeperReconcileIdentityField(listIdx, detailIdx); ierr != nil {
 		return "", false
 	}
 	return reconciled, true

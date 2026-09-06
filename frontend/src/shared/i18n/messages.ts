@@ -40,6 +40,7 @@ const exactServerMessages: MessagePair[] = [
   ['账号缺少 account_id，无法安全核销，请刷新后重试', 'The account has no account_id; a safe redemption is not possible. Refresh and try again.'],
   ['账号 auth_index 已变化，请刷新账号列表后重试', 'The account auth_index has changed. Refresh the account list and try again.'],
   ['账号身份已变化（account_id 不一致），请刷新账号列表后重试', 'The account identity has changed (account_id mismatch). Refresh the account list and try again.'],
+  ['账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照', 'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.'],
   ['无法确认可用重置额度（快照未知），请刷新后重试', 'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.'],
   ['核销主动重置额度失败：网络异常，未确认是否已核销', 'Failed to redeem the reset credit: network error; redemption is unconfirmed.'],
   ['核销主动重置额度失败：管理接口异常', 'Failed to redeem the reset credit: management API error.'],

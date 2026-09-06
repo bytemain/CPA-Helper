@@ -2654,10 +2654,10 @@ func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
 // (e.g. ResetCreditsUnavailable) is not silently dropped by the generalized
 // aggregation. Every field is given a distinct value and must sum.
 func TestKeeperStatsAddSumsEveryField(t *testing.T) {
-	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9, StateWriteError: 11}
-	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90, StateWriteError: 110}
+	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, IdentityError: 12, ResetCreditsUnavailable: 9, StateWriteError: 11}
+	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, IdentityError: 120, ResetCreditsUnavailable: 90, StateWriteError: 110}
 	base.add(delta)
-	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99, StateWriteError: 121}
+	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, IdentityError: 132, ResetCreditsUnavailable: 99, StateWriteError: 121}
 	if base != want {
 		t.Fatalf("add sum = %+v, want %+v", base, want)
 	}
@@ -3123,7 +3123,7 @@ func TestUpsertResetCreditClearedOnAccountSwapSameIndex(t *testing.T) {
 // the list id_token.chatgpt_account_id and the download account_id must AGREE (or only one
 // present) to be trusted; a conflict — or a single source that is self-contradictory —
 // yields (·, false) so the caller treats the identity as unknown.
-func TestKeeperReconcileInspectionAccountID(t *testing.T) {
+func TestKeeperReconcileInspectionIdentity(t *testing.T) {
 	idTokenAcct := func(id string) map[string]any {
 		return map[string]any{"id_token": map[string]any{"chatgpt_account_id": id}}
 	}
@@ -3138,13 +3138,17 @@ func TestKeeperReconcileInspectionAccountID(t *testing.T) {
 		{"list-only", idTokenAcct("acct-A"), map[string]any{}, "acct-A", true},
 		{"detail-only", map[string]any{}, map[string]any{"account_id": "acct-B"}, "acct-B", true},
 		{"neither", map[string]any{}, map[string]any{}, "", true},
-		{"list-A-detail-B-conflict", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-B"}, "", false},
+		{"account-conflict", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-B"}, "", false},
 		// A single source self-contradicting (top-level vs id_token claim) is also untrusted.
 		{"detail-self-conflict", map[string]any{}, map[string]any{"account_id": "acct-B", "id_token": map[string]any{"chatgpt_account_id": "acct-C"}}, "", false},
+		// auth_index conflict alone (accounts agree) is also untrusted.
+		{"authindex-conflict", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-B", "account_id": "acct-A"}, "", false},
+		// account AND auth_index agree.
+		{"both-agree", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-A", "account_id": "acct-A"}, "acct-A", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := keeperReconcileInspectionAccountID(tc.authInfo, tc.detail)
+			got, ok := keeperReconcileInspectionIdentity(tc.authInfo, tc.detail)
 			if ok != tc.wantOK || got != tc.wantID {
 				t.Fatalf("reconcile = (%q,%v), want (%q,%v)", got, ok, tc.wantID, tc.wantOK)
 			}
@@ -3201,5 +3205,91 @@ func TestKeeperLedgerPerAccountAndRouteAgnostic(t *testing.T) {
 	}
 	if idAFresh == idA {
 		t.Fatalf("claim after a resolved redeem reused the terminal id %q; must mint fresh", idA)
+	}
+}
+
+// TestKeeperInspectIdentityConflictPreservesSnapshot proves an inspection whose list and
+// download identities conflict (list account_id A, detail account_id B) bails out with an
+// identity_error: it does NOT fetch the reset credits, preserves the previous snapshot, and
+// the refresh audit reports error (never a healthy/ok refresh).
+func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "conflict.json"
+	var mu sync.Mutex
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// List identity: account A.
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "id_token": map[string]any{"chatgpt_account_id": "acct-LIST-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Download identity: account B (conflicts with the list).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1", "account_id": "acct-DETAIL-B",
+				"email": "c@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a good prior snapshot for account B (auth_index idx-1, reset_credit_count 5).
+	idx, acctB, count := "idx-1", "acct-DETAIL-B", 5
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &acctB,
+		ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	if stats.IdentityError != 1 || stats.Healthy != 0 {
+		t.Fatalf("stats = %+v, want IdentityError=1, Healthy=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "identity_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, identity_error)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times on identity conflict; must not fetch from a mixed detail", fetches)
+	}
+	// The prior snapshot must be preserved (not overwritten/cleared).
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
+		t.Fatalf("snapshot not preserved on conflict: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	}
+	if st.LastError == nil {
+		t.Fatal("identity conflict did not record an error on the account")
 	}
 }

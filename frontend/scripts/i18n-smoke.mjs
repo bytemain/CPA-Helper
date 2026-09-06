@@ -154,6 +154,14 @@ try {
     'The account auth_index has changed. Refresh the account list and try again.',
   )
   assert.equal(
+    localizedServerMessage('同一 OpenAI 账号的另一路由正在重置，请稍后重试'),
+    'Another route for the same OpenAI account is being reset. Try again shortly.',
+  )
+  assert.equal(
+    localizedServerMessage('账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照'),
+    'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.',
+  )
+  assert.equal(
     localizedServerMessage('账号 account_id 身份冲突（列表与详情不一致），请刷新后重试'),
     'Account account_id identity conflict (list and detail disagree). Refresh and try again.',
   )
