@@ -3339,15 +3339,21 @@ func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
 func TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	const authName = "legacy.json"
+	// The list carries a PARSEABLE renewal claim that DIFFERS from the seeded snapshot but
+	// still no account_id — so this pins the subscription guard: with an unknown account_id
+	// the list's renewal must NOT be bound; the old snapshot value must be preserved.
+	listSub := time.Now().Add(1000 * time.Hour).UTC().Truncate(time.Second)
 	var mu sync.Mutex
 	creditFetches := 0
 	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
-			// List entry: auth_index only, NO account_id / id_token claim.
+			// List entry: auth_index + a subscription claim, but NO account_id (the id_token
+			// has chatgpt_subscription_active_until yet no chatgpt_account_id).
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
-				{"name": authName, "type": "codex", "auth_index": "idx-1"},
+				{"name": authName, "type": "codex", "auth_index": "idx-1",
+					"id_token": map[string]any{"chatgpt_subscription_active_until": listSub.Format(time.RFC3339)}},
 			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
 			// Download detail: auth_index only, NO account_id.
@@ -3422,6 +3428,9 @@ func TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites(t *testing.T) {
 	}
 	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(sub) {
 		t.Fatalf("subscription not preserved with unknown account_id: got=%v want=%v", st.SubscriptionActiveUntil, sub)
+	}
+	if st.SubscriptionActiveUntil.Equal(listSub) {
+		t.Fatalf("list renewal claim was bound despite unknown account_id: got=%v (list=%v)", st.SubscriptionActiveUntil, listSub)
 	}
 	if st.AccountID == nil || *st.AccountID != "acct-KNOWN-X" {
 		t.Fatalf("prior account_id not preserved with unknown inspection identity: %v", st.AccountID)
