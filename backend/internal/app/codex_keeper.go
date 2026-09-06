@@ -3423,12 +3423,6 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	return accounts, nil
 }
 
-// keeperQuotaResetResult is the deliberately minimal wire shape of a reset: it
-// must not leak internal keeperAccount fields (auth_index, email, errors). It
-// carries only whether a real OpenAI reset credit was consumed this operation
-// (Consumed=false means only the local 429 cooldown was cleared because no
-// credit was available), so a caller can never mistake a cooldown-clear for a
-// real redemption.
 // keeperResetOutcomeCooldownOnly is the outcome when no consume ran (no credit was
 // available and no pending redeem existed) — only the local cooldown was cleared. The
 // other outcomes are exactly the OpenAI terminal codes, so the caller can message each
