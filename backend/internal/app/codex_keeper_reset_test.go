@@ -27,8 +27,9 @@ func rawJWTWithClaims(t *testing.T, claims map[string]any) string {
 	return enc(map[string]any{"alg": "none", "typ": "JWT"}) + "." + enc(claims) + ".sig"
 }
 
-// keeperResetResponse is the minimal wire shape the reset route returns: only
-// the account name plus whether a real reset credit was consumed this operation.
+// keeperResetResponse is the minimal wire shape the reset route returns: only the
+// account name plus the operation outcome (reset|already_redeemed|no_credit|
+// nothing_to_reset|cooldown_only) for this operation.
 type keeperResetResponse struct {
 	Status  string `json:"status"`
 	Account struct {
@@ -292,10 +293,10 @@ func setupKeeperResetApp(t *testing.T, cpaURL string) (http.Handler, []*http.Coo
 }
 
 // TestKeeperReset drives the real reset route through its new contract: when a
-// credit is available it redeems one (consume) and reports consumed=true; when
-// none is available it clears only the local cooldown (consumed=false); a failed
-// consume fails closed WITHOUT clearing the cooldown; an unconfirmed CLIProxyAPI
-// reset surfaces an error; and the response wire shape stays minimal.
+// credit is available it redeems one (consume) and reports outcome=reset; when
+// none is available it clears only the local cooldown (outcome=cooldown_only); a
+// failed consume fails closed WITHOUT clearing the cooldown; an unconfirmed
+// CLIProxyAPI reset surfaces an error; and the response wire shape stays minimal.
 func TestKeeperReset(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -311,7 +312,7 @@ func TestKeeperReset(t *testing.T) {
 	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
 	defer cleanup()
 
-	// Happy path: a credit is available, so one is redeemed (consumed=true) and the
+	// Happy path: a credit is available, so one is redeemed (outcome=reset) and the
 	// cooldown is cleared exactly once.
 	reset := keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
@@ -345,7 +346,7 @@ func TestKeeperReset(t *testing.T) {
 	}
 
 	// No-credit path: the authoritative count is 0, so consume is skipped entirely
-	// and only the local cooldown is cleared (consumed=false).
+	// and only the local cooldown is cleared (outcome=cooldown_only).
 	ctrl.mu.Lock()
 	ctrl.availableCount = 0
 	ctrl.consumeCalls = 0
@@ -797,7 +798,7 @@ func TestKeeperResetRawJWTAccountIDConflictFailsClosed(t *testing.T) {
 // TestKeeperResetPendingReplayedWhenCountZero pins the control-flow rule that an
 // identity-matched pending redeem is replayed with its original key even when the
 // fresh available_count is 0: a lost first response that actually consumed the LAST
-// credit is recovered as already_redeemed (consumed=true), never short-circuited into
+// credit is recovered as outcome=already_redeemed, never short-circuited into
 // a cooldown-only clear.
 func TestKeeperResetPendingReplayedWhenCountZero(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())

@@ -4025,7 +4025,11 @@ func keeperInnerStatusCode(raw map[string]any) int {
 // NOT by auth_name/auth_index (routing selectors that change on file rename/move/reorder),
 // so a lost-response pending is still found after the account is re-routed. It is a pure
 // read: it does NOT depend on the fresh credit count, so a pending can be replayed even
-// when the count endpoint is temporarily unavailable. Callers MUST hold the per-auth lock.
+// when the count endpoint is temporarily unavailable. The money-critical caller (reset) MUST
+// hold the per-account_id fence — the mutex that serializes same-account consume across
+// different files/routes — around the lookup→consume→finish window (reset also holds the
+// per-auth_name lock, but that is per-file and does not by itself serialize two files of the
+// same account).
 func (a *App) lookupPendingKeeperRedeem(ctx context.Context, accountID string) (redeemID string, ok bool, err error) {
 	var id, status string
 	qerr := a.db.QueryRowContext(ctx, `SELECT redeem_request_id, status FROM codex_keeper_reset_redeems WHERE account_id = ?`, accountID).Scan(&id, &status)
@@ -4044,8 +4048,10 @@ func (a *App) lookupPendingKeeperRedeem(ctx context.Context, accountID string) (
 // upsert overwrites only this account's own non-pending (terminal) row; a concurrent
 // pending row for the same account is left untouched, so two claimers (e.g. blue/green
 // instances sharing the DB) converge on ONE request_id. SQLite serializes the writes, so
-// the second upsert observes the first's committed row; the per-auth lock serializes
-// same-instance callers.
+// the second upsert observes the first's committed row; within one instance the money-critical
+// caller's per-account_id fence serializes same-account callers across different files/routes
+// (the per-auth_name lock is per-file and does not, on its own, serialize two files that
+// resolve to the same account).
 //
 // This HARDENS the concurrent-overlap window but is NOT a full cross-process operation
 // lease: if one instance finalizes a redeem (terminal row) and a second, delayed request
