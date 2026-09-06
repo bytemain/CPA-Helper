@@ -3166,8 +3166,8 @@ func TestKeeperReconcileInspectionIdentity(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got, ok := keeperReconcileInspectionIdentity(tc.authInfo, tc.detail)
-			if ok != tc.wantOK || got != tc.wantID {
-				t.Fatalf("reconcile = (%q,%v), want (%q,%v)", got, ok, tc.wantID, tc.wantOK)
+			if ok != tc.wantOK || got.accountID != tc.wantID {
+				t.Fatalf("reconcile = (%q,%v), want (%q,%v)", got.accountID, ok, tc.wantID, tc.wantOK)
 			}
 		})
 	}
@@ -3559,5 +3559,105 @@ func TestKeeperInspectRawJWTAccountConflictPreservesSnapshot(t *testing.T) {
 	}
 	if st.LastError == nil {
 		t.Fatal("raw-JWT identity conflict did not record an error")
+	}
+}
+
+// TestKeeperInspectListOnlyAccountIDSetsHeader proves that when the account_id is known only
+// from the LIST entry's id_token claim (the download detail is a legacy raw file with no
+// top-level account_id), the inspection still sends the Chatgpt-Account-Id header on BOTH the
+// usage and reset-credit api-call egress (attributing the request to the confirmed account),
+// AND writes the reset-credit snapshot — i.e. a known account_id never sends an account-less
+// request while writing an account-scoped snapshot.
+func TestKeeperInspectListOnlyAccountIDSetsHeader(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "list-only.json"
+	var mu sync.Mutex
+	usageHeader, creditHeader, creditRouteIndex := "", "", ""
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// account_id AND auth_index known ONLY from the list entry.
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Legacy raw detail: token only, NO top-level account_id, NO id_token, and an
+			// EXPLICIT-null auth_index (the dangerous case a right-biased merge would let
+			// overwrite the list's idx-1, then keeperAuthIndex would fall back to the name).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": nil,
+				"email": "a@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL       string            `json:"url"`
+				AuthIndex string            `json:"auth_index"`
+				Header    map[string]string `json:"header"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			switch {
+			case strings.Contains(p.URL, "rate-limit-reset-credits"):
+				mu.Lock()
+				creditFetches++
+				creditHeader = p.Header["Chatgpt-Account-Id"]
+				creditRouteIndex = p.AuthIndex
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 1, "credits": []map[string]any{
+					{"id": "RateLimitResetCredit_A", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": "2026-09-21T00:08:46.146320Z"},
+				}}})
+			default:
+				mu.Lock()
+				usageHeader = p.Header["Chatgpt-Account-Id"]
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	okFamily := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okFamily != 1 || stats.ResetCreditsUnavailable != 0 || stats.IdentityError != 0 {
+		t.Fatalf("stats = %+v, want ok-family=1, ResetCreditsUnavailable=0, IdentityError=0", stats)
+	}
+	mu.Lock()
+	uh, ch, cri, fetches := usageHeader, creditHeader, creditRouteIndex, creditFetches
+	mu.Unlock()
+	if uh != "acct-A" {
+		t.Fatalf("usage Chatgpt-Account-Id = %q, want acct-A (known from list claim)", uh)
+	}
+	if fetches != 1 || ch != "acct-A" {
+		t.Fatalf("reset-credit fetch=%d header=%q, want 1 fetch with Chatgpt-Account-Id=acct-A", fetches, ch)
+	}
+	// Routing uses the reconciled list auth_index, not the auth NAME (the detail's explicit-null
+	// auth_index must not win the merge and force a name fallback).
+	if cri != "idx-1" {
+		t.Fatalf("reset-credit routed auth_index = %q, want idx-1 (reconciled from the list, not the name)", cri)
+	}
+	// The snapshot is written and account-scoped to the confirmed account_id.
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.AccountID == nil || *st.AccountID != "acct-A" {
+		t.Fatalf("stored account_id = %v, want acct-A", st.AccountID)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 1 {
+		t.Fatalf("reset-credit snapshot not written: %v", st.ResetCreditCount)
 	}
 }

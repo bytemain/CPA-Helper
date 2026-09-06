@@ -2680,7 +2680,7 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	// accounts, so bail out with an identity_error and preserve the prior snapshot rather
 	// than fetching usage / writing account data from an ambiguous mix. This is audited as
 	// an error (never a successful refresh) and never binds a wrong account_id.
-	acct, consistent := keeperReconcileInspectionIdentity(authInfo, detail)
+	identity, consistent := keeperReconcileInspectionIdentity(authInfo, detail)
 	if !consistent {
 		message := "账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照"
 		result.Result = "identity_error"
@@ -2705,18 +2705,35 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		return result
 	}
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
+	// Normalize the merged object with the per-source-VALIDATED identity so all account-scoped
+	// work below consumes only the reconciled {auth_index, account_id}, never re-derived from
+	// the raw right-biased merge. Routing (checkKeeperUsage / fetchKeeperResetCredits call
+	// keeperAuthIndex, which otherwise falls back to the auth NAME) uses the reconciled
+	// auth_index; the Chatgpt-Account-Id header (read from the top-level account_id) uses the
+	// reconciled account_id. Each is injected only when non-empty. Safe because the identity is
+	// reconciled (non-conflicting) for this merged detail.
+	if identity.authIndex != "" {
+		merged["auth_index"] = identity.authIndex
+	}
 	result.AuthIndex = keeperRemoteAuthIndex(merged)
 	// accountIDKnown gates the account-scoped work below. keeperReconcileInspectionIdentity
-	// returns ("", true) when NEITHER source carries an account_id (e.g. a legacy auth_index-only
+	// yields an empty account_id when NEITHER source carries one (e.g. a legacy auth_index-only
 	// credential): the identity is consistent (nothing to conflict) but UNKNOWN. Without a stable
 	// account_id we cannot attribute reset credits to a resource (the api-call would omit the
 	// Chatgpt-Account-Id header and OpenAI would resolve the account from $TOKEN$ alone) nor detect
 	// a same-index account swap in the snapshot CASE. So we still run usage/priority (transient
 	// current state, always overwritten), but skip the reset-credit fetch and the subscription
 	// write and preserve the prior account-scoped snapshot rather than overwrite it blind.
+	acct := identity.accountID
 	accountIDKnown := acct != ""
 	if accountIDKnown {
 		result.AccountID = &acct
+		// Attribute the account-scoped api-calls (Chatgpt-Account-Id, read from the top-level
+		// account_id) to the confirmed account even when the id came only from the list's
+		// id_token claim and the download detail carried no top-level account_id — otherwise a
+		// known account_id could send an account-less request yet write an account-scoped
+		// snapshot, an inconsistent attribution.
+		merged["account_id"] = acct
 	} else {
 		// Clear the up-front subscription claim so upsertKeeperState's CASE falls through to
 		// COALESCE(NULL, existing) = preserve, instead of binding a renewal date to an
@@ -3894,29 +3911,39 @@ func keeperConsistentValue(candidates ...string) (string, error) {
 	return agreed, nil
 }
 
+// keeperInspectionIdentity is the per-source-validated identity for an inspection: the
+// reconciled account_id and auth_index. Callers route (auth_index) and header (account_id)
+// account-scoped requests using ONLY these normalized values, never re-deriving them from the
+// raw right-biased merge (which can drop a list-only value or fall back to the auth name).
+type keeperInspectionIdentity struct {
+	accountID string
+	authIndex string
+}
+
 // keeperReconcileInspectionIdentity reconciles the account identity across BOTH sources
 // during inspection — the list entry's explicit account_id (its id_token.chatgpt_account_id,
 // the same source as the subscription claim) and auth_index, and the download detail's
-// account_id and auth_index. It returns (account_id, true) when each field agrees (or only
-// one source has it, or neither), and ("", false) when ANY field conflicts across sources
-// or a single source is self-contradictory. A false result means the merged detail mixes
-// two accounts, so the caller must not fetch/write account data from it.
-func keeperReconcileInspectionIdentity(authInfo, detail map[string]any) (string, bool) {
+// account_id and auth_index. It returns (identity, true) when each field agrees (or only one
+// source has it, or neither), and ({}, false) when ANY field conflicts across sources or a
+// single source is self-contradictory. A false result means the merged detail mixes two
+// accounts, so the caller must not fetch/write account data from it.
+func keeperReconcileInspectionIdentity(authInfo, detail map[string]any) (keeperInspectionIdentity, bool) {
 	listAcct, lerr := keeperExplicitAccountID(authInfo)
 	detailAcct, derr := keeperExplicitAccountID(detail)
 	listIdx, lierr := keeperExplicitAuthIndex(authInfo)
 	detailIdx, dierr := keeperExplicitAuthIndex(detail)
 	if lerr != nil || derr != nil || lierr != nil || dierr != nil {
-		return "", false
+		return keeperInspectionIdentity{}, false
 	}
-	reconciled, rerr := keeperReconcileIdentityField(listAcct, detailAcct)
+	acct, rerr := keeperReconcileIdentityField(listAcct, detailAcct)
 	if rerr != nil {
-		return "", false
+		return keeperInspectionIdentity{}, false
 	}
-	if _, ierr := keeperReconcileIdentityField(listIdx, detailIdx); ierr != nil {
-		return "", false
+	idx, ierr := keeperReconcileIdentityField(listIdx, detailIdx)
+	if ierr != nil {
+		return keeperInspectionIdentity{}, false
 	}
-	return reconciled, true
+	return keeperInspectionIdentity{accountID: acct, authIndex: idx}, true
 }
 
 // keeperExplicitStringField reads an identity field that, WHEN PRESENT, must be a string.
