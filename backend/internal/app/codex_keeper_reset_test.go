@@ -11,57 +11,41 @@ import (
 	backendApp "cpa-helper/backend/internal/app"
 )
 
+// keeperResetResponse is the minimal wire shape the reset route returns: only
+// the account name plus whether a real reset credit was consumed this operation.
 type keeperResetResponse struct {
 	Status  string `json:"status"`
 	Account struct {
-		Name             string  `json:"name"`
-		QuotaResetCount  int     `json:"quota_reset_count"`
-		LastQuotaResetAt *string `json:"last_quota_reset_at"`
+		Name     string `json:"name"`
+		Consumed bool   `json:"consumed"`
 	} `json:"account"`
 }
 
-type keeperResetAccountsResponse struct {
-	Items []struct {
-		Name             string  `json:"name"`
-		QuotaResetCount  int     `json:"quota_reset_count"`
-		LastQuotaResetAt *string `json:"last_quota_reset_at"`
-	} `json:"items"`
+// keeperResetControl is the shared, mutex-guarded mock state that lets each
+// sub-case steer the fake CLIProxyAPI: the authoritative available credit count,
+// how the consume endpoint replies, and how /reset-quota replies. It also records
+// call counts so a test can assert fail-closed ordering (e.g. a failed consume
+// must never reach /reset-quota).
+type keeperResetControl struct {
+	mu               sync.Mutex
+	availableCount   int    // authoritative available_count returned by the fresh fetch
+	fetchMode        string // ok | fail (fresh reset-credit GET)
+	consumeMode      string // ok | http-fail | unknown-code | no-credit
+	resetMode        string // ok | http-fail | empty-body | wrong-index | bad-status | padded-index
+	consumeCalls     int
+	resetCreditFetch int
+	resetQuotaCalls  []string
 }
 
-// TestKeeperQuotaReset drives the real /api/codex-keeper/reset-quota route:
-// a successful CLIProxyAPI reset-quota call increments the per-auth counter
-// (visible via /accounts), a CLIProxyAPI failure surfaces the error WITHOUT
-// incrementing, and bad requests are rejected before any CLIProxyAPI call.
-func accountsResetCount(t *testing.T, handler http.Handler, cookies []*http.Cookie) int {
+func newKeeperResetCPA(t *testing.T, authName string, authDetail map[string]any, ctrl *keeperResetControl) *httptest.Server {
 	t.Helper()
-	accounts := keeperResetAccountsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &accounts)
-	if len(accounts.Items) != 1 {
-		t.Fatalf("accounts listing has %d items, want 1", len(accounts.Items))
+	credit := func(id, expires string) map[string]any {
+		return map[string]any{
+			"id": id, "reset_type": "codex_rate_limits", "status": "available",
+			"granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": expires,
+		}
 	}
-	return accounts.Items[0].QuotaResetCount
-}
-
-func TestKeeperQuotaReset(t *testing.T) {
-	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
-
-	authName := "reset-me.json"
-	authDetail := map[string]any{
-		"name":         authName,
-		"type":         "codex",
-		"auth_index":   "idx-7",
-		"email":        "reset@example.com",
-		"account_type": "plus",
-		"disabled":     false,
-		"priority":     1,
-		"access_token": "test-token",
-	}
-
-	var mu sync.Mutex
-	resetCalls := []string{}
-	resetMode := "ok" // ok | http-fail | empty-body | wrong-index | bad-status
-
-	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
@@ -69,14 +53,55 @@ func TestKeeperQuotaReset(t *testing.T) {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
 			_ = json.NewEncoder(w).Encode(authDetail)
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"status_code": 200,
-				"body": map[string]any{
-					"rate_limit": map[string]any{
-						"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600},
-					},
-				},
-			})
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			switch {
+			// The consume URL also contains "rate-limit-reset-credits", so match the
+			// more specific "/consume" suffix first.
+			case strings.Contains(p.URL, "rate-limit-reset-credits/consume"):
+				ctrl.mu.Lock()
+				ctrl.consumeCalls++
+				mode := ctrl.consumeMode
+				// A real consume decrements the authoritative count.
+				if mode == "ok" && ctrl.availableCount > 0 {
+					ctrl.availableCount--
+				}
+				ctrl.mu.Unlock()
+				switch mode {
+				case "http-fail":
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": map[string]any{"error": map[string]any{"message": "forbidden"}}})
+				case "unknown-code":
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "surprise"}})
+				case "no-credit":
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "no_credit"}})
+				default:
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "reset", "windows_reset": []any{}}})
+				}
+			case strings.Contains(p.URL, "rate-limit-reset-credits"):
+				ctrl.mu.Lock()
+				ctrl.resetCreditFetch++
+				n := ctrl.availableCount
+				mode := ctrl.fetchMode
+				ctrl.mu.Unlock()
+				if mode == "fail" {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return
+				}
+				credits := []map[string]any{}
+				if n >= 1 {
+					credits = append(credits, credit("RateLimitResetCredit_A", "2026-09-21T00:08:46.146320Z"))
+				}
+				if n >= 2 {
+					credits = append(credits, credit("RateLimitResetCredit_B", "2026-10-04T02:24:33.736521Z"))
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": n, "credits": credits}})
+			default:
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
+					"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
+				}})
+			}
 		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
 			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/reset-quota":
@@ -87,12 +112,10 @@ func TestKeeperQuotaReset(t *testing.T) {
 				http.Error(w, "auth_index is required", http.StatusBadRequest)
 				return
 			}
-			mu.Lock()
-			mode := resetMode
-			if mode == "ok" {
-				resetCalls = append(resetCalls, payload.AuthIndex)
-			}
-			mu.Unlock()
+			ctrl.mu.Lock()
+			mode := ctrl.resetMode
+			ctrl.resetQuotaCalls = append(ctrl.resetQuotaCalls, payload.AuthIndex)
+			ctrl.mu.Unlock()
 			switch mode {
 			case "http-fail":
 				http.Error(w, "boom", http.StatusBadRequest)
@@ -111,50 +134,67 @@ func TestKeeperQuotaReset(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer cpa.Close()
+}
 
+func setupKeeperResetApp(t *testing.T, cpaURL string) (http.Handler, []*http.Cookie, func()) {
+	t.Helper()
 	app, err := backendApp.New()
 	if err != nil {
 		t.Fatalf("New() failed: %v", err)
 	}
-	defer app.Close()
 	handler := app.Routes()
-
 	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
-		"username": "admin",
-		"password": "test-password",
-		"nickname": "Admin",
+		"username": "admin", "password": "test-password", "nickname": "Admin",
 	}, nil, nil)
 	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
-		"cliaproxy_url":     cpa.URL,
-		"management_key":    "test-management-key",
-		"collector_enabled": false,
+		"cliaproxy_url": cpaURL, "management_key": "test-management-key", "collector_enabled": false,
 	}, cookies, nil)
 	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
-		"schedule_cron":       "0 0 29 2 *",
-		"dry_run":             false,
-		"quota_threshold":     100,
-		"worker_threads":      1,
-		"cpa_timeout_seconds": 1,
+		"schedule_cron": "0 0 29 2 *", "dry_run": false, "quota_threshold": 100,
+		"worker_threads": 1, "cpa_timeout_seconds": 1,
 	}, cookies, nil)
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
 	waitForKeeperAccounts(t, handler, cookies, 1)
+	return handler, cookies, func() { app.Close() }
+}
 
-	// Happy path: reset succeeds, counter becomes 1 and carries a timestamp.
+// TestKeeperReset drives the real reset route through its new contract: when a
+// credit is available it redeems one (consume) and reports consumed=true; when
+// none is available it clears only the local cooldown (consumed=false); a failed
+// consume fails closed WITHOUT clearing the cooldown; an unconfirmed CLIProxyAPI
+// reset surfaces an error; and the response wire shape stays minimal.
+func TestKeeperReset(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+
+	authName := "reset-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-7",
+		"email": "reset@example.com", "account_type": "plus", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-123",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Happy path: a credit is available, so one is redeemed (consumed=true) and the
+	// cooldown is cleared exactly once.
 	reset := keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Status != "ok" || reset.Account.Name != authName {
-		t.Fatalf("reset response = %+v, want ok for %s", reset, authName)
+	if reset.Status != "ok" || reset.Account.Name != authName || !reset.Account.Consumed {
+		t.Fatalf("reset response = %+v, want ok/consumed for %s", reset, authName)
 	}
-	if reset.Account.QuotaResetCount != 1 || reset.Account.LastQuotaResetAt == nil {
-		t.Fatalf("first reset count = %d (lastAt=%v), want 1 with timestamp", reset.Account.QuotaResetCount, reset.Account.LastQuotaResetAt)
+	ctrl.mu.Lock()
+	if ctrl.consumeCalls != 1 {
+		ctrl.mu.Unlock()
+		t.Fatalf("consume calls = %d, want exactly 1", ctrl.consumeCalls)
 	}
-	mu.Lock()
-	if len(resetCalls) != 1 || resetCalls[0] != "idx-7" {
-		mu.Unlock()
-		t.Fatalf("CLIProxyAPI reset calls = %v, want exactly one for auth_index %q", resetCalls, "idx-7")
+	if len(ctrl.resetQuotaCalls) != 1 || ctrl.resetQuotaCalls[0] != "idx-7" {
+		ctrl.mu.Unlock()
+		t.Fatalf("reset-quota calls = %v, want one for idx-7", ctrl.resetQuotaCalls)
 	}
-	mu.Unlock()
+	ctrl.mu.Unlock()
 
 	// Wire minimalism: the reset response must not leak internal account fields.
 	raw := map[string]json.RawMessage{}
@@ -165,62 +205,102 @@ func TestKeeperQuotaReset(t *testing.T) {
 	}
 	for key := range accountFields {
 		switch key {
-		case "name", "quota_reset_count", "last_quota_reset_at":
+		case "name", "consumed":
 		default:
 			t.Fatalf("reset response leaks internal field %q (payload %v)", key, accountFields)
 		}
 	}
 
-	// Third reset (after the wire-minimalism reset above) increments to 3.
+	// No-credit path: the authoritative count is 0, so consume is skipped entirely
+	// and only the local cooldown is cleared (consumed=false).
+	ctrl.mu.Lock()
+	ctrl.availableCount = 0
+	ctrl.consumeCalls = 0
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
 	reset = keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Account.QuotaResetCount != 3 {
-		t.Fatalf("third reset count = %d, want 3", reset.Account.QuotaResetCount)
+	if reset.Status != "ok" || reset.Account.Consumed {
+		t.Fatalf("no-credit reset = %+v, want ok with consumed=false", reset)
 	}
-
-	// The accounts listing carries the counter (3 successful resets so far).
-	accounts := keeperResetAccountsResponse{}
-	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/accounts", nil, cookies, &accounts)
-	if len(accounts.Items) != 1 || accounts.Items[0].QuotaResetCount != 3 || accounts.Items[0].LastQuotaResetAt == nil {
-		t.Fatalf("accounts listing = %+v, want quota_reset_count 3 with timestamp", accounts.Items)
+	ctrl.mu.Lock()
+	if ctrl.consumeCalls != 0 {
+		ctrl.mu.Unlock()
+		t.Fatalf("no-credit path made %d consume calls, want 0", ctrl.consumeCalls)
 	}
+	if len(ctrl.resetQuotaCalls) != 1 {
+		ctrl.mu.Unlock()
+		t.Fatalf("no-credit path reset-quota calls = %v, want exactly one", ctrl.resetQuotaCalls)
+	}
+	ctrl.mu.Unlock()
 
-	// Any CLIProxyAPI outcome short of a confirmed reset (HTTP failure, or a
-	// deceptive 2xx whose body lacks status=ok for our exact auth_index) must
-	// surface an error and must NOT increment the counter.
-	baseline := accountsResetCount(t, handler, cookies)
-	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status", "padded-index"} {
-		mu.Lock()
-		resetMode = mode
-		mu.Unlock()
+	// Fail-closed: when a credit is available but the consume fails (inner non-2xx
+	// or an unrecognized code, or the fresh count is unknown), the whole operation
+	// errors and NEVER reaches /reset-quota — the cooldown is not cleared on a
+	// half-done redemption.
+	for _, mode := range []string{"http-fail", "unknown-code"} {
+		ctrl.mu.Lock()
+		ctrl.availableCount = 2
+		ctrl.consumeMode = mode
+		ctrl.resetQuotaCalls = nil
+		ctrl.mu.Unlock()
 		requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
-		if got := accountsResetCount(t, handler, cookies); got != baseline {
-			t.Fatalf("count after %s reset = %d, want unchanged %d", mode, got, baseline)
+		ctrl.mu.Lock()
+		calls := ctrl.resetQuotaCalls
+		ctrl.mu.Unlock()
+		if len(calls) != 0 {
+			t.Fatalf("consume mode %s reached /reset-quota (%v); it must fail closed first", mode, calls)
 		}
 	}
-	mu.Lock()
-	resetMode = "ok"
-	mu.Unlock()
+	ctrl.mu.Lock()
+	ctrl.consumeMode = "ok"
+	ctrl.mu.Unlock()
 
-	// Bad requests are rejected before any CLIProxyAPI call.
+	// Unknown available count (fresh fetch failed) blocks rather than degrading to
+	// a cooldown-only clear.
+	ctrl.mu.Lock()
+	ctrl.fetchMode = "fail"
+	ctrl.resetQuotaCalls = nil
+	ctrl.mu.Unlock()
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	ctrl.mu.Lock()
+	if len(ctrl.resetQuotaCalls) != 0 {
+		ctrl.mu.Unlock()
+		t.Fatalf("unknown-count path reached /reset-quota; it must block")
+	}
+	ctrl.fetchMode = "ok"
+	ctrl.mu.Unlock()
+
+	// Any CLIProxyAPI outcome short of a confirmed reset must surface an error.
+	for _, mode := range []string{"http-fail", "empty-body", "wrong-index", "bad-status", "padded-index"} {
+		ctrl.mu.Lock()
+		ctrl.availableCount = 2
+		ctrl.resetMode = mode
+		ctrl.mu.Unlock()
+		requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+	}
+	ctrl.mu.Lock()
+	ctrl.resetMode = "ok"
+	ctrl.mu.Unlock()
+
+	// Bad requests are rejected before any CLIProxyAPI reset call.
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": ""}, cookies, http.StatusUnprocessableEntity)
 	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": "nope.json"}, cookies, http.StatusNotFound)
 }
 
-// keeperResetInspectAccountsResponse reads the reset_credit fields from the
-// accounts endpoint so a test can assert the post-reset inspection refreshed them.
+// keeperResetInspectAccountsResponse reads the reset_credit count from the
+// accounts endpoint so a test can assert the post-reset inspection refreshed it.
 type keeperResetInspectAccountsResponse struct {
 	Items []struct {
 		Name             string `json:"name"`
-		QuotaResetCount  int    `json:"quota_reset_count"`
 		ResetCreditCount *int   `json:"reset_credit_count"`
 	} `json:"items"`
 }
 
-// TestKeeperResetQuotaTriggersInspection proves that a successful reset-quota
-// synchronously re-inspects just that account: the reset-credit snapshot in the DB
-// is refreshed from a live fetch (not left at the pre-reset value), so the
-// frontend's follow-up accounts reload shows the post-reset state.
+// TestKeeperResetQuotaTriggersInspection proves a successful reset synchronously
+// re-inspects just that account: after redeeming one of two credits the DB
+// snapshot is refreshed from a live fetch (2 -> 1), so the frontend's follow-up
+// accounts reload shows the post-reset state rather than the stale pre-reset one.
 func TestKeeperResetQuotaTriggersInspection(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 
@@ -228,84 +308,13 @@ func TestKeeperResetQuotaTriggersInspection(t *testing.T) {
 	authDetail := map[string]any{
 		"name": authName, "type": "codex", "auth_index": "idx-9",
 		"email": "inspect@example.com", "account_type": "pro", "disabled": false,
-		"priority": 1, "access_token": "test-token",
+		"priority": 1, "access_token": "test-token", "account_id": "acct-9",
 	}
-
-	credit := func(id, expires string) map[string]any {
-		return map[string]any{
-			"id": id, "reset_type": "codex_rate_limits", "status": "available",
-			"granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": expires,
-		}
-	}
-	var mu sync.Mutex
-	// Before any reset: 2 available credits. After a reset consumes one: 1.
-	availableCount := 2
-	resetCreditFetches := 0
-
-	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
-			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{{"name": authName, "type": "codex"}}})
-		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
-			_ = json.NewEncoder(w).Encode(authDetail)
-		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
-			var payload struct {
-				URL string `json:"url"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&payload)
-			if strings.Contains(payload.URL, "rate-limit-reset-credits") {
-				mu.Lock()
-				resetCreditFetches++
-				n := availableCount
-				mu.Unlock()
-				credits := []map[string]any{credit("RateLimitResetCredit_A", "2026-09-21T00:08:46.146320Z")}
-				if n >= 2 {
-					credits = append(credits, credit("RateLimitResetCredit_B", "2026-10-04T02:24:33.736521Z"))
-				}
-				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": n, "credits": credits}})
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{
-				"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}},
-			}})
-		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/reset-quota":
-			var payload struct {
-				AuthIndex string `json:"auth_index"`
-			}
-			_ = json.NewDecoder(r.Body).Decode(&payload)
-			// A reset consumes one credit, so a fresh fetch afterward returns 1.
-			mu.Lock()
-			availableCount = 1
-			mu.Unlock()
-			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok", "auth_index": payload.AuthIndex, "models": []string{}})
-		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
-			_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-		default:
-			http.NotFound(w, r)
-		}
-	}))
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
 	defer cpa.Close()
-
-	app, err := backendApp.New()
-	if err != nil {
-		t.Fatalf("New() failed: %v", err)
-	}
-	defer app.Close()
-	handler := app.Routes()
-
-	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
-		"username": "admin", "password": "test-password", "nickname": "Admin",
-	}, nil, nil)
-	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
-		"cliaproxy_url": cpa.URL, "management_key": "test-management-key", "collector_enabled": false,
-	}, cookies, nil)
-	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
-		"schedule_cron": "0 0 29 2 *", "dry_run": false, "quota_threshold": 100,
-		"worker_threads": 1, "cpa_timeout_seconds": 1,
-	}, cookies, nil)
-	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
-	waitForKeeperAccounts(t, handler, cookies, 1)
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
 
 	// After the initial inspection the snapshot shows 2 available credits.
 	before := keeperResetInspectAccountsResponse{}
@@ -313,20 +322,20 @@ func TestKeeperResetQuotaTriggersInspection(t *testing.T) {
 	if len(before.Items) != 1 || before.Items[0].ResetCreditCount == nil || *before.Items[0].ResetCreditCount != 2 {
 		t.Fatalf("pre-reset reset_credit_count = %+v, want 2", before.Items)
 	}
-	mu.Lock()
-	fetchesBeforeReset := resetCreditFetches
-	mu.Unlock()
+	ctrl.mu.Lock()
+	fetchesBeforeReset := ctrl.resetCreditFetch
+	ctrl.mu.Unlock()
 
-	// Reset succeeds; the handler must synchronously re-inspect this account.
+	// Reset succeeds; it redeems one credit and then re-inspects this account.
 	reset := keeperResetResponse{}
 	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, &reset)
-	if reset.Status != "ok" {
-		t.Fatalf("reset status = %q, want ok", reset.Status)
+	if reset.Status != "ok" || !reset.Account.Consumed {
+		t.Fatalf("reset = %+v, want ok/consumed", reset)
 	}
 
-	mu.Lock()
-	fetchesAfterReset := resetCreditFetches
-	mu.Unlock()
+	ctrl.mu.Lock()
+	fetchesAfterReset := ctrl.resetCreditFetch
+	ctrl.mu.Unlock()
 	if fetchesAfterReset <= fetchesBeforeReset {
 		t.Fatalf("reset-credit fetches did not increase after reset (%d -> %d): no post-reset inspection ran", fetchesBeforeReset, fetchesAfterReset)
 	}

@@ -1195,13 +1195,13 @@ function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
       return '-'
     }
     return h('div', { class: 'quota-reset-schedule-cell' }, [
-      h('span', { class: 'quota-reset-schedule-label' }, t(`主动重置次数：${count}`, `Manual resets: ${count}`)),
+      h('span', { class: 'quota-reset-schedule-label' }, t(`可用重置额度：${count}`, `Available credits: ${count}`)),
     ])
   }
   const header = h(
     'span',
     { class: 'quota-reset-schedule-label' },
-    t(`主动重置次数：${count ?? credits.length}`, `Manual resets: ${count ?? credits.length}`),
+    t(`可用重置额度：${count ?? credits.length}`, `Available credits: ${count ?? credits.length}`),
   )
   const rows = credits.map((credit, index) => {
     const label = t(`第 ${index + 1} 次`, `#${index + 1}`)
@@ -1220,6 +1220,22 @@ function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
     ])
   })
   return h('div', { class: 'quota-reset-schedule-cell' }, [header, ...rows])
+}
+
+// renderSubscriptionCell shows the ChatGPT subscription renewal time (parsed by
+// CPA from the account's id_token `chatgpt_subscription_active_until` claim) plus
+// a coarse countdown. A null value (no subscription / unknown) renders a dash.
+function renderSubscriptionCell(account: CodexKeeperAccount) {
+  const value = account.subscription_active_until
+  if (!value) {
+    return '-'
+  }
+  const time = formatQuotaResetTime(value)
+  const countdown = formatQuotaResetCountdown(value)
+  return h('div', { class: 'quota-reset-schedule-cell' }, [
+    h('span', { class: 'quota-reset-schedule-time' }, time ?? '-'),
+    countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, `（${countdown}）`) : null,
+  ])
 }
 
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
@@ -1581,8 +1597,8 @@ function confirmResetQuota(account: CodexKeeperAccount) {
   openAccountConfirm(
     t('重置配额状态', 'Reset Quota State'),
     t(
-      `重置 ${account.name} 在 CPA 侧的配额/冷却状态？已重置 ${account.quota_reset_count ?? 0} 次。`,
-      `Reset the CPA-side quota/cooldown state of ${account.name}? Reset ${account.quota_reset_count ?? 0} times so far.`,
+      `确认重置 ${account.name} 的配额与冷却状态？当前可用重置额度 ${account.reset_credit_count ?? 0}，有额度时会真实消耗 1 次。`,
+      `Reset the quota/cooldown state of ${account.name}? Available reset credits: ${account.reset_credit_count ?? 0}; one is really consumed when available.`,
     ),
     t('确认重置', 'Confirm Reset'),
     'warning',
@@ -1779,6 +1795,12 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     key: 'reset_credit_schedule',
     width: 230,
     render: (row) => renderResetCreditScheduleCell(row),
+  },
+  {
+    title: t('续期时间', 'Renews At'),
+    key: 'subscription_active_until',
+    width: 170,
+    render: (row) => renderSubscriptionCell(row),
   },
   {
     title: t('最近巡检', 'Last Inspection'),

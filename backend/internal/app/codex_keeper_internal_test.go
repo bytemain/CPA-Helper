@@ -2766,3 +2766,49 @@ func TestKeeperResetInspectStateWriteFailure(t *testing.T) {
 		t.Fatal("expected a stable state_write_error marker in the Keeper log")
 	}
 }
+
+// TestKeeperSubscriptionActiveUntil pins the tri-state contract: a parsed value
+// is known, a confirmed-absent claim is known-and-nil (clears the stored value),
+// and an unreadable/malformed claim is unknown (preserves the stored value).
+func TestKeeperSubscriptionActiveUntil(t *testing.T) {
+	idToken := func(m map[string]any) map[string]any {
+		return map[string]any{"id_token": m}
+	}
+	want := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		authInfo  map[string]any
+		wantTime  *time.Time
+		wantKnown bool
+	}{
+		{"unix-seconds", idToken(map[string]any{"chatgpt_subscription_active_until": float64(want.Unix())}), &want, true},
+		{"rfc3339", idToken(map[string]any{"chatgpt_subscription_active_until": "2026-10-01T00:00:00Z"}), &want, true},
+		{"date-only", idToken(map[string]any{"chatgpt_subscription_active_until": "2026-10-01"}), &want, true},
+		{"unix-string", idToken(map[string]any{"chatgpt_subscription_active_until": "1790812800"}), &want, true},
+		// Confirmed absent: id_token readable but no claim -> known, nil (clear).
+		{"claim-absent", idToken(map[string]any{"plan_type": "pro"}), nil, true},
+		{"claim-null", idToken(map[string]any{"chatgpt_subscription_active_until": nil}), nil, true},
+		// Unknown: unreadable id_token or malformed claim -> preserve.
+		{"no-id-token", map[string]any{"name": "x"}, nil, false},
+		{"id-token-not-map", map[string]any{"id_token": "raw.jwt.string"}, nil, false},
+		{"empty-string", idToken(map[string]any{"chatgpt_subscription_active_until": ""}), nil, false},
+		{"non-positive", idToken(map[string]any{"chatgpt_subscription_active_until": float64(0)}), nil, false},
+		{"garbage-string", idToken(map[string]any{"chatgpt_subscription_active_until": "not-a-time"}), nil, false},
+		{"wrong-type", idToken(map[string]any{"chatgpt_subscription_active_until": true}), nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, known := keeperSubscriptionActiveUntil(tc.authInfo)
+			if known != tc.wantKnown {
+				t.Fatalf("known = %v, want %v", known, tc.wantKnown)
+			}
+			switch {
+			case tc.wantTime == nil && got != nil:
+				t.Fatalf("time = %v, want nil", got)
+			case tc.wantTime != nil && (got == nil || !got.Equal(*tc.wantTime)):
+				t.Fatalf("time = %v, want %v", got, tc.wantTime)
+			}
+		})
+	}
+}
