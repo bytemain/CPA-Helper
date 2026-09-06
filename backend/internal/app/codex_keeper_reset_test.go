@@ -659,6 +659,11 @@ func TestKeeperResetAuthIndexChangeProceeds(t *testing.T) {
 	if ctrl.consumeCalls != 1 {
 		t.Fatalf("consume calls = %d, want 1 (index change should proceed)", ctrl.consumeCalls)
 	}
+	// The cooldown clear MUST route with the FRESH index (idx-different), not the stale DB
+	// value — otherwise a reindex clears the wrong account / leaves a partial.
+	if len(ctrl.resetQuotaCalls) != 1 || ctrl.resetQuotaCalls[0] != "idx-different" {
+		t.Fatalf("/reset-quota routed with %v, want [idx-different] (fresh index)", ctrl.resetQuotaCalls)
+	}
 }
 
 // TestKeeperResetMissingAccountID proves the reset fails closed when no account_id can

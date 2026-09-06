@@ -3518,7 +3518,9 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	if state.AuthIndex == nil || strings.TrimSpace(*state.AuthIndex) == "" {
 		return keeperQuotaResetResult{}, validationError("该账号缺少 auth_index，请先刷新账号列表")
 	}
-	authIndex := strings.TrimSpace(*state.AuthIndex)
+	// The DB auth_index is only a page snapshot for the initial existence check; it must
+	// NOT route any remote call (see below).
+	dbAuthIndex := strings.TrimSpace(*state.AuthIndex)
 
 	// Resolve the account identity (auth_index + account_id) FRESH from CPA and bind
 	// every downstream call to it. The list entry and download detail are validated
@@ -3528,9 +3530,15 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	// closed (the consume header needs it).
 	identity, ierr := a.resolveKeeperResetIdentity(ctx, cfg, authName)
 	if ierr != nil {
-		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", keeperSafeReason(ierr), "auth_index", authIndex)
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", keeperSafeReason(ierr), "auth_index", dbAuthIndex)
 		return keeperQuotaResetResult{}, ierr
 	}
+	// From here ALL remote routing (consume, /reset-quota cooldown clear) and audits use the
+	// FRESH auth_index — never the stale DB value — so a reindexed account is consumed AND
+	// cooled down on the SAME (current) index. Routing the cooldown clear with the old index
+	// would clear the wrong account or leave an irreversible partial.
+	authIndex := identity.authIndex
+
 	// account_id is the RESOURCE identity; auth_index is only a routing selector (a CPA
 	// hash of the file path) and legitimately changes on a file rename/move/reorder, so it
 	// is NOT compared to the DB row — the fresh auth_index is used as-is for routing. What
