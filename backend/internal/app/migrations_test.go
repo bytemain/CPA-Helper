@@ -446,6 +446,9 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	if !testColumnExists(t, db, "codex_keeper_auth_states", "subscription_active_until") {
 		t.Fatal("head is missing subscription_active_until")
 	}
+	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
+		t.Fatal("head is missing codex_keeper_auth_states.account_id")
+	}
 	if !testTableExists(t, db, "codex_keeper_reset_redeems") {
 		t.Fatal("head is missing codex_keeper_reset_redeems")
 	}
@@ -474,5 +477,8 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	}
 	if testColumnExists(t, db, "codex_keeper_auth_states", "subscription_active_until") {
 		t.Fatal("rollback left subscription_active_until behind")
+	}
+	if testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
+		t.Fatal("rollback left codex_keeper_auth_states.account_id behind")
 	}
 }

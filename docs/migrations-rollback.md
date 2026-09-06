@@ -6,13 +6,14 @@ version is newer than the binary** (goose reports
 `database migration version is newer than this application`). A binary rollback
 therefore always requires migrating the schema **down first**.
 
-## Rolling back the reset-credit-consume release (migrations 202609060001–202609060003)
+## Rolling back the reset-credit-consume release (migrations 202609060001–202609060004)
 
 This release added, on top of `202609040002`:
 
 - `202609060001` — `codex_keeper_auth_states.subscription_active_until` column.
 - `202609060002` — **DROP** of the obsolete `codex_keeper_quota_resets` table.
 - `202609060003` — `codex_keeper_reset_redeems` (redeem ledger) table.
+- `202609060004` — `codex_keeper_auth_states.account_id` column (subscription identity scope).
 
 The previous binary (`a996697`, target version `202609040002`) both refuses to start
 against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
@@ -42,11 +43,12 @@ against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
    cpa-helper migrate down-to 202609040002 --allow-pending
    ```
 
-   This runs the Down migrations for `202609060003`, `202609060002`, and `202609060001`:
-   it drops `codex_keeper_reset_redeems`, drops the `subscription_active_until` column,
-   and **recreates an empty `codex_keeper_quota_resets`** so the old binary's `/accounts`
-   query works. `202609040002` is the only allowlisted rollback target; the command
-   refuses any other version and refuses to run when the DB is not newer than the target.
+   This runs the Down migrations for `202609060004`, `202609060003`, `202609060002`, and
+   `202609060001`: it drops the `account_id` column, drops `codex_keeper_reset_redeems`,
+   drops the `subscription_active_until` column, and **recreates an empty
+   `codex_keeper_quota_resets`** so the old binary's `/accounts` query works.
+   `202609040002` is the only allowlisted rollback target; the command refuses any other
+   version and refuses to run when the DB is not newer than the target.
 
    > Do NOT expect a bare `cpa-helper migrate` to downgrade — it only runs migrations
    > **Up**. The dedicated `migrate down-to` subcommand is required.
@@ -61,6 +63,9 @@ against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
 - `subscription_active_until` (the column **and every collected subscription-renewal
   timestamp**) is dropped and **not** recovered. If you need it, restore from the backup
   taken in step 0; otherwise accept the loss.
+- `account_id` (the column **and every stored account identity**) is dropped and **not**
+  recovered. It is re-derived on the next inspection after re-upgrading, so the loss is
+  transient; restore from the step-0 backup only if you need it before re-upgrading.
 - `codex_keeper_reset_redeems` (the in-flight redeem ledger) is dropped. Any unresolved
   pending redeem is lost; after rollback the old binary cannot consume credits at all, so
   this is acceptable.
