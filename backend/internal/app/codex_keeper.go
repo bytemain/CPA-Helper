@@ -3919,10 +3919,40 @@ func keeperReconcileInspectionIdentity(authInfo, detail map[string]any) (string,
 	return reconciled, true
 }
 
-// keeperExplicitAuthIndex returns an object's explicit auth_index — NEVER the auth name
-// — validating that its alias fields (auth_index/authIndex/index) all agree.
+// keeperExplicitStringField reads an identity field that, WHEN PRESENT, must be a string.
+// It distinguishes absent (key missing or null → "", nil) from present-but-invalid (present
+// with a non-string type, e.g. a JSON number → errKeeperIdentityConflict). Identity fields
+// gate an irreversible consume, so a present-but-wrong-type alias must fail closed rather than
+// be silently ignored (keeperString maps it to "") in favor of a differently-typed sibling.
+func keeperExplicitStringField(o map[string]any, key string) (string, error) {
+	value, present := o[key]
+	if !present || value == nil {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", errKeeperIdentityConflict
+	}
+	return strings.TrimSpace(text), nil
+}
+
+// keeperExplicitAuthIndex returns an object's explicit auth_index — NEVER the auth name —
+// validating that its alias fields (auth_index/authIndex/index) all agree. Any alias that is
+// present but not a string is illegal and fails closed (not silently skipped).
 func keeperExplicitAuthIndex(o map[string]any) (string, error) {
-	return keeperConsistentValue(keeperString(o["auth_index"]), keeperString(o["authIndex"]), keeperString(o["index"]))
+	ai, err := keeperExplicitStringField(o, "auth_index")
+	if err != nil {
+		return "", err
+	}
+	aiCamel, err := keeperExplicitStringField(o, "authIndex")
+	if err != nil {
+		return "", err
+	}
+	idx, err := keeperExplicitStringField(o, "index")
+	if err != nil {
+		return "", err
+	}
+	return keeperConsistentValue(ai, aiCamel, idx)
 }
 
 // keeperExplicitAccountID returns an object's account_id, from the top-level field AND the
@@ -3933,13 +3963,21 @@ func keeperExplicitAuthIndex(o map[string]any) (string, error) {
 // An id_token that is present but cannot be parsed leaves the identity INDETERMINATE, so it
 // fails closed (returns a conflict) rather than trusting the un-cross-checked top-level value.
 func keeperExplicitAccountID(o map[string]any) (string, error) {
-	candidates := []string{keeperString(o["account_id"])}
+	top, err := keeperExplicitStringField(o, "account_id")
+	if err != nil {
+		return "", err
+	}
+	candidates := []string{top}
 	if raw, present := o["id_token"]; present && raw != nil {
 		claims := keeperIDTokenClaims(raw)
 		if claims == nil {
 			return "", errKeeperIdentityConflict
 		}
-		candidates = append(candidates, keeperClaimsAccountIDs(claims)...)
+		ids, err := keeperClaimsAccountIDs(claims)
+		if err != nil {
+			return "", err
+		}
+		candidates = append(candidates, ids...)
 	}
 	return keeperConsistentValue(candidates...)
 }
@@ -4749,12 +4787,26 @@ func keeperIDTokenPlanValues(value any) []string {
 // level and the OpenAI auth namespace claim (https://api.openai.com/auth) where OpenAI's real
 // id_token nests it. Both are returned so keeperConsistentValue validates they agree with each
 // other and with the object's top-level account_id — any disagreement is an identity conflict.
-func keeperClaimsAccountIDs(claims map[string]any) []string {
-	ids := []string{keeperString(claims["chatgpt_account_id"])}
-	if auth, ok := claims["https://api.openai.com/auth"].(map[string]any); ok {
-		ids = append(ids, keeperString(auth["chatgpt_account_id"]))
+// A present-but-wrong-type claim (a non-string account id, or a namespace that is present but
+// not an object) is illegal and fails closed rather than being silently ignored.
+func keeperClaimsAccountIDs(claims map[string]any) ([]string, error) {
+	top, err := keeperExplicitStringField(claims, "chatgpt_account_id")
+	if err != nil {
+		return nil, err
 	}
-	return ids
+	ids := []string{top}
+	if ns, present := claims["https://api.openai.com/auth"]; present && ns != nil {
+		auth, ok := ns.(map[string]any)
+		if !ok {
+			return nil, errKeeperIdentityConflict
+		}
+		nested, err := keeperExplicitStringField(auth, "chatgpt_account_id")
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, nested)
+	}
+	return ids, nil
 }
 
 func keeperIDTokenClaims(value any) map[string]any {

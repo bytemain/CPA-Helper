@@ -3154,6 +3154,14 @@ func TestKeeperReconcileInspectionIdentity(t *testing.T) {
 		{"rawjwt-namespace-conflict", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})}, "", false},
 		// An id_token that is present but unparseable leaves the identity indeterminate → fail closed.
 		{"idtoken-unparseable", map[string]any{}, map[string]any{"account_id": "acct-A", "id_token": "not-a-jwt"}, "", false},
+		// A present-but-wrong-type identity alias must fail closed, not be silently ignored in
+		// favor of a differently-typed sibling.
+		{"authindex-wrong-type", map[string]any{"id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"account_id": "acct-A", "auth_index": float64(123), "authIndex": "idx-A"}, "", false},
+		{"account-id-wrong-type", map[string]any{}, map[string]any{"account_id": float64(123), "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, "", false},
+		// The JWT auth namespace present but not an object is illegal.
+		{"jwt-namespace-not-object", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": "not-object"})}, "", false},
+		// The nested claim present but not a string is illegal.
+		{"jwt-nested-claim-wrong-type", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": float64(7)}})}, "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
