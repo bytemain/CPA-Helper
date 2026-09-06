@@ -3662,48 +3662,44 @@ func TestKeeperInspectListOnlyAccountIDSetsHeader(t *testing.T) {
 	}
 }
 
-// TestBindKeeperAccountIDCASAndSwap proves the CAS bind used by the reset path: a pre-account_id
-// (NULL) row binds to the reset's resolved account_id, a re-bind of the SAME id is idempotent,
-// and a re-bind with a DIFFERENT id fails closed — so a NULL row can never stay bindable-to-
-// anything across resets (the fix for the same-name account-swap-between-resets window).
-func TestBindKeeperAccountIDCASAndSwap(t *testing.T) {
+// TestKeeperResetNullAccountRefusedUntilInspected proves a legacy pre-account_id (NULL) state
+// row cannot be reset: the account fence keys on the stored account_id and is taken before any
+// remote resolve, so an unconfirmed identity is refused (fail closed) rather than fenced on an
+// unknown key. No consume / cooldown is attempted.
+func TestKeeperResetNullAccountRefusedUntilInspected(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "legacy-null.json"
+	var mu sync.Mutex
+	remoteCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		remoteCalls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		http.NotFound(w, r)
+	}))
+	defer cpa.Close()
+
 	app, err := New()
 	if err != nil {
 		t.Fatalf("New(): %v", err)
 	}
 	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) { cfg.CodexKeeper.DryRun = false })
 	ctx := context.Background()
-	const authName = "legacy-null.json"
+
+	// Seed a legacy NULL-account row (auth_index set, account_id NULL).
 	idx := "idx-1"
-	// Seed a pre-account_id row (auth_index set, account_id NULL).
 	if err := app.upsertKeeperState(ctx, keeperAccountResult{Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx}); err != nil {
-		t.Fatalf("seed null row: %v", err)
+		t.Fatalf("seed: %v", err)
 	}
-	if st, _ := app.getKeeperState(ctx, authName); st.AccountID != nil {
-		t.Fatalf("seed row must have NULL account_id, got %v", st.AccountID)
+	if _, rerr := app.resetKeeperQuota(ctx, authName); rerr == nil {
+		t.Fatal("reset on a NULL-account row must fail closed (require inspection first)")
 	}
-	// A reset on the NULL row binds the resolved account_id.
-	if err := app.bindKeeperAccountID(ctx, authName, "acct-A"); err != nil {
-		t.Fatalf("bind A: %v", err)
-	}
-	st, err := app.getKeeperState(ctx, authName)
-	if err != nil {
-		t.Fatalf("get: %v", err)
-	}
-	if st.AccountID == nil || *st.AccountID != "acct-A" {
-		t.Fatalf("account_id not bound to A: %v", st.AccountID)
-	}
-	// Re-binding the SAME account is idempotent.
-	if err := app.bindKeeperAccountID(ctx, authName, "acct-A"); err != nil {
-		t.Fatalf("idempotent re-bind A: %v", err)
-	}
-	// A swap — a different account on the now-bound row — fails closed.
-	if err := app.bindKeeperAccountID(ctx, authName, "acct-B"); !errors.Is(err, errKeeperIdentityConflict) {
-		t.Fatalf("bind B on a row bound to A = %v, want errKeeperIdentityConflict", err)
-	}
-	st, _ = app.getKeeperState(ctx, authName)
-	if st.AccountID == nil || *st.AccountID != "acct-A" {
-		t.Fatalf("swap must not change the stored account_id: %v", st.AccountID)
+	// It must fail before ANY remote resolve/consume.
+	mu.Lock()
+	defer mu.Unlock()
+	if remoteCalls != 0 {
+		t.Fatalf("reset on an unconfirmed identity made %d remote calls; must refuse before resolving", remoteCalls)
 	}
 }

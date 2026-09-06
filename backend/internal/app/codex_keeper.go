@@ -3619,6 +3619,33 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	// NOT route any remote call (see below).
 	dbAuthIndex := strings.TrimSpace(*state.AuthIndex)
 
+	// The account fence MUST be acquired before any fresh list/download resolution, so two
+	// different files that resolve to the SAME account cannot interleave in a pre-fence window
+	// (file A blocked mid-download while file B fully resolves, consumes, finishes and releases,
+	// then A resumes, sees a terminal ledger and mints a fresh redeem id → a SECOND consume).
+	// Fencing before the remote resolve requires a stable key up front, so the fence keys on the
+	// STORED account_id. That means the row must already carry a confirmed account_id: a legacy
+	// pre-account_id (NULL) row must be inspected once first (which persists its account_id)
+	// before it can be reset — fail closed otherwise rather than fencing on an unknown identity.
+	if state.AccountID == nil || strings.TrimSpace(*state.AccountID) == "" {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_unknown", "auth_index", dbAuthIndex)
+		return keeperQuotaResetResult{}, validationError("账号尚未确认身份（缺少 account_id），请先刷新账号列表后再重置")
+	}
+	storedAccountID := strings.TrimSpace(*state.AccountID)
+
+	// Hold the ACCOUNT-level fence (in addition to the per-auth_name lock) across the WHOLE
+	// operation — resolve → pending-lookup → fetch → claim → consume → cooldown → finish. The
+	// paid, limited credit is the ACCOUNT's, so two different filenames/routes for the SAME
+	// account (rename overlap / duplicate import) must be mutually exclusive even though they
+	// hold different auth_name locks — otherwise the second route could redeem a second credit.
+	// Keying on the stored account_id and taking it BEFORE the resolve closes the pre-fence
+	// window. Non-blocking: a contended reset of the same account returns a conflict.
+	if !a.keeper.tryLockAccountID(storedAccountID) {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_busy", "auth_index", dbAuthIndex)
+		return keeperQuotaResetResult{}, conflictError("同一 OpenAI 账号的另一路由正在重置，请稍后重试")
+	}
+	defer a.keeper.unlockAccountID(storedAccountID)
+
 	// Resolve the account identity (auth_index + account_id) FRESH from CPA and bind
 	// every downstream call to it. The list entry and download detail are validated
 	// separately: a conflicting explicit auth_index/account_id between them fails
@@ -3636,42 +3663,15 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	// would clear the wrong account or leave an irreversible partial.
 	authIndex := identity.authIndex
 
-	// account_id is the RESOURCE identity; auth_index is only a routing selector (a CPA
-	// hash of the file path) and legitimately changes on a file rename/move/reorder, so it
-	// is NOT compared to the DB row — the fresh auth_index is used as-is for routing. What
-	// MUST match is the account: when the DB already knows this row's account_id, the fresh
-	// account_id has to equal it, otherwise a stale page is acting on a swapped-out account
-	// and would consume the WRONG account's credit. Fail closed and ask for a refresh. (A
-	// NULL stored account_id — a pre-account_id row — is allowed to bind on this reset.)
-	if state.AccountID != nil && strings.TrimSpace(*state.AccountID) != "" && *state.AccountID != identity.accountID {
+	// account_id is the RESOURCE identity; auth_index is only a routing selector (a CPA hash of
+	// the file path) and legitimately changes on a file rename/move/reorder, so it is NOT
+	// compared to the DB row — the fresh auth_index is used as-is for routing. What MUST match is
+	// the account: the FRESH account_id has to equal the STORED account_id we fenced on, else a
+	// stale page is acting on a swapped-out account (or the file was rebound to another account)
+	// and would consume the WRONG account's credit. Fail closed and ask for a refresh.
+	if identity.accountID != storedAccountID {
 		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_mismatch", "auth_index", authIndex)
 		return keeperQuotaResetResult{}, validationError("账号身份已变化（account_id 不一致），请刷新账号列表后重试")
-	}
-	// Hold the ACCOUNT-level fence (in addition to the per-auth_name lock) across the whole
-	// pending-lookup → fetch → claim → consume → cooldown → finish sequence. The paid,
-	// limited credit is the ACCOUNT's, so two different filenames/routes for the SAME
-	// account (rename overlap / duplicate import) must be mutually exclusive even though
-	// they hold different auth_name locks — otherwise the second route could redeem a second
-	// credit. Non-blocking: a contended reset of the same account returns a conflict.
-	if !a.keeper.tryLockAccountID(identity.accountID) {
-		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_busy", "auth_index", authIndex)
-		return keeperQuotaResetResult{}, conflictError("同一 OpenAI 账号的另一路由正在重置，请稍后重试")
-	}
-	defer a.keeper.unlockAccountID(identity.accountID)
-
-	// Persist the resolved account_id onto a legacy NULL-account row NOW — inside the account
-	// fence and BEFORE any consume — so a later reset sees the bound identity and the account_id
-	// swap gate above protects it. Otherwise a pre-account_id (NULL) row is treated as
-	// bindable-to-anything on every reset: if the same filename is swapped to a different account
-	// between resets (with no successful inspection persisting the new id in between), the next
-	// reset would consume the WRONG account's credit undetected. CAS on account_id IS NULL; if
-	// the row already carries a DIFFERENT account_id, the identity changed under us → fail closed.
-	if berr := a.bindKeeperAccountID(ctx, authName, identity.accountID); berr != nil {
-		if errors.Is(berr, errKeeperIdentityConflict) {
-			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_mismatch", "auth_index", authIndex)
-			return keeperQuotaResetResult{}, validationError("账号身份已变化（account_id 不一致），请刷新账号列表后重试")
-		}
-		return keeperQuotaResetResult{}, berr
 	}
 
 	// A normalized detail carrying ONLY the validated identity, so the fetch/consume
@@ -4408,41 +4408,6 @@ func (a *App) markKeeperIdentityError(ctx context.Context, authName string, mess
 		WHERE auth_name = ?
 	`, message, message, dbTime(checkedAt), now, authName)
 	return err
-}
-
-// bindKeeperAccountID persists a resolved account_id onto a pre-account_id (NULL) state row so
-// a later reset sees the binding and the account_id swap gate can protect it. It CAS-updates
-// only while account_id IS NULL (affected==1 = bound). affected==0 means the row already
-// carries an account_id (or, defensively, no row exists): it re-reads and returns nil only when
-// the stored id already equals accountID, else errKeeperIdentityConflict (the identity changed
-// under us). Callers hold the account fence + per-auth lock, so no concurrent writer races this.
-func (a *App) bindKeeperAccountID(ctx context.Context, authName, accountID string) error {
-	res, err := a.db.ExecContext(ctx, `
-		UPDATE codex_keeper_auth_states SET account_id = ?, updated_at = ?
-		WHERE auth_name = ? AND account_id IS NULL
-	`, accountID, dbTime(time.Now()), authName)
-	if err != nil {
-		return err
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if affected == 1 {
-		return nil
-	}
-	var stored sql.NullString
-	qerr := a.db.QueryRowContext(ctx, `SELECT CAST(account_id AS TEXT) FROM codex_keeper_auth_states WHERE auth_name = ?`, authName).Scan(&stored)
-	if errors.Is(qerr, sql.ErrNoRows) {
-		return nil
-	}
-	if qerr != nil {
-		return qerr
-	}
-	if stored.Valid && strings.TrimSpace(stored.String) != "" && strings.TrimSpace(stored.String) != accountID {
-		return errKeeperIdentityConflict
-	}
-	return nil
 }
 
 func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, disabled bool) error {

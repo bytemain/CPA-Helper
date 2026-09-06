@@ -182,6 +182,10 @@ try {
     'The account has no account_id; a safe redemption is not possible. Refresh and try again.',
   )
   assert.equal(
+    localizedServerMessage('账号尚未确认身份（缺少 account_id），请先刷新账号列表后再重置'),
+    'The account identity is not confirmed yet (no account_id). Refresh the account list before resetting.',
+  )
+  assert.equal(
     localizedServerMessage('无法确认可用重置额度（快照未知），请刷新后重试'),
     'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.',
   )

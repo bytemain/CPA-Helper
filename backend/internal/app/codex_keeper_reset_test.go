@@ -65,6 +65,10 @@ type keeperResetControl struct {
 	gateReached chan struct{}
 	gateRelease chan struct{}
 	gateOnce    *sync.Once
+	// gateAtDownload moves the concurrency gate from the reset-credit fetch to the auth-files
+	// download stage, so a test can hold a reset inside identity resolution (before the fetch)
+	// and assert the account fence — taken before the resolve — already excludes a second route.
+	gateAtDownload bool
 	// authIndexOverride, when non-empty, replaces the downloaded detail's auth_index
 	// so a test can simulate a reassignment (fresh auth_index != stored DB row).
 	authIndexOverride string
@@ -1227,6 +1231,14 @@ func newTwoFileSameAccountCPA(t *testing.T, fileA, fileB, accountID string, ctrl
 				{"name": fileA, "type": "codex"}, {"name": fileB, "type": "codex"},
 			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			ctrl.mu.Lock()
+			atDownload := ctrl.gateAtDownload
+			gReached, gRelease, gOnce := ctrl.gateReached, ctrl.gateRelease, ctrl.gateOnce
+			ctrl.mu.Unlock()
+			if atDownload && gRelease != nil {
+				gOnce.Do(func() { close(gReached) })
+				<-gRelease
+			}
 			name := r.URL.Query().Get("name")
 			idx := "idx-A"
 			if name == fileB {
@@ -1246,9 +1258,10 @@ func newTwoFileSameAccountCPA(t *testing.T, fileA, fileB, accountID string, ctrl
 				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"code": "reset", "windows_reset": []any{}}})
 			case strings.Contains(p.URL, "rate-limit-reset-credits"):
 				ctrl.mu.Lock()
+				atDownload := ctrl.gateAtDownload
 				gReached, gRelease, gOnce := ctrl.gateReached, ctrl.gateRelease, ctrl.gateOnce
 				ctrl.mu.Unlock()
-				if gRelease != nil {
+				if !atDownload && gRelease != nil {
 					gOnce.Do(func() { close(gReached) })
 					<-gRelease
 				}
@@ -1327,5 +1340,65 @@ func TestKeeperResetAccountFenceAcrossTwoFiles(t *testing.T) {
 	defer ctrl.mu.Unlock()
 	if ctrl.consumeCalls != 1 {
 		t.Fatalf("consume calls across two files of one account = %d, want exactly 1", ctrl.consumeCalls)
+	}
+}
+
+// TestKeeperResetAccountFenceBeforeResolve is the deterministic PRE-fence-window right-cause:
+// the account fence keys on the stored account_id and is taken BEFORE the fresh list/download
+// resolve. fileA is held inside its auth-files DOWNLOAD (identity resolution, before any fetch)
+// while already holding the fence; a reset of fileB — a different auth_name, same account — is
+// refused (409) even though fileA has not reached its consume yet. Exactly one credit is
+// consumed. Before the fix (fence taken after resolve), fileB could resolve and consume in this
+// window, yielding a second consume.
+func TestKeeperResetAccountFenceBeforeResolve(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	ctrl := &keeperResetControl{}
+	cpa := newTwoFileSameAccountCPA(t, "a.json", "b.json", "acct-shared", ctrl)
+	defer cpa.Close()
+
+	app, err := backendApp.New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	handler := app.Routes()
+	cookies := requestJSON(t, handler, http.MethodPost, "/api/auth/setup", map[string]any{
+		"username": "admin", "password": "test-password", "nickname": "Admin",
+	}, nil, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/settings", map[string]any{
+		"cliaproxy_url": cpa.URL, "management_key": "test-management-key", "collector_enabled": false,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPut, "/api/codex-keeper/settings", map[string]any{
+		"schedule_cron": "0 0 29 2 *", "dry_run": false, "quota_threshold": 100,
+		"worker_threads": 1, "cpa_timeout_seconds": 1,
+	}, cookies, nil)
+	requestJSON(t, handler, http.MethodPost, "/api/codex-keeper/run-once", nil, cookies, nil)
+	waitForKeeperAccounts(t, handler, cookies, 2)
+
+	// Gate at the DOWNLOAD stage so fileA is held inside identity resolution — before its fetch
+	// — while already holding the account fence.
+	ctrl.mu.Lock()
+	ctrl.gateAtDownload = true
+	ctrl.gateReached = make(chan struct{})
+	ctrl.gateRelease = make(chan struct{})
+	ctrl.gateOnce = &sync.Once{}
+	ctrl.mu.Unlock()
+
+	winnerCh := make(chan int, 1)
+	go func() { winnerCh <- postKeeperReset(handler, cookies, "a.json") }()
+	<-ctrl.gateReached // fileA holds the account fence, blocked in its download (pre-fetch)
+
+	if s := postKeeperReset(handler, cookies, "b.json"); s != http.StatusConflict {
+		t.Fatalf("second file for the same account, blocked in pre-resolve = %d, want 409 (fence before resolve)", s)
+	}
+
+	close(ctrl.gateRelease)
+	if s := <-winnerCh; s != http.StatusOK {
+		t.Fatalf("fileA reset = %d, want 200", s)
+	}
+	ctrl.mu.Lock()
+	defer ctrl.mu.Unlock()
+	if ctrl.consumeCalls != 1 {
+		t.Fatalf("consume calls with a pre-resolve fence = %d, want exactly 1", ctrl.consumeCalls)
 	}
 }
