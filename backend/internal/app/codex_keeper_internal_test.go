@@ -2910,3 +2910,116 @@ func TestCreateKeeperRedeemConvergesAcrossApps(t *testing.T) {
 		t.Fatalf("cross-process claims did not converge on one request_id: %v", ids)
 	}
 }
+
+// keeperInsertPendingRedeem seeds a pending redeem ledger row for a test.
+func keeperInsertPendingRedeem(t *testing.T, app *App, authName, authIndex, accountID, id string) {
+	t.Helper()
+	if _, err := app.db.ExecContext(context.Background(),
+		`INSERT INTO codex_keeper_reset_redeems (auth_name, auth_index, account_id, redeem_request_id, status, updated_at) VALUES (?, ?, ?, ?, 'pending', '2026-01-01 00:00:00')`,
+		authName, authIndex, accountID, id); err != nil {
+		t.Fatalf("seed pending redeem: %v", err)
+	}
+}
+
+func keeperInsertStateRow(t *testing.T, app *App, authName string) {
+	t.Helper()
+	if err := app.upsertKeeperState(context.Background(), keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed state row: %v", err)
+	}
+}
+
+// TestPruneRetainsAccountWithPendingRedeem proves prune never drops an account that still
+// holds a persisted pending redeem — even after a restart (empty in-memory lock table) and
+// a transient/empty remote list — so the sole idempotency key survives. A non-pending
+// stale account is still pruned.
+func TestPruneRetainsAccountWithPendingRedeem(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	keeperInsertStateRow(t, app, "keep.json")
+	keeperInsertPendingRedeem(t, app, "keep.json", "idx-keep", "acct-keep", "rid-keep")
+	keeperInsertStateRow(t, app, "drop.json") // no pending redeem
+
+	// A transient/empty remote list marks BOTH as stale.
+	pruned, err := app.pruneKeeperMissingAuthStates(ctx, map[string]bool{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1 (only the non-pending account)", pruned)
+	}
+	if st, _ := app.getKeeperState(ctx, "keep.json"); st == nil {
+		t.Fatal("account with a pending redeem was pruned; its idempotency key was dropped")
+	}
+	if ok, _ := app.hasPendingKeeperRedeem(ctx, "keep.json"); !ok {
+		t.Fatal("pending redeem was dropped for the retained account")
+	}
+	if st, _ := app.getKeeperState(ctx, "drop.json"); st != nil {
+		t.Fatal("non-pending stale account should have been pruned")
+	}
+}
+
+// TestPruneFailsClosedWithoutRunner proves prune deletes nothing when there is no runner
+// (no per-auth fence), rather than proceeding unlocked.
+func TestPruneFailsClosedWithoutRunner(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	keeperInsertStateRow(t, app, "orphan.json")
+	app.keeper = nil // simulate a maintenance/test variant without a runner
+
+	pruned, err := app.pruneKeeperMissingAuthStates(ctx, map[string]bool{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("prune without a runner deleted %d rows; must fail closed", pruned)
+	}
+	if st, _ := app.getKeeperState(ctx, "orphan.json"); st == nil {
+		t.Fatal("prune without a fence deleted state; must skip")
+	}
+}
+
+// TestDeleteRefusedWithPendingRedeem proves an explicit delete is refused while a pending
+// redeem is unresolved (dropping it would lose the sole idempotency key).
+func TestDeleteRefusedWithPendingRedeem(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	// A disabled account (delete precondition) that still holds a pending redeem.
+	idx := "idx-del"
+	dis := true
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "del.json", Result: "status_disabled", CheckedAt: time.Now(), AuthIndex: &idx, Disabled: &dis,
+	}); err != nil {
+		t.Fatalf("seed state: %v", err)
+	}
+	keeperInsertPendingRedeem(t, app, "del.json", idx, "acct-del", "rid-del")
+
+	err = app.deleteKeeperAccount(ctx, "del.json")
+	if err == nil {
+		t.Fatal("delete succeeded despite a pending redeem; must refuse")
+	}
+	if st, _ := app.getKeeperState(ctx, "del.json"); st == nil {
+		t.Fatal("state row was deleted despite the refusal")
+	}
+	if ok, _ := app.hasPendingKeeperRedeem(ctx, "del.json"); !ok {
+		t.Fatal("pending redeem was dropped despite the refusal")
+	}
+}

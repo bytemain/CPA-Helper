@@ -3859,6 +3859,22 @@ func (a *App) lookupPendingKeeperRedeem(ctx context.Context, authName, authIndex
 	return "", false, nil
 }
 
+// hasPendingKeeperRedeem reports whether authName has an unresolved (pending) redeem in
+// the ledger. This is a PERSISTENT check (survives restarts / an empty in-memory lock
+// table), so a destructive removal never drops the sole idempotency key of an in-flight
+// redeem. Returns false when the table is absent (pre-ledger DB).
+func (a *App) hasPendingKeeperRedeem(ctx context.Context, authName string) (bool, error) {
+	var status string
+	err := a.db.QueryRowContext(ctx, `SELECT status FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return status == keeperRedeemStatusPending, nil
+}
+
 // createKeeperRedeem atomically claims a fresh pending redeem_request_id for the given
 // identity and returns the WINNING row's id. The upsert overwrites the row ONLY when it
 // is not already a same-identity pending redeem (i.e. it is absent, terminal, or a stale
@@ -3944,18 +3960,36 @@ func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[
 	if len(stale) == 0 {
 		return 0, nil
 	}
+	// Prune is a destructive removal, so it is fail-closed without a fence: no runner
+	// means no per-auth lock, so skip the whole pass rather than delete state+ledger
+	// unlocked (consistent with reset/delete/priority).
+	if a.keeper == nil {
+		return 0, nil
+	}
 	pruned := 0
 	for _, name := range stale {
 		// Prune shares the per-auth fence with reset: skip a stale account a reset is
 		// currently holding, so it never drops an in-flight redeem's ledger key. The
 		// account (already absent remotely) is retried on the next cycle.
-		if a.keeper != nil && !a.keeper.tryLockAuthName("prune", name) {
+		if !a.keeper.tryLockAuthName("prune", name) {
+			continue
+		}
+		// PERSISTENT guard (survives restarts, unlike the in-memory lock): never prune an
+		// account that still holds a pending redeem — a transient/empty remote list must
+		// not drop the sole idempotency key of an unconfirmed consume. It is retained
+		// until the redeem resolves (or an operator reconciles it).
+		pending, perr := a.hasPendingKeeperRedeem(ctx, name)
+		if perr != nil {
+			a.keeper.unlockAuthName(name)
+			return pruned, perr
+		}
+		if pending {
+			a.auditKeeperOp("prune", name, "result", "skipped", "reason", "pending_redeem")
+			a.keeper.unlockAuthName(name)
 			continue
 		}
 		affected, derr := a.deleteKeeperStateAndRedeem(ctx, name)
-		if a.keeper != nil {
-			a.keeper.unlockAuthName(name)
-		}
+		a.keeper.unlockAuthName(name)
 		if derr != nil {
 			return pruned, derr
 		}
@@ -4202,6 +4236,14 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	}
 	if !state.Disabled {
 		return validationError("只能删除已禁用账号")
+	}
+	// Refuse to delete while a pending redeem is unresolved: dropping the ledger would
+	// lose the sole idempotency key of an unconfirmed consume, so a later re-import of the
+	// same identity could mint a new key and double-consume. Reconcile (resolve) it first.
+	if pending, perr := a.hasPendingKeeperRedeem(ctx, authName); perr != nil {
+		return perr
+	} else if pending {
+		return conflictError("该账号存在未完成的核销记录，请先对账处理后再删除")
 	}
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err

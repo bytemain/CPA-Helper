@@ -20,6 +20,7 @@ const exactServerMessages: MessagePair[] = [
   ['当前为 dry-run 模式，已阻止真实核销/重置；请关闭 dry-run 后重试', 'Dry-run mode blocked the real redemption/reset. Turn dry-run off and try again.'],
   ['Keeper 未初始化，无法安全重置', 'The keeper is not initialized; a safe reset is not possible.'],
   ['Keeper 未初始化，无法安全删除', 'The keeper is not initialized; a safe delete is not possible.'],
+  ['该账号存在未完成的核销记录，请先对账处理后再删除', 'This account has an unresolved redemption record; reconcile it before deleting.'],
   ['Keeper 未初始化，无法安全操作', 'The keeper is not initialized; this operation is not safe.'],
   ['重置额度核销状态异常，请稍后重试', 'The reset-credit redemption state is inconsistent. Try again shortly.'],
   ['账号不是 Codex 类型，无法主动重置', 'This account is not a Codex account and cannot be reset.'],
