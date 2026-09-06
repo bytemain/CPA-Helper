@@ -2869,3 +2869,44 @@ func TestUpsertSubscriptionPreservedWhenIdentityUnconfirmed(t *testing.T) {
 		t.Fatalf("subscription not preserved on unconfirmed identity: got %v, want %v", st.SubscriptionActiveUntil, known)
 	}
 }
+
+// TestCreateKeeperRedeemConvergesAcrossApps proves the DB-atomic claim is truly
+// cross-process, not just in-process: two App instances with independent DB handles on
+// the SAME SQLite file concurrently claim a fresh redeem for the same identity and both
+// converge on ONE winner request_id (so OpenAI dedups a single logical key).
+func TestCreateKeeperRedeemConvergesAcrossApps(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app1, err := New()
+	if err != nil {
+		t.Fatalf("New() app1: %v", err)
+	}
+	defer app1.Close()
+	// Same data dir → same SQLite file, but a distinct *sql.DB handle (a second process).
+	app2, err := New()
+	if err != nil {
+		t.Fatalf("New() app2: %v", err)
+	}
+	defer app2.Close()
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	ids := make([]string, 2)
+	errs := make([]error, 2)
+	apps := []*App{app1, app2}
+	wg.Add(2)
+	for i := range apps {
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = apps[i].createKeeperRedeem(ctx, "shared.json", "idx-shared", "acct-shared")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("app%d claim: %v", i+1, err)
+		}
+	}
+	if ids[0] == "" || ids[0] != ids[1] {
+		t.Fatalf("cross-process claims did not converge on one request_id: %v", ids)
+	}
+}

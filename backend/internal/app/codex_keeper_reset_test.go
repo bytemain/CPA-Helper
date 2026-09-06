@@ -1022,3 +1022,82 @@ func TestKeeperResetResolverGuardsFailClosed(t *testing.T) {
 		})
 	}
 }
+
+// TestKeeperResetPartialAuditOnCooldownFailure proves that when a credit was consumed but
+// the local cooldown clear then failed, the audit records an irreversible PARTIAL (not a
+// plain error), so the money-affecting half-completion is not masked.
+func TestKeeperResetPartialAuditOnCooldownFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "partial-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-partial",
+		"email": "partial@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-partial",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "http-fail"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Consume succeeds (reset) but the cooldown clear fails → error to the caller.
+	requestJSONExpectStatus(t, handler, http.MethodPost, "/api/codex-keeper/reset-quota", map[string]any{"auth_name": authName}, cookies, http.StatusUnprocessableEntity)
+
+	var status struct {
+		Logs []string `json:"logs"`
+	}
+	requestJSON(t, handler, http.MethodGet, "/api/codex-keeper/status", nil, cookies, &status)
+	joined := strings.Join(status.Logs, "\n")
+	if !strings.Contains(joined, "cooldown_failed_after_consume") || !strings.Contains(joined, "result=partial") {
+		t.Fatalf("cooldown-after-consume must audit an irreversible partial; logs=%v", status.Logs)
+	}
+}
+
+func deleteKeeperAccountReq(handler http.Handler, cookies []*http.Cookie, authName string) int {
+	req := httptest.NewRequest(http.MethodDelete, "/api/codex-keeper/accounts/"+authName, nil)
+	for _, c := range cookies {
+		req.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec.Code
+}
+
+// TestKeeperDeleteConflictsWithInFlightReset proves delete shares the per-auth fence with
+// reset: while a reset holds the lock mid-consume, a concurrent delete of the same account
+// is refused (409) so it can never drop the in-flight redeem ledger key; after the reset
+// finishes the lock is free again.
+func TestKeeperDeleteConflictsWithInFlightReset(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	authName := "fence-me.json"
+	authDetail := map[string]any{
+		"name": authName, "type": "codex", "auth_index": "idx-fence",
+		"email": "fence@example.com", "account_type": "pro", "disabled": false,
+		"priority": 1, "access_token": "test-token", "account_id": "acct-fence",
+	}
+	ctrl := &keeperResetControl{availableCount: 2, fetchMode: "ok", consumeMode: "ok", resetMode: "ok"}
+	cpa := newKeeperResetCPA(t, authName, authDetail, ctrl)
+	defer cpa.Close()
+	handler, cookies, cleanup := setupKeeperResetApp(t, cpa.URL)
+	defer cleanup()
+
+	// Arm the gate so a reset holds the per-auth lock while blocked in its fresh fetch.
+	ctrl.mu.Lock()
+	ctrl.gateReached = make(chan struct{})
+	ctrl.gateRelease = make(chan struct{})
+	ctrl.gateOnce = &sync.Once{}
+	ctrl.mu.Unlock()
+
+	winnerCh := make(chan int, 1)
+	go func() { winnerCh <- postKeeperReset(handler, cookies, authName) }()
+	<-ctrl.gateReached // the reset now holds the per-auth lock
+
+	if s := deleteKeeperAccountReq(handler, cookies, authName); s != http.StatusConflict {
+		t.Fatalf("delete during in-flight reset = %d, want 409 (per-auth fence)", s)
+	}
+
+	close(ctrl.gateRelease)
+	if s := <-winnerCh; s != http.StatusOK {
+		t.Fatalf("reset winner = %d, want 200", s)
+	}
+}

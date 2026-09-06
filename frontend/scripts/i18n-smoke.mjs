@@ -166,6 +166,10 @@ try {
     'Dry-run mode blocked the real redemption/reset. Turn dry-run off and try again.',
   )
   assert.equal(
+    localizedServerMessage('重置额度核销状态异常，请稍后重试'),
+    'The reset-credit redemption state is inconsistent. Try again shortly.',
+  )
+  assert.equal(
     localizedServerMessage('账号缺少 account_id，无法安全核销，请刷新后重试'),
     'The account has no account_id; a safe redemption is not possible. Refresh and try again.',
   )

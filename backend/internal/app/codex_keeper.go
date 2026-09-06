@@ -3576,7 +3576,7 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 		if consumed {
 			// Irreversible partial: the credit was consumed but the cooldown clear
 			// failed. The ledger stays pending so a retry reuses the same id.
-			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
+			a.auditKeeperOp("reset-quota", authName, "result", "partial", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
 		}
 		return keeperQuotaResetResult{}, err
 	}
@@ -3589,7 +3589,7 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	if err := json.Unmarshal(payload, &cpaResult); err != nil ||
 		cpaResult.Status != "ok" || cpaResult.AuthIndex != authIndex {
 		if consumed {
-			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
+			a.auditKeeperOp("reset-quota", authName, "result", "partial", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
 		}
 		return keeperQuotaResetResult{}, validationError("CLIProxyAPI 未确认重置成功（响应缺少 status=ok 或 auth_index 不匹配）")
 	}
@@ -3944,39 +3944,47 @@ func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[
 	if len(stale) == 0 {
 		return 0, nil
 	}
+	pruned := 0
+	for _, name := range stale {
+		// Prune shares the per-auth fence with reset: skip a stale account a reset is
+		// currently holding, so it never drops an in-flight redeem's ledger key. The
+		// account (already absent remotely) is retried on the next cycle.
+		if a.keeper != nil && !a.keeper.tryLockAuthName("prune", name) {
+			continue
+		}
+		affected, derr := a.deleteKeeperStateAndRedeem(ctx, name)
+		if a.keeper != nil {
+			a.keeper.unlockAuthName(name)
+		}
+		if derr != nil {
+			return pruned, derr
+		}
+		pruned += affected
+	}
+	return pruned, nil
+}
+
+// deleteKeeperStateAndRedeem removes an account's state row and its redeem ledger row in
+// ONE transaction (both or neither), returning the number of state rows deleted. Callers
+// that need the per-auth fence must hold it around this call.
+func (a *App) deleteKeeperStateAndRedeem(ctx context.Context, authName string) (int, error) {
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`)
+	res, err := tx.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName)
 	if err != nil {
 		return 0, err
 	}
-	defer stmt.Close()
-	// A pruned account must also drop its redeem ledger row so a later account that
-	// reuses the same auth_name never inherits a stale pending redeem_request_id.
-	redeemStmt, err := tx.PrepareContext(ctx, `DELETE FROM codex_keeper_reset_redeems WHERE auth_name = ?`)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName); err != nil {
 		return 0, err
-	}
-	defer redeemStmt.Close()
-	pruned := 0
-	for _, name := range stale {
-		result, err := stmt.ExecContext(ctx, name)
-		if err != nil {
-			return 0, err
-		}
-		if _, err := redeemStmt.ExecContext(ctx, name); err != nil {
-			return 0, err
-		}
-		affected, _ := result.RowsAffected()
-		pruned += int(affected)
 	}
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
-	return pruned, nil
+	affected, _ := res.RowsAffected()
+	return int(affected), nil
 }
 
 func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState, error) {
@@ -4124,6 +4132,18 @@ func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, dis
 	if err != nil {
 		return err
 	}
+	// Share the per-auth fence: an enable/disable must not change the remote credential
+	// or DB identity while a reset holds the lock mid-consume (it would drift the row the
+	// consume/cooldown is bound to). This is handler-only; processKeeperAuth uses the
+	// lock-free setKeeperRemoteDisabled helper, so there is no self-conflict.
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全操作")
+	}
+	if !a.keeper.tryLockAuthName("toggle", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
@@ -4164,6 +4184,18 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err != nil {
 		return err
 	}
+	// Delete shares the per-auth fence with reset/inspection: it must not delete the
+	// remote state or the redeem ledger while a reset holds the lock mid-consume, or an
+	// in-flight redeem's idempotency key could be dropped and later re-minted (double
+	// consume). Fail closed if the runner is missing.
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全删除")
+	}
+	if !a.keeper.tryLockAuthName("delete", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
@@ -4174,22 +4206,11 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err
 	}
-	// Delete the state row and the redeem ledger row ATOMICALLY. A future account that
-	// re-imports the same auth_name with the SAME identity (auth_index + account_id)
-	// would otherwise reuse a residual pending redeem_request_id — so a ledger-clear
-	// failure must fail the whole delete, never leave an orphan behind.
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM codex_keeper_reset_redeems WHERE auth_name = ?`, authName); err != nil {
-		return err
-	}
-	if err = tx.Commit(); err != nil {
+	// Delete the state row and the redeem ledger row ATOMICALLY (both or neither): a
+	// future account that re-imports the same auth_name with the SAME identity would
+	// otherwise reuse a residual pending redeem_request_id, so a ledger-clear failure
+	// must fail the whole delete rather than leave an orphan behind.
+	if _, err := a.deleteKeeperStateAndRedeem(ctx, authName); err != nil {
 		return err
 	}
 	a.auditKeeperOp("delete", authName, "result", "ok")
@@ -4224,6 +4245,16 @@ func (a *App) updateKeeperAccountPriority(ctx context.Context, authName string, 
 	if err != nil {
 		return err
 	}
+	// Share the per-auth fence (handler-only; processKeeperAuth uses the lock-free
+	// setKeeperRemotePriority helper, so no self-conflict).
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全操作")
+	}
+	if !a.keeper.tryLockAuthName("priority", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
