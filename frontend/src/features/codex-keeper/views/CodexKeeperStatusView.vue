@@ -48,6 +48,7 @@ import {
   resetCodexKeeperQuota,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
+import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
   CodexKeeperAccount,
   CodexKeeperPriorityRule,
@@ -97,8 +98,6 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1588
-const normalTableScrollX = 2092
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -1597,15 +1596,28 @@ function confirmDeleteAccount(account: CodexKeeperAccount) {
   )
 }
 
+function resetQuotaOutcomeText(outcome: CodexKeeperResetResult['account']['outcome']): string {
+  switch (outcome) {
+    case 'reset':
+      return t('已真实核销 1 次主动重置额度，并清理了冷却', 'Redeemed one reset credit and cleared the cooldown')
+    case 'already_redeemed':
+      return t('该次重置此前已核销（幂等），已清理冷却', 'This reset was already redeemed (idempotent); cooldown cleared')
+    case 'no_credit':
+      return t('OpenAI 返回无可用额度，仅清理了冷却', 'OpenAI reported no available credit; only the cooldown was cleared')
+    case 'nothing_to_reset':
+      return t('OpenAI 返回无需重置，仅清理了冷却', 'OpenAI reported nothing to reset; only the cooldown was cleared')
+    case 'cooldown_only':
+    default:
+      return t('无可用额度，仅清理了本地冷却', 'No credit available; only the local cooldown was cleared')
+  }
+}
+
 function resetQuotaAccount(account: CodexKeeperAccount) {
   return runAccountAction(
     account,
     'reset-quota',
     () => resetCodexKeeperQuota(account.name),
-    (result) =>
-      result.account.consumed
-        ? t('已真实核销 1 次主动重置额度，并清理了冷却', 'Redeemed one reset credit and cleared the cooldown')
-        : t('无可用额度，仅清理了本地冷却', 'No credit available; only the local cooldown was cleared'),
+    (result) => resetQuotaOutcomeText(result.account.outcome),
   )
 }
 
@@ -1990,6 +2002,18 @@ const normalColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
   ...baseColumns.value,
   normalActionColumn.value,
 ])
+
+// Derive the horizontal scroll width by summing the actual column widths so it can never
+// drift out of sync when a column is added/removed (fixed right action column relies on
+// scroll-x matching the true total).
+function sumColumnWidths(columns: DataTableColumns<CodexKeeperAccount>): number {
+  return columns.reduce((total, column) => {
+    const width = (column as { width?: number }).width
+    return total + (typeof width === 'number' ? width : 0)
+  }, 0)
+}
+const disabledTableScrollX = computed(() => sumColumnWidths(disabledColumns.value))
+const normalTableScrollX = computed(() => sumColumnWidths(normalColumns.value))
 
 restoreAccountStatusPreferences()
 

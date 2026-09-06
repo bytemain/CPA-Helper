@@ -76,13 +76,22 @@ export function refreshCodexKeeperAccounts(payload: CodexKeeperRefreshPayload): 
   return apiClient.post<void>('/codex-keeper/accounts/refresh', payload)
 }
 
+// CodexKeeperResetOutcome is the real business result of a reset. reset = a credit was
+// redeemed now; already_redeemed = an in-flight redeem resolved idempotently; no_credit
+// / nothing_to_reset = OpenAI reported nothing was redeemed (distinct reasons);
+// cooldown_only = no credit available, only the local 429 cooldown was cleared.
+export type CodexKeeperResetOutcome =
+  | 'reset'
+  | 'already_redeemed'
+  | 'no_credit'
+  | 'nothing_to_reset'
+  | 'cooldown_only'
+
 export interface CodexKeeperResetResult {
   status: string
   account: {
     name: string
-    // Whether a real OpenAI reset credit was consumed this operation (false means
-    // only the local 429 cooldown was cleared because none was available).
-    consumed: boolean
+    outcome: CodexKeeperResetOutcome
   }
 }
 

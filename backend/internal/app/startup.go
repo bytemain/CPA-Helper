@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	backendMigrations "cpa-helper/backend/migrations"
+
+	"github.com/pressly/goose/v3"
 )
 
 var (
@@ -77,6 +80,103 @@ func Migrate(ctx context.Context) (MigrationReport, error) {
 		CurrentVersion:  after,
 		TargetVersion:   backendMigrations.LatestVersion,
 	}, nil
+}
+
+// allowedRollbackTargets whitelists the goose versions `migrate down-to` may roll back
+// to. A downgrade is destructive — its Down migrations drop the columns/tables (and the
+// data in them) added since the target — so only explicitly reviewed rollback targets
+// are permitted, never an arbitrary version.
+var allowedRollbackTargets = map[int64]bool{
+	202609040002: true, // pre-reset-credit-consume baseline (see docs/migrations-rollback.md)
+}
+
+func sortedRollbackTargets() []int64 {
+	targets := make([]int64, 0, len(allowedRollbackTargets))
+	for v := range allowedRollbackTargets {
+		targets = append(targets, v)
+	}
+	sort.Slice(targets, func(i, j int) bool { return targets[i] < targets[j] })
+	return targets
+}
+
+// pendingRedeemCount returns how many in-flight (pending) rows the redeem ledger holds,
+// or 0 when the table does not exist yet (a partially-migrated DB below 202609060003).
+func pendingRedeemCount(ctx context.Context, db *sql.DB) (int, error) {
+	var name string
+	err := db.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type='table' AND name='codex_keeper_reset_redeems'`).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var n int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM codex_keeper_reset_redeems WHERE status = ?`, keeperRedeemStatusPending).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// MigrateDownTo rolls the schema DOWN to target, which MUST be an allowlisted rollback
+// target. It refuses to act when target is not whitelisted or is not strictly below the
+// current version. DESTRUCTIVE: the Down migrations drop everything added since target
+// (for the reset-credit-consume release that includes subscription_active_until and its
+// data). By default it also REFUSES when the redeem ledger holds any pending (unresolved,
+// unknown-outcome) redeem, because dropping the ledger loses that redeem's unique
+// idempotency key — a later re-upgrade + reset would mint a NEW key and could double
+// consume. Pass allowPending=true only after reconciling those redeems and backing up.
+//
+// This is an OFFLINE operation: stop the CPA-Helper service first. The pending-redeem
+// check is a pre-flight guard, NOT atomic protection — a still-running service could
+// create a pending redeem between the check and the drop. Quiescence is the operator's
+// responsibility per docs/migrations-rollback.md.
+func MigrateDownTo(ctx context.Context, target int64, allowPending bool) (MigrationReport, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if !allowedRollbackTargets[target] {
+		return MigrationReport{}, fmt.Errorf("refusing to roll back to unlisted version %d; allowed targets: %v", target, sortedRollbackTargets())
+	}
+	paths, err := resolveRuntimePaths()
+	if err != nil {
+		return MigrationReport{}, err
+	}
+	db, err := openRuntimeDB(paths, false)
+	if err != nil {
+		return MigrationReport{}, err
+	}
+	defer db.Close()
+
+	before, err := currentMigrationVersion(ctx, db)
+	if err != nil {
+		return MigrationReport{DBPath: paths.DBPath, TargetVersion: target}, err
+	}
+	if before <= target {
+		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, CurrentVersion: before, TargetVersion: target},
+			fmt.Errorf("current version %d is not newer than target %d; nothing to roll back", before, target)
+	}
+	if !allowPending {
+		pending, perr := pendingRedeemCount(ctx, db)
+		if perr != nil {
+			return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target}, perr
+		}
+		if pending > 0 {
+			return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target},
+				fmt.Errorf("refusing to roll back: %d pending redeem(s) in codex_keeper_reset_redeems whose idempotency keys would be lost; reconcile them, back up, then re-run with --allow-pending", pending)
+		}
+	}
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target}, err
+	}
+	if err := goose.DownToContext(ctx, db, ".", target); err != nil {
+		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target}, err
+	}
+	after, err := currentMigrationVersion(ctx, db)
+	if err != nil {
+		return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, TargetVersion: target}, err
+	}
+	return MigrationReport{DBPath: paths.DBPath, PreviousVersion: before, CurrentVersion: after, TargetVersion: target}, nil
 }
 
 func CheckStartup(ctx context.Context) (StartupCheck, error) {

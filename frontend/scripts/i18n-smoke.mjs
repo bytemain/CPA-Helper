@@ -158,6 +158,14 @@ try {
     'Account account_id identity conflict (list and detail disagree). Refresh and try again.',
   )
   assert.equal(
+    localizedServerMessage('账号不是 Codex 类型，无法主动重置'),
+    'This account is not a Codex account and cannot be reset.',
+  )
+  assert.equal(
+    localizedServerMessage('当前为 dry-run 模式，已阻止真实核销/重置；请关闭 dry-run 后重试'),
+    'Dry-run mode blocked the real redemption/reset. Turn dry-run off and try again.',
+  )
+  assert.equal(
     localizedServerMessage('账号缺少 account_id，无法安全核销，请刷新后重试'),
     'The account has no account_id; a safe redemption is not possible. Refresh and try again.',
   )

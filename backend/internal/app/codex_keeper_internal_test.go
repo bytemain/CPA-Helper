@@ -2807,6 +2807,11 @@ func TestKeeperSubscriptionActiveUntil(t *testing.T) {
 		{"negative", idToken(map[string]any{"chatgpt_subscription_active_until": float64(-1)}), nil, false},
 		{"fractional-explicit", idToken(map[string]any{"chatgpt_subscription_active_until": float64(1700000000.5)}), nil, false},
 		{"unix-string-out-of-range", idToken(map[string]any{"chatgpt_subscription_active_until": "100"}), nil, false},
+		// String date forms are range-gated too, not just the numeric path.
+		{"rfc3339-year-0001", idToken(map[string]any{"chatgpt_subscription_active_until": "0001-01-01T00:00:00Z"}), nil, false},
+		{"rfc3339-year-9999", idToken(map[string]any{"chatgpt_subscription_active_until": "9999-12-31T23:59:59Z"}), nil, false},
+		{"date-year-1000", idToken(map[string]any{"chatgpt_subscription_active_until": "1000-01-01"}), nil, false},
+		{"date-year-2500", idToken(map[string]any{"chatgpt_subscription_active_until": "2500-01-01"}), nil, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2821,5 +2826,46 @@ func TestKeeperSubscriptionActiveUntil(t *testing.T) {
 				t.Fatalf("time = %v, want %v", got, tc.wantTime)
 			}
 		})
+	}
+}
+
+// TestUpsertSubscriptionPreservedWhenIdentityUnconfirmed proves the subscription write is
+// gated on a confirmed identity: a later inspection whose detail read failed (AuthIndex
+// nil) must NOT overwrite/clear the stored renewal time even though SubscriptionKnown was
+// set early from the list claim.
+func TestUpsertSubscriptionPreservedWhenIdentityUnconfirmed(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-sub"
+	known := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	// A confirmed inspection stores a known subscription renewal time.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "sub.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, SubscriptionActiveUntil: &known, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	// A later inspection whose DETAIL read failed: identity is unconfirmed (AuthIndex
+	// nil) but SubscriptionKnown is still true. The stored value must be preserved.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "sub.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: nil, SubscriptionActiveUntil: nil, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+
+	st, err := app.getKeeperState(ctx, "sub.json")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(known) {
+		t.Fatalf("subscription not preserved on unconfirmed identity: got %v, want %v", st.SubscriptionActiveUntil, known)
 	}
 }
