@@ -76,8 +76,29 @@ export function refreshCodexKeeperAccounts(payload: CodexKeeperRefreshPayload): 
   return apiClient.post<void>('/codex-keeper/accounts/refresh', payload)
 }
 
-export function resetCodexKeeperQuota(authName: string): Promise<void> {
-  return apiClient.post<void>('/codex-keeper/reset-quota', { auth_name: authName })
+// CodexKeeperResetOutcome is the real business result of a reset. reset = a credit was
+// redeemed now; already_redeemed = an in-flight redeem resolved idempotently; no_credit
+// / nothing_to_reset = OpenAI reported nothing was redeemed (distinct reasons);
+// cooldown_only = no credit available, only the local 429 cooldown was cleared.
+export type CodexKeeperResetOutcome =
+  | 'reset'
+  | 'already_redeemed'
+  | 'no_credit'
+  | 'nothing_to_reset'
+  | 'cooldown_only'
+
+export interface CodexKeeperResetResult {
+  status: string
+  account: {
+    name: string
+    outcome: CodexKeeperResetOutcome
+  }
+}
+
+export function resetCodexKeeperQuota(authName: string): Promise<CodexKeeperResetResult> {
+  return apiClient.post<CodexKeeperResetResult>('/codex-keeper/reset-quota', {
+    auth_name: authName,
+  })
 }
 
 export function updateCodexKeeperPriority(authName: string, priority: number): Promise<void> {

@@ -48,6 +48,7 @@ import {
   resetCodexKeeperQuota,
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
+import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
   CodexKeeperAccount,
   CodexKeeperPriorityRule,
@@ -97,8 +98,6 @@ const ACCOUNT_TABLE_VIRTUAL_THRESHOLD = 200
 const CODEX_FIVE_HOUR_WINDOW_SECONDS = 5 * 60 * 60
 const CODEX_WEEK_WINDOW_SECONDS = 7 * 24 * 60 * 60
 const CODEX_MONTH_WINDOW_SECONDS = 30 * 24 * 60 * 60
-const disabledTableScrollX = 1588
-const normalTableScrollX = 2092
 const KEEPER_STATUS_POLL_INTERVAL_MS = 3000
 const REFRESH_STATUS_POLL_INTERVAL_MS = 1500
 const message = useMessage()
@@ -1188,20 +1187,21 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
 function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
   const credits = account.reset_credits ?? []
   const count = account.reset_credit_count
+  // The authoritative count is reset_credit_count. When it is null the snapshot is
+  // unknown/stale — NEVER substitute credits.length (a possibly-truncated detail list)
+  // for it; show "未知/陈旧" so a stale count is not misread as an exact number.
+  const countText = count === null || count === undefined
+    ? t('未知（快照陈旧）', 'unknown (stale)')
+    : String(count)
   if (credits.length === 0) {
-    // Authoritative count with no detail rows still deserves a "0 次" / count line
-    // rather than a bare dash, so a truncated-but-nonzero snapshot is visible.
-    if (count === null || count === undefined) {
-      return '-'
-    }
     return h('div', { class: 'quota-reset-schedule-cell' }, [
-      h('span', { class: 'quota-reset-schedule-label' }, t(`主动重置次数：${count}`, `Manual resets: ${count}`)),
+      h('span', { class: 'quota-reset-schedule-label' }, t(`可用重置额度：${countText}`, `Available credits: ${countText}`)),
     ])
   }
   const header = h(
     'span',
     { class: 'quota-reset-schedule-label' },
-    t(`主动重置次数：${count ?? credits.length}`, `Manual resets: ${count ?? credits.length}`),
+    t(`可用重置额度：${countText}`, `Available credits: ${countText}`),
   )
   const rows = credits.map((credit, index) => {
     const label = t(`第 ${index + 1} 次`, `#${index + 1}`)
@@ -1220,6 +1220,34 @@ function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
     ])
   })
   return h('div', { class: 'quota-reset-schedule-cell' }, [header, ...rows])
+}
+
+// renderSubscriptionCell shows the ChatGPT subscription renewal time (parsed by
+// CPA from the account's id_token `chatgpt_subscription_active_until` claim) plus
+// a coarse countdown. A null value (no subscription / unknown) renders a dash.
+function renderSubscriptionCell(account: CodexKeeperAccount) {
+  const value = account.subscription_active_until
+  if (!value) {
+    return '-'
+  }
+  const time = formatQuotaResetTime(value)
+  const countdown = formatQuotaResetCountdown(value)
+  return h('div', { class: 'quota-reset-schedule-cell' }, [
+    h('span', { class: 'quota-reset-schedule-time' }, time ?? '-'),
+    countdown ? h('span', { class: 'quota-reset-schedule-countdown' }, `（${countdown}）`) : null,
+  ])
+}
+
+// subscriptionDetailText renders the subscription renewal time plus countdown for the
+// account detail drawer (task #77 requires the renewal on both the list and the drawer).
+function subscriptionDetailText(account: CodexKeeperAccount): string {
+  const value = account.subscription_active_until
+  if (!value) {
+    return '-'
+  }
+  const time = formatQuotaResetTime(value) ?? formatDateTime(value)
+  const countdown = formatQuotaResetCountdown(value)
+  return countdown ? `${time}（${countdown}）` : time
 }
 
 function renderAccountIdentityCell(account: CodexKeeperAccount) {
@@ -1568,12 +1596,28 @@ function confirmDeleteAccount(account: CodexKeeperAccount) {
   )
 }
 
+function resetQuotaOutcomeText(outcome: CodexKeeperResetResult['account']['outcome']): string {
+  switch (outcome) {
+    case 'reset':
+      return t('已真实核销 1 次主动重置额度，并清理了冷却', 'Redeemed one reset credit and cleared the cooldown')
+    case 'already_redeemed':
+      return t('该次重置此前已核销（幂等），已清理冷却', 'This reset was already redeemed (idempotent); cooldown cleared')
+    case 'no_credit':
+      return t('OpenAI 返回无可用额度，仅清理了冷却', 'OpenAI reported no available credit; only the cooldown was cleared')
+    case 'nothing_to_reset':
+      return t('OpenAI 返回无需重置，仅清理了冷却', 'OpenAI reported nothing to reset; only the cooldown was cleared')
+    case 'cooldown_only':
+    default:
+      return t('无可用额度，仅清理了本地冷却', 'No credit available; only the local cooldown was cleared')
+  }
+}
+
 function resetQuotaAccount(account: CodexKeeperAccount) {
   return runAccountAction(
     account,
     'reset-quota',
     () => resetCodexKeeperQuota(account.name),
-    t('配额状态已重置', 'Quota state reset'),
+    (result) => resetQuotaOutcomeText(result.account.outcome),
   )
 }
 
@@ -1581,8 +1625,8 @@ function confirmResetQuota(account: CodexKeeperAccount) {
   openAccountConfirm(
     t('重置配额状态', 'Reset Quota State'),
     t(
-      `重置 ${account.name} 在 CPA 侧的配额/冷却状态？已重置 ${account.quota_reset_count ?? 0} 次。`,
-      `Reset the CPA-side quota/cooldown state of ${account.name}? Reset ${account.quota_reset_count ?? 0} times so far.`,
+      `确认重置 ${account.name} 的配额与冷却状态？当前可用重置额度 ${account.reset_credit_count ?? '未知'}，有额度时会真实消耗 1 次。`,
+      `Reset the quota/cooldown state of ${account.name}? Available reset credits: ${account.reset_credit_count ?? 'unknown'}; one is really consumed when available.`,
     ),
     t('确认重置', 'Confirm Reset'),
     'warning',
@@ -1714,11 +1758,11 @@ function isRowActing(account: CodexKeeperAccount): boolean {
   )
 }
 
-async function runAccountAction(
+async function runAccountAction<T>(
   account: CodexKeeperAccount,
   actionType: AccountAction,
-  action: () => Promise<void>,
-  successText: string,
+  action: () => Promise<T>,
+  successText: string | ((result: T) => string),
 ) {
   const key = accountActionKey(account, actionType)
   if (actingActions.value.has(key)) {
@@ -1726,8 +1770,8 @@ async function runAccountAction(
   }
   actingActions.value = new Set(actingActions.value).add(key)
   try {
-    await action()
-    message.success(successText)
+    const result = await action()
+    message.success(typeof successText === 'function' ? successText(result) : successText)
     await loadAccounts()
     if (selectedAccount.value?.name === account.name) {
       const freshAccount = accounts.value.find((item) => item.name === account.name) ?? null
@@ -1779,6 +1823,12 @@ const baseColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
     key: 'reset_credit_schedule',
     width: 230,
     render: (row) => renderResetCreditScheduleCell(row),
+  },
+  {
+    title: t('续期时间', 'Renews At'),
+    key: 'subscription_active_until',
+    width: 170,
+    render: (row) => renderSubscriptionCell(row),
   },
   {
     title: t('最近巡检', 'Last Inspection'),
@@ -1952,6 +2002,18 @@ const normalColumns = computed<DataTableColumns<CodexKeeperAccount>>(() => [
   ...baseColumns.value,
   normalActionColumn.value,
 ])
+
+// Derive the horizontal scroll width by summing the actual column widths so it can never
+// drift out of sync when a column is added/removed (fixed right action column relies on
+// scroll-x matching the true total).
+function sumColumnWidths(columns: DataTableColumns<CodexKeeperAccount>): number {
+  return columns.reduce((total, column) => {
+    const width = (column as { width?: number }).width
+    return total + (typeof width === 'number' ? width : 0)
+  }, 0)
+}
+const disabledTableScrollX = computed(() => sumColumnWidths(disabledColumns.value))
+const normalTableScrollX = computed(() => sumColumnWidths(normalColumns.value))
 
 restoreAccountStatusPreferences()
 
@@ -2560,6 +2622,9 @@ onBeforeUnmount(() => {
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近巡检', 'Last Inspection')">
             {{ formatDateTime(selectedAccount.last_checked_at) }}
+          </NDescriptionsItem>
+          <NDescriptionsItem :label="t('续期时间', 'Renews At')">
+            {{ subscriptionDetailText(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近操作', 'Latest Action')">
             {{ latestActionText(selectedAccount) }}

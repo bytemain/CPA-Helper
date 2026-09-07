@@ -419,3 +419,84 @@ func testColumnExists(t *testing.T, db *sql.DB, table, column string) bool {
 func ensureTestDir(path string) error {
 	return os.MkdirAll(path, 0o755)
 }
+
+// TestRollbackToPreConsumeRestoresCompatSchema pins the PR #12 rollback contract:
+// the previous binary (a996697, target 202609040002) refuses to start against a
+// newer goose version AND its /accounts SELECTs codex_keeper_quota_resets, so a
+// rollback MUST run the Down migrations first. This proves Down from the PR #12 head
+// back to 202609040002 restores the (empty) compat table the old binary needs and
+// removes the PR #12 objects. Down restores schema only, never historical counts.
+func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "rollback.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+
+	goose.SetBaseFS(backendMigrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := goose.UpToContext(ctx, db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("migrate up to head: %v", err)
+	}
+	// PR #12 head schema.
+	if !testColumnExists(t, db, "codex_keeper_auth_states", "subscription_active_until") {
+		t.Fatal("head is missing subscription_active_until")
+	}
+	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
+		t.Fatal("head is missing codex_keeper_auth_states.account_id")
+	}
+	if !testTableExists(t, db, "codex_keeper_reset_redeems") {
+		t.Fatal("head is missing codex_keeper_reset_redeems")
+	}
+	if testTableExists(t, db, "codex_keeper_quota_resets") {
+		t.Fatal("head should have dropped codex_keeper_quota_resets")
+	}
+
+	// Rollback: Down to the version the previous binary targets.
+	const preConsumeVersion int64 = 202609040002
+	if err := goose.DownToContext(ctx, db, ".", preConsumeVersion); err != nil {
+		t.Fatalf("migrate down to %d: %v", preConsumeVersion, err)
+	}
+	var version int64
+	if err := db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&version); err != nil {
+		t.Fatalf("query goose version: %v", err)
+	}
+	if version != preConsumeVersion {
+		t.Fatalf("post-rollback goose version = %d, want %d", version, preConsumeVersion)
+	}
+	// The old binary needs the compat table back (empty), and the PR #12 objects gone.
+	if !testTableExists(t, db, "codex_keeper_quota_resets") {
+		t.Fatal("rollback did not restore the codex_keeper_quota_resets compat table")
+	}
+	if testTableExists(t, db, "codex_keeper_reset_redeems") {
+		t.Fatal("rollback left codex_keeper_reset_redeems behind")
+	}
+	if testColumnExists(t, db, "codex_keeper_auth_states", "subscription_active_until") {
+		t.Fatal("rollback left subscription_active_until behind")
+	}
+	if testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
+		t.Fatal("rollback left codex_keeper_auth_states.account_id behind")
+	}
+
+	// Replay: from the prod baseline (202609040002) migrate Up to head again — the whole
+	// release must be re-runnable after a rollback (040002 → head → 040002 → head).
+	if err := goose.UpToContext(ctx, db, ".", backendMigrations.LatestVersion); err != nil {
+		t.Fatalf("replay up to head after rollback: %v", err)
+	}
+	if v := func() int64 {
+		var v int64
+		_ = db.QueryRow(`SELECT MAX(version_id) FROM goose_db_version`).Scan(&v)
+		return v
+	}(); v != backendMigrations.LatestVersion {
+		t.Fatalf("post-replay version = %d, want head %d", v, backendMigrations.LatestVersion)
+	}
+	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") ||
+		!testTableExists(t, db, "codex_keeper_reset_redeems") ||
+		testTableExists(t, db, "codex_keeper_quota_resets") {
+		t.Fatal("replay to head did not restore the full head schema")
+	}
+}

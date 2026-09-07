@@ -20,13 +20,28 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 const (
-	keeperUsageURL                 = "https://chatgpt.com/backend-api/wham/usage"
-	keeperResetCreditsURL          = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-	keeperResetCreditType          = "codex_rate_limits"
-	keeperResetCreditStatus        = "available"
+	keeperUsageURL               = "https://chatgpt.com/backend-api/wham/usage"
+	keeperResetCreditsURL        = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+	keeperResetCreditsConsumeURL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume"
+	keeperResetCreditType        = "codex_rate_limits"
+	keeperResetCreditStatus      = "available"
+	// Inner response codes returned by wham/rate-limit-reset-credits/consume
+	// (OpenAI Codex backend-client rate_limit_resets). A 2xx inner status only
+	// means the request was processed; the code decides whether a credit was
+	// actually redeemed this call.
+	keeperResetCreditCodeReset           = "reset"            // a real reset happened now
+	keeperResetCreditCodeAlreadyRedeemed = "already_redeemed" // same redeem_request_id replayed (idempotent) — still our redemption
+	keeperResetCreditCodeNoCredit        = "no_credit"        // no credit available (snapshot was stale-high) — NOT consumed
+	keeperResetCreditCodeNothingToReset  = "nothing_to_reset" // nothing to reset — NOT consumed
+	// keeperRedeemStatusPending marks a redeem ledger row whose outcome is unknown
+	// (in-flight or a prior attempt that failed transport/protocol). Its
+	// redeem_request_id must be reused on the next attempt for idempotency.
+	keeperRedeemStatusPending      = "pending"
 	keeperLogFilePrefix            = "codex-keeper-"
 	keeperLogComponent             = "codex_keeper"
 	keeperLogRetainedFiles         = 3
@@ -38,20 +53,21 @@ const (
 )
 
 type KeeperRunner struct {
-	app            *App
-	mu             sync.Mutex
-	daemonStop     chan struct{}
-	daemonDone     chan struct{}
-	running        bool
-	runningModes   map[string]struct{}
-	inFlightAuths  map[string]string
-	state          string
-	detail         string
-	mode           *string
-	lastStartedAt  *time.Time
-	lastFinishedAt *time.Time
-	stats          keeperStats
-	logs           []string
+	app              *App
+	mu               sync.Mutex
+	daemonStop       chan struct{}
+	daemonDone       chan struct{}
+	running          bool
+	runningModes     map[string]struct{}
+	inFlightAuths    map[string]string
+	inFlightAccounts map[string]bool
+	state            string
+	detail           string
+	mode             *string
+	lastStartedAt    *time.Time
+	lastFinishedAt   *time.Time
+	stats            keeperStats
+	logs             []string
 }
 
 type keeperStats struct {
@@ -63,6 +79,10 @@ type keeperStats struct {
 	PriorityRestored int `json:"priority_restored"`
 	Skipped          int `json:"skipped"`
 	NetworkError     int `json:"network_error"`
+	// IdentityError counts accounts whose list/detail identity (account_id or auth_index)
+	// conflicted this run, so the snapshot was preserved and NOT refreshed from an
+	// ambiguous mixed detail — a post-reset refresh must be audited as error, not ok.
+	IdentityError int `json:"identity_error"`
 	// ResetCreditsUnavailable counts otherwise-healthy accounts whose reset-credit
 	// fetch failed this run (snapshot preserved, health unchanged). Not persisted to
 	// the runs table; used to audit a post-reset refresh as partial.
@@ -127,28 +147,27 @@ type keeperQuotaResetRequest struct {
 }
 
 type keeperAccount struct {
-	Name                   string              `json:"name"`
-	Email                  *string             `json:"email"`
-	AuthIndex              *string             `json:"auth_index"`
-	AccountType            *string             `json:"account_type"`
-	Disabled               bool                `json:"disabled"`
-	Priority               *int                `json:"priority"`
-	PrimaryUsedPercent     *int                `json:"primary_used_percent"`
-	SecondaryUsedPercent   *int                `json:"secondary_used_percent"`
-	PrimaryResetAt         *time.Time          `json:"primary_reset_at"`
-	SecondaryResetAt       *time.Time          `json:"secondary_reset_at"`
-	PrimaryWindowSeconds   *int                `json:"primary_window_seconds"`
-	SecondaryWindowSeconds *int                `json:"secondary_window_seconds"`
-	QuotaThreshold         *int                `json:"quota_threshold"`
-	LastStatusCode         *int                `json:"last_status_code"`
-	QuotaResetCount        int                 `json:"quota_reset_count"`
-	LastQuotaResetAt       *time.Time          `json:"last_quota_reset_at"`
-	ResetCreditCount       *int                `json:"reset_credit_count"`
-	ResetCredits           []keeperResetCredit `json:"reset_credits"`
-	LastError              *string             `json:"last_error"`
-	LatestAction           *string             `json:"latest_action"`
-	LastCheckedAt          *time.Time          `json:"last_checked_at"`
-	LastHealthyAt          *time.Time          `json:"last_healthy_at"`
+	Name                    string              `json:"name"`
+	Email                   *string             `json:"email"`
+	AuthIndex               *string             `json:"auth_index"`
+	AccountType             *string             `json:"account_type"`
+	Disabled                bool                `json:"disabled"`
+	Priority                *int                `json:"priority"`
+	PrimaryUsedPercent      *int                `json:"primary_used_percent"`
+	SecondaryUsedPercent    *int                `json:"secondary_used_percent"`
+	PrimaryResetAt          *time.Time          `json:"primary_reset_at"`
+	SecondaryResetAt        *time.Time          `json:"secondary_reset_at"`
+	PrimaryWindowSeconds    *int                `json:"primary_window_seconds"`
+	SecondaryWindowSeconds  *int                `json:"secondary_window_seconds"`
+	QuotaThreshold          *int                `json:"quota_threshold"`
+	LastStatusCode          *int                `json:"last_status_code"`
+	ResetCreditCount        *int                `json:"reset_credit_count"`
+	ResetCredits            []keeperResetCredit `json:"reset_credits"`
+	SubscriptionActiveUntil *time.Time          `json:"subscription_active_until"`
+	LastError               *string             `json:"last_error"`
+	LatestAction            *string             `json:"latest_action"`
+	LastCheckedAt           *time.Time          `json:"last_checked_at"`
+	LastHealthyAt           *time.Time          `json:"last_healthy_at"`
 }
 
 // keeperResetCredit is the safe projection of one entry from
@@ -176,29 +195,28 @@ type keeperResetCreditResponse struct {
 }
 
 type keeperAccountResponse struct {
-	Name                   string                          `json:"name"`
-	Email                  *string                         `json:"email"`
-	AccountType            *string                         `json:"account_type"`
-	Disabled               bool                            `json:"disabled"`
-	Priority               *int                            `json:"priority"`
-	PrimaryUsedPercent     *int                            `json:"primary_used_percent"`
-	SecondaryUsedPercent   *int                            `json:"secondary_used_percent"`
-	PrimaryResetAt         *string                         `json:"primary_reset_at"`
-	SecondaryResetAt       *string                         `json:"secondary_reset_at"`
-	PrimaryWindowSeconds   *int                            `json:"primary_window_seconds"`
-	SecondaryWindowSeconds *int                            `json:"secondary_window_seconds"`
-	PrimaryWindowUsage     *keeperQuotaWindowUsageResponse `json:"primary_window_usage"`
-	SecondaryWindowUsage   *keeperQuotaWindowUsageResponse `json:"secondary_window_usage"`
-	QuotaThreshold         *int                            `json:"quota_threshold"`
-	LastStatusCode         *int                            `json:"last_status_code"`
-	LastError              *string                         `json:"last_error"`
-	LatestAction           *string                         `json:"latest_action"`
-	LastCheckedAt          *string                         `json:"last_checked_at"`
-	LastHealthyAt          *string                         `json:"last_healthy_at"`
-	QuotaResetCount        int                             `json:"quota_reset_count"`
-	LastQuotaResetAt       *string                         `json:"last_quota_reset_at"`
-	ResetCreditCount       *int                            `json:"reset_credit_count"`
-	ResetCredits           []keeperResetCreditResponse     `json:"reset_credits"`
+	Name                    string                          `json:"name"`
+	Email                   *string                         `json:"email"`
+	AccountType             *string                         `json:"account_type"`
+	Disabled                bool                            `json:"disabled"`
+	Priority                *int                            `json:"priority"`
+	PrimaryUsedPercent      *int                            `json:"primary_used_percent"`
+	SecondaryUsedPercent    *int                            `json:"secondary_used_percent"`
+	PrimaryResetAt          *string                         `json:"primary_reset_at"`
+	SecondaryResetAt        *string                         `json:"secondary_reset_at"`
+	PrimaryWindowSeconds    *int                            `json:"primary_window_seconds"`
+	SecondaryWindowSeconds  *int                            `json:"secondary_window_seconds"`
+	PrimaryWindowUsage      *keeperQuotaWindowUsageResponse `json:"primary_window_usage"`
+	SecondaryWindowUsage    *keeperQuotaWindowUsageResponse `json:"secondary_window_usage"`
+	QuotaThreshold          *int                            `json:"quota_threshold"`
+	LastStatusCode          *int                            `json:"last_status_code"`
+	LastError               *string                         `json:"last_error"`
+	LatestAction            *string                         `json:"latest_action"`
+	LastCheckedAt           *string                         `json:"last_checked_at"`
+	LastHealthyAt           *string                         `json:"last_healthy_at"`
+	ResetCreditCount        *int                            `json:"reset_credit_count"`
+	ResetCredits            []keeperResetCreditResponse     `json:"reset_credits"`
+	SubscriptionActiveUntil *string                         `json:"subscription_active_until"`
 }
 
 type keeperQuotaWindowUsageResponse struct {
@@ -254,8 +272,12 @@ type keeperWindowUsageCache struct {
 type keeperAuthState struct {
 	keeperAccount
 	RestorePriority *int
-	CreatedAt       time.Time
-	UpdatedAt       time.Time
+	// AccountID is the stored ChatGPT account identity (nil until an inspection observed
+	// it). resetKeeperQuota compares it with the fresh identity so a same-filename account
+	// swap (auth_index unchanged) never resets the wrong account.
+	AccountID *string
+	CreatedAt time.Time
+	UpdatedAt time.Time
 }
 
 type keeperUsageInfo struct {
@@ -302,6 +324,19 @@ type keeperAccountResult struct {
 	// good data. A successful empty result carries a non-nil count of 0.
 	ResetCreditCount *int
 	ResetCredits     *string
+	// SubscriptionActiveUntil is the ChatGPT subscription renewal time parsed from
+	// the account's id_token claims. It is tri-state together with
+	// SubscriptionKnown: when SubscriptionKnown is true the value is authoritative
+	// (a nil pointer means "confirmed no subscription" and clears the stored
+	// value); when SubscriptionKnown is false the claim was unreadable/malformed
+	// and upsertKeeperState preserves the previous snapshot.
+	SubscriptionActiveUntil *time.Time
+	SubscriptionKnown       bool
+	// AccountID is the ChatGPT account identity this inspection observed (nil when the
+	// detail/claims were unreadable). upsertKeeperState uses it to scope the subscription
+	// preserve-on-unknown to the ACCOUNT, so an auth_name swapped to a different account
+	// under the same auth_index never inherits the previous account's renewal date.
+	AccountID *string
 	// ResetCreditsUnavailable is set when the account is healthy but its reset-credit
 	// fetch failed, so the snapshot was not refreshed this inspection.
 	ResetCreditsUnavailable bool
@@ -651,6 +686,39 @@ func (r *KeeperRunner) unlockAuthName(name string) {
 	delete(r.inFlightAuths, name)
 }
 
+// tryLockAccountID / unlockAccountID guard the RESOURCE (an OpenAI account_id), separately
+// from the auth_name (file) lock. Two different filenames/routes for the SAME account
+// (rename overlap, duplicate import) take different auth_name locks but the SAME account_id
+// lock, so a reset that redeems a credit for an account excludes any other concurrent reset
+// of the same account — without this a second route could consume a second credit even in a
+// single process. Non-blocking: a contended reset returns a conflict.
+func (r *KeeperRunner) tryLockAccountID(accountID string) bool {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return true
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.inFlightAccounts == nil {
+		r.inFlightAccounts = map[string]bool{}
+	}
+	if r.inFlightAccounts[accountID] {
+		return false
+	}
+	r.inFlightAccounts[accountID] = true
+	return true
+}
+
+func (r *KeeperRunner) unlockAccountID(accountID string) {
+	accountID = strings.TrimSpace(accountID)
+	if accountID == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.inFlightAccounts, accountID)
+}
+
 func keeperModeOrder(mode string) int {
 	switch mode {
 	case "daemon":
@@ -854,6 +922,10 @@ func keeperRefreshAuditOutcome(stats keeperStats, err error) (result string, rea
 		return "error", "state_write_error"
 	case stats.NetworkError > 0:
 		return "error", "network_error"
+	case stats.IdentityError > 0:
+		// The account's list/detail identity conflicted, so its snapshot was preserved
+		// (not refreshed from an ambiguous mixed detail) — never a successful refresh.
+		return "error", "identity_error"
 	case stats.StatusDisabled > 0:
 		// The account was disabled during the inspect (invalid/expired credentials)
 		// before the usage + reset-credit fetch could refresh the snapshot.
@@ -1068,7 +1140,12 @@ func (a *App) handleCodexKeeper(w http.ResponseWriter, r *http.Request) error {
 		}
 		result, err := a.resetKeeperQuota(r.Context(), name)
 		if err != nil {
-			a.auditKeeperOp("reset-quota", name, "result", "error", "reason", keeperSafeReason(err))
+			// An irreversible partial (credit consumed, cooldown-clear failed) is already
+			// audited as result=partial inside resetKeeperQuota; do NOT overwrite it with a
+			// generic result=error line that would mask the partial in the log tail.
+			if keeperSafeReason(err) != keeperResetPartialCode {
+				a.auditKeeperOp("reset-quota", name, "result", "error", "reason", keeperSafeReason(err))
+			}
 			return err
 		}
 		// Immediately re-inspect just this account so its post-reset usage / window /
@@ -1239,29 +1316,28 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 	for _, account := range accounts {
 		usage := windowUsages[account.Name]
 		responses = append(responses, keeperAccountResponse{
-			Name:                   account.Name,
-			Email:                  account.Email,
-			AccountType:            account.AccountType,
-			Disabled:               account.Disabled,
-			Priority:               keeperDisplayPriority(account.Priority),
-			PrimaryUsedPercent:     account.PrimaryUsedPercent,
-			SecondaryUsedPercent:   account.SecondaryUsedPercent,
-			PrimaryResetAt:         apiDateTimePtr(account.PrimaryResetAt),
-			SecondaryResetAt:       apiDateTimePtr(account.SecondaryResetAt),
-			PrimaryWindowSeconds:   account.PrimaryWindowSeconds,
-			SecondaryWindowSeconds: account.SecondaryWindowSeconds,
-			PrimaryWindowUsage:     keeperQuotaWindowUsageResponseFrom(usage.Primary),
-			SecondaryWindowUsage:   keeperQuotaWindowUsageResponseFrom(usage.Secondary),
-			QuotaThreshold:         account.QuotaThreshold,
-			LastStatusCode:         account.LastStatusCode,
-			LastError:              account.LastError,
-			LatestAction:           account.LatestAction,
-			LastCheckedAt:          apiDateTimePtr(account.LastCheckedAt),
-			LastHealthyAt:          apiDateTimePtr(account.LastHealthyAt),
-			QuotaResetCount:        account.QuotaResetCount,
-			LastQuotaResetAt:       apiDateTimePtr(account.LastQuotaResetAt),
-			ResetCreditCount:       account.ResetCreditCount,
-			ResetCredits:           keeperResetCreditResponses(account.ResetCredits),
+			Name:                    account.Name,
+			Email:                   account.Email,
+			AccountType:             account.AccountType,
+			Disabled:                account.Disabled,
+			Priority:                keeperDisplayPriority(account.Priority),
+			PrimaryUsedPercent:      account.PrimaryUsedPercent,
+			SecondaryUsedPercent:    account.SecondaryUsedPercent,
+			PrimaryResetAt:          apiDateTimePtr(account.PrimaryResetAt),
+			SecondaryResetAt:        apiDateTimePtr(account.SecondaryResetAt),
+			PrimaryWindowSeconds:    account.PrimaryWindowSeconds,
+			SecondaryWindowSeconds:  account.SecondaryWindowSeconds,
+			PrimaryWindowUsage:      keeperQuotaWindowUsageResponseFrom(usage.Primary),
+			SecondaryWindowUsage:    keeperQuotaWindowUsageResponseFrom(usage.Secondary),
+			QuotaThreshold:          account.QuotaThreshold,
+			LastStatusCode:          account.LastStatusCode,
+			LastError:               account.LastError,
+			LatestAction:            account.LatestAction,
+			LastCheckedAt:           apiDateTimePtr(account.LastCheckedAt),
+			LastHealthyAt:           apiDateTimePtr(account.LastHealthyAt),
+			ResetCreditCount:        account.ResetCreditCount,
+			ResetCredits:            keeperResetCreditResponses(account.ResetCredits),
+			SubscriptionActiveUntil: apiDateTimePtr(account.SubscriptionActiveUntil),
 		})
 	}
 	return responses
@@ -2560,6 +2636,10 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		name = "unknown"
 	}
 	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now}
+	// Subscription renewal time comes from the auth-file list entry's parsed
+	// id_token claims (available regardless of the usage-fetch outcome), so set it
+	// up front to persist on every path.
+	result.SubscriptionActiveUntil, result.SubscriptionKnown = keeperSubscriptionActiveUntil(authInfo)
 	// persistState writes the result to the DB and, if that fails, records the
 	// failure on the result (and logs it) rather than swallowing the error — so a
 	// state that never reached the DB is not later reported as a healthy refresh.
@@ -2593,8 +2673,74 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		return result
 	}
 	merged := mergeKeeperObjects(authInfo, detail)
+	// Reconcile the account identity across BOTH sources FIRST — the list entry's explicit
+	// account_id (its id_token.chatgpt_account_id, the same source as the subscription
+	// claim) and auth_index, and the download detail's account_id and auth_index. If either
+	// conflicts (or a single source is self-contradictory), the merged detail mixes two
+	// accounts, so bail out with an identity_error and preserve the prior snapshot rather
+	// than fetching usage / writing account data from an ambiguous mix. This is audited as
+	// an error (never a successful refresh) and never binds a wrong account_id.
+	identity, consistent := keeperReconcileInspectionIdentity(authInfo, detail)
+	if !consistent {
+		message := "账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照"
+		result.Result = "identity_error"
+		result.LastError = &message
+		result.LatestAction = &message
+		result.SubscriptionKnown = false
+		// The merged detail mixes two accounts, so every business column (email,
+		// auth_index, account_id, account_type, disabled, priority, usage, quota,
+		// reset credits, subscription) on `result` is empty/ambiguous here. Persisting
+		// it through the normal upsert (which is `= excluded.*` for those columns) would
+		// clobber the prior good snapshot to NULL/false — which also breaks a later reset
+		// that needs the stored auth_index. Preserve ALL existing state and only stamp the
+		// error/latest_action and the check time. If no row exists yet (first-ever
+		// inspection hits a conflict) there is nothing trustworthy to insert, so this
+		// touches zero rows rather than manufacturing an incomplete identity row.
+		if err := a.markKeeperIdentityError(ctx, name, &message, result.CheckedAt); err != nil {
+			logFn(name + "：状态写回失败（state_write_error）")
+			log.Printf("codex keeper identity-error write-back failed for %s: %v", name, err)
+			result.StateWriteFailed = true
+		}
+		logFn(name + "：" + message)
+		return result
+	}
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
+	// Normalize the merged object with the per-source-VALIDATED identity so all account-scoped
+	// work below consumes only the reconciled {auth_index, account_id}, never re-derived from
+	// the raw right-biased merge. Routing (checkKeeperUsage / fetchKeeperResetCredits call
+	// keeperAuthIndex, which otherwise falls back to the auth NAME) uses the reconciled
+	// auth_index; the Chatgpt-Account-Id header (read from the top-level account_id) uses the
+	// reconciled account_id. Each is injected only when non-empty. Safe because the identity is
+	// reconciled (non-conflicting) for this merged detail.
+	if identity.authIndex != "" {
+		merged["auth_index"] = identity.authIndex
+	}
 	result.AuthIndex = keeperRemoteAuthIndex(merged)
+	// accountIDKnown gates the account-scoped work below. keeperReconcileInspectionIdentity
+	// yields an empty account_id when NEITHER source carries one (e.g. a legacy auth_index-only
+	// credential): the identity is consistent (nothing to conflict) but UNKNOWN. Without a stable
+	// account_id we cannot attribute reset credits to a resource (the api-call would omit the
+	// Chatgpt-Account-Id header and OpenAI would resolve the account from $TOKEN$ alone) nor detect
+	// a same-index account swap in the snapshot CASE. So we still run usage/priority (transient
+	// current state, always overwritten), but skip the reset-credit fetch and the subscription
+	// write and preserve the prior account-scoped snapshot rather than overwrite it blind.
+	acct := identity.accountID
+	accountIDKnown := acct != ""
+	if accountIDKnown {
+		result.AccountID = &acct
+		// Attribute the account-scoped api-calls (Chatgpt-Account-Id, read from the top-level
+		// account_id) to the confirmed account even when the id came only from the list's
+		// id_token claim and the download detail carried no top-level account_id — otherwise a
+		// known account_id could send an account-less request yet write an account-scoped
+		// snapshot, an inconsistent attribution.
+		merged["account_id"] = acct
+	} else {
+		// Clear the up-front subscription claim so upsertKeeperState's CASE falls through to
+		// COALESCE(NULL, existing) = preserve, instead of binding a renewal date to an
+		// account we cannot identify.
+		result.SubscriptionActiveUntil = nil
+		result.SubscriptionKnown = false
+	}
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
 	result.Disabled = &disabled
@@ -2703,10 +2849,17 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 	result.PrimaryWindowSeconds = usage.PrimaryWindowSeconds
 	result.SecondaryWindowSeconds = usage.SecondaryWindowSeconds
 	result.QuotaThreshold = &cfg.CodexKeeper.QuotaThreshold
-	// Best-effort reset-credit snapshot. A failed/malformed fetch leaves both
-	// fields nil, so upsertKeeperState preserves the previous snapshot instead of
-	// wiping it; a successful empty result carries count 0 and an empty list.
-	if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
+	// Best-effort reset-credit snapshot. A failed/malformed fetch leaves both fields nil,
+	// so upsertKeeperState preserves the previous snapshot instead of wiping it; a
+	// successful empty result carries count 0 and an empty list. (An identity conflict has
+	// already bailed out above, so this fetch only runs for a reconciled identity.)
+	if !accountIDKnown {
+		// No stable account_id → we cannot safely attribute a reset-credit snapshot to a
+		// resource, so we do NOT fetch it (leaving both fields nil preserves the prior
+		// account-scoped snapshot via the upsert's COALESCE). Flag it unavailable so a
+		// post-reset refresh is audited partial, never a falsely-healthy ok.
+		result.ResetCreditsUnavailable = true
+	} else if count, credits, ok := a.fetchKeeperResetCredits(ctx, cfg, merged); ok {
 		result.ResetCreditCount = &count
 		if encoded, err := json.Marshal(credits); err == nil {
 			payload := string(encoded)
@@ -2892,6 +3045,8 @@ func (a *App) mergeKeeperStats(stats *keeperStats, result keeperAccountResult) {
 		stats.PriorityRestored++
 	case "network_error":
 		stats.NetworkError++
+	case "identity_error":
+		stats.IdentityError++
 	default:
 		stats.Skipped++
 	}
@@ -2912,6 +3067,7 @@ func (stats *keeperStats) add(delta keeperStats) {
 	stats.PriorityRestored += delta.PriorityRestored
 	stats.Skipped += delta.Skipped
 	stats.NetworkError += delta.NetworkError
+	stats.IdentityError += delta.IdentityError
 	stats.ResetCreditsUnavailable += delta.ResetCreditsUnavailable
 	stats.StateWriteError += delta.StateWriteError
 }
@@ -3291,13 +3447,82 @@ func keeperParseOptionalTime(value any) (*time.Time, bool) {
 	return &parsed, true
 }
 
+// keeperSubscriptionActiveUntil extracts the ChatGPT subscription renewal time
+// from an auth-file list entry's parsed id_token claims (CPA's ListAuthFiles
+// surfaces `id_token.chatgpt_subscription_active_until`). It is tri-state so a
+// missing/malformed claim never corrupts a good stored snapshot:
+//   - (t, true)   — claim present and parsed (Unix seconds or RFC3339 / date).
+//   - (nil, true) — id_token readable but the claim is confirmed absent/null:
+//     the account has no active subscription, so the old value may be cleared.
+//   - (nil, false)— UNKNOWN: id_token unreadable, or the claim is present but
+//     malformed (wrong type, empty, non-positive, unparseable time). The caller
+//     must preserve the previous snapshot rather than clearing it.
+func keeperSubscriptionActiveUntil(authInfo map[string]any) (*time.Time, bool) {
+	idToken, ok := authInfo["id_token"].(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	value, present := idToken["chatgpt_subscription_active_until"]
+	if !present || value == nil {
+		return nil, true
+	}
+	switch v := value.(type) {
+	case float64:
+		// JSON numbers arrive as float64. Require a finite, whole value: reject NaN/Inf
+		// and a fractional value (a truncated/garbage number). The magnitude is checked
+		// as float64 BEFORE the int64 conversion so an overflowing value (e.g.
+		// math.MaxInt64) can never wrap into a spurious in-range integer.
+		if math.IsNaN(v) || math.IsInf(v, 0) || v != math.Trunc(v) {
+			return nil, false
+		}
+		if v < keeperSubscriptionMinUnix || v > keeperSubscriptionMaxUnix {
+			return nil, false
+		}
+		return keeperValidateSubscriptionTime(time.Unix(int64(v), 0))
+	case string:
+		s := strings.TrimSpace(v)
+		if s == "" {
+			return nil, false
+		}
+		for _, layout := range []string{time.RFC3339Nano, "2006-01-02T15:04:05Z07:00", "2006-01-02"} {
+			if t, err := time.Parse(layout, s); err == nil {
+				return keeperValidateSubscriptionTime(t)
+			}
+		}
+		if secs, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return keeperValidateSubscriptionTime(time.Unix(secs, 0))
+		}
+	}
+	return nil, false
+}
+
+// keeperSubscription{Min,Max}Unix bound a plausible subscription renewal time
+// (2000-01-01 .. 2100-01-01 UTC) so a corrupt/extreme epoch never becomes a stored
+// timestamp.
+const (
+	keeperSubscriptionMinUnix = 946684800  // 2000-01-01T00:00:00Z
+	keeperSubscriptionMaxUnix = 4102444800 // 2100-01-01T00:00:00Z
+)
+
+// keeperValidateSubscriptionTime is the single range gate every parsed subscription
+// time (numeric Unix, RFC3339, or date string) must pass: it returns the UTC time only
+// when it falls inside the plausible [2000, 2100] window, otherwise (nil, false). This
+// keeps an extreme string date (e.g. 0001-01-01 / 9999-...) from being stored as known.
+func keeperValidateSubscriptionTime(t time.Time) (*time.Time, bool) {
+	if secs := t.Unix(); secs < keeperSubscriptionMinUnix || secs > keeperSubscriptionMaxUnix {
+		return nil, false
+	}
+	utc := t.UTC()
+	return &utc, true
+}
+
 func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	rows, err := a.db.QueryContext(ctx, `
 		SELECT auth_name, email, auth_index, account_type, disabled, priority, primary_used_percent,
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
-		       reset_credit_count, CAST(reset_credits AS TEXT)
+		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT)
 		FROM codex_keeper_auth_states
 		ORDER BY COALESCE(email, ''), auth_name
 	`)
@@ -3316,65 +3541,71 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := a.mergeKeeperQuotaResetCounts(ctx, accounts); err != nil {
-		return nil, err
-	}
 	return accounts, nil
 }
 
-// mergeKeeperQuotaResetCounts fills QuotaResetCount/LastQuotaResetAt from the
-// codex_keeper_quota_resets table (rows without an entry keep the zero count).
-func (a *App) mergeKeeperQuotaResetCounts(ctx context.Context, accounts []keeperAccount) error {
-	if len(accounts) == 0 {
-		return nil
-	}
-	rows, err := a.db.QueryContext(ctx, `SELECT auth_name, reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	type resetInfo struct {
-		count  int
-		lastAt *time.Time
-	}
-	counts := map[string]resetInfo{}
-	for rows.Next() {
-		var name string
-		var count int
-		var lastAt sql.NullString
-		if err := rows.Scan(&name, &count, &lastAt); err != nil {
-			return err
-		}
-		counts[name] = resetInfo{count: count, lastAt: timePtr(lastAt)}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for i := range accounts {
-		if info, ok := counts[accounts[i].Name]; ok {
-			accounts[i].QuotaResetCount = info.count
-			accounts[i].LastQuotaResetAt = info.lastAt
-		}
-	}
-	return nil
+// keeperResetOutcomeCooldownOnly is the outcome when no consume ran (no credit was
+// available and no pending redeem existed) — only the local cooldown was cleared. The
+// other outcomes are exactly the OpenAI terminal codes, so the caller can message each
+// distinctly (already_redeemed ≠ reset; nothing_to_reset ≠ no_credit).
+const keeperResetOutcomeCooldownOnly = "cooldown_only"
+
+// keeperResetPartialCode is the stable error code for an irreversible partial reset (a
+// credit was consumed but the local cooldown clear then failed). The handler recognizes
+// it and does NOT re-audit a generic result=error over the already-recorded partial.
+const keeperResetPartialCode = "reset_partial"
+
+func keeperResetPartialError() *AppError {
+	return appError(keeperResetPartialCode, http.StatusConflict, "已消耗 1 次主动重置额度，但清理本地冷却失败；请稍后重试（系统会复用同一凭据幂等重试，不会重复消耗）")
 }
 
-// resetKeeperQuota asks CLIProxyAPI to reset the quota/cooldown state of one
-// auth (by its auth_index) and records the reset in the local counter table.
-// The CLIProxyAPI call must succeed before the counter is incremented.
-// keeperQuotaResetResult is the deliberately minimal wire shape of a reset:
-// it must not leak internal keeperAccount fields (auth_index, email, errors).
 type keeperQuotaResetResult struct {
-	Name             string  `json:"name"`
-	QuotaResetCount  int     `json:"quota_reset_count"`
-	LastQuotaResetAt *string `json:"last_quota_reset_at"`
+	Name string `json:"name"`
+	// Outcome is one of: reset, already_redeemed, no_credit, nothing_to_reset,
+	// cooldown_only. It preserves the real business result without leaking internals.
+	Outcome string `json:"outcome"`
 }
 
+// resetKeeperQuota performs a real reset for one auth. When the account has an
+// available reset credit (reset_credit_count > 0, the authoritative
+// available_count — never the possibly-truncated credits list length), it first
+// redeems one credit against OpenAI via wham/rate-limit-reset-credits/consume
+// (fail-closed: any transport error / non-2xx / non-ok inner status aborts the
+// whole operation and never reports a redemption). It then always clears the
+// local CLIProxyAPI 429 cooldown via /reset-quota. When no credit is available
+// it skips the consume and only clears the cooldown.
 func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuotaResetResult, error) {
 	cfg, err := a.loadConfig(ctx)
 	if err != nil {
 		return keeperQuotaResetResult{}, err
 	}
+	// Dry-run means "no real side effects". A manual reset really redeems a paid credit
+	// and clears the cooldown, so it is fail-closed under dry-run — an admin testing the
+	// keeper must not silently burn a credit. Turn dry-run off to perform a real reset.
+	if cfg.CodexKeeper.DryRun {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "dry_run")
+		return keeperQuotaResetResult{}, validationError("当前为 dry-run 模式，已阻止真实核销/重置；请关闭 dry-run 后重试")
+	}
+
+	// A missing runner is fail-closed rather than "proceed unlocked" — never let a serve/test
+	// variant bypass the concurrency guards below.
+	if a.keeper == nil {
+		return keeperQuotaResetResult{}, validationError("Keeper 未初始化，无法安全重置")
+	}
+	// Acquire the per-auth_name lock FIRST, then read state under it, so the decision never uses
+	// a pre-lock snapshot that a concurrent delete/rebuild could have invalidated. This lock is a
+	// per-FILE/state guard: it serializes operations on THIS auth_name (reset/inspect/delete/…)
+	// so its state row and remote credential are not mutated concurrently. It is NOT by itself the
+	// cross-file monetary guard — two DIFFERENT files that resolve to the same OpenAI account hold
+	// DIFFERENT auth_name locks; the paid-credit mutual exclusion across those routes is the
+	// stored-account_id fence acquired below. Non-blocking: a contended request returns a
+	// conflict. Released on return, BEFORE the handler's chained InspectAccountsLocked (which
+	// re-acquires it itself).
+	if !a.keeper.tryLockAuthName("reset", authName) {
+		return keeperQuotaResetResult{}, conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return keeperQuotaResetResult{}, err
@@ -3385,47 +3616,567 @@ func (a *App) resetKeeperQuota(ctx context.Context, authName string) (keeperQuot
 	if state.AuthIndex == nil || strings.TrimSpace(*state.AuthIndex) == "" {
 		return keeperQuotaResetResult{}, validationError("该账号缺少 auth_index，请先刷新账号列表")
 	}
-	authIndex := strings.TrimSpace(*state.AuthIndex)
+	// The DB auth_index is only a page snapshot for the initial existence check; it must
+	// NOT route any remote call (see below).
+	dbAuthIndex := strings.TrimSpace(*state.AuthIndex)
+
+	// The account fence MUST be acquired before any fresh list/download resolution, so two
+	// different files that resolve to the SAME account cannot interleave in a pre-fence window
+	// (file A blocked mid-download while file B fully resolves, consumes, finishes and releases,
+	// then A resumes, sees a terminal ledger and mints a fresh redeem id → a SECOND consume).
+	// Fencing before the remote resolve requires a stable key up front, so the fence keys on the
+	// STORED account_id. That means the row must already carry a confirmed account_id: a legacy
+	// pre-account_id (NULL) row must be inspected once first (which persists its account_id)
+	// before it can be reset — fail closed otherwise rather than fencing on an unknown identity.
+	if state.AccountID == nil || strings.TrimSpace(*state.AccountID) == "" {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_unknown", "auth_index", dbAuthIndex)
+		return keeperQuotaResetResult{}, validationError("账号尚未确认身份（缺少 account_id），请先刷新账号列表后再重置")
+	}
+	storedAccountID := strings.TrimSpace(*state.AccountID)
+
+	// Hold the ACCOUNT-level fence (in addition to the per-auth_name lock) across the WHOLE
+	// operation — resolve → pending-lookup → fetch → claim → consume → cooldown → finish. The
+	// paid, limited credit is the ACCOUNT's, so two different filenames/routes for the SAME
+	// account (rename overlap / duplicate import) must be mutually exclusive even though they
+	// hold different auth_name locks — otherwise the second route could redeem a second credit.
+	// Keying on the stored account_id and taking it BEFORE the resolve closes the pre-fence
+	// window. Non-blocking: a contended reset of the same account returns a conflict.
+	if !a.keeper.tryLockAccountID(storedAccountID) {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_busy", "auth_index", dbAuthIndex)
+		return keeperQuotaResetResult{}, conflictError("同一 OpenAI 账号的另一路由正在重置，请稍后重试")
+	}
+	defer a.keeper.unlockAccountID(storedAccountID)
+
+	// Resolve the account identity (auth_index + account_id) FRESH from CPA and bind
+	// every downstream call to it. The list entry and download detail are validated
+	// separately: a conflicting explicit auth_index/account_id between them fails
+	// closed (never silently merged into a cross-row mix), there is no auth-name
+	// fallback for the auth_index on the reset path, and a missing account_id fails
+	// closed (the consume header needs it).
+	identity, ierr := a.resolveKeeperResetIdentity(ctx, cfg, authName)
+	if ierr != nil {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", keeperSafeReason(ierr), "auth_index", dbAuthIndex)
+		return keeperQuotaResetResult{}, ierr
+	}
+	// From here ALL remote routing (consume, /reset-quota cooldown clear) and audits use the
+	// FRESH auth_index — never the stale DB value — so a reindexed account is consumed AND
+	// cooled down on the SAME (current) index. Routing the cooldown clear with the old index
+	// would clear the wrong account or leave an irreversible partial.
+	authIndex := identity.authIndex
+
+	// account_id is the RESOURCE identity; auth_index is only a routing selector (a CPA hash of
+	// the file path) and legitimately changes on a file rename/move/reorder, so it is NOT
+	// compared to the DB row — the fresh auth_index is used as-is for routing. What MUST match is
+	// the account: the FRESH account_id has to equal the STORED account_id we fenced on, else a
+	// stale page is acting on a swapped-out account (or the file was rebound to another account)
+	// and would consume the WRONG account's credit. Fail closed and ask for a refresh.
+	if identity.accountID != storedAccountID {
+		a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "account_id_mismatch", "auth_index", authIndex)
+		return keeperQuotaResetResult{}, validationError("账号身份已变化（account_id 不一致），请刷新账号列表后重试")
+	}
+
+	// A normalized detail carrying ONLY the validated identity, so the fetch/consume
+	// never re-derive an index from a name fallback or a conflicting field.
+	identDetail := map[string]any{"auth_index": identity.authIndex, "account_id": identity.accountID}
+
+	consumed := false
+	// Set when a real credit was redeemed: the ledger stays pending through the
+	// cooldown step and is finalized only after the whole operation succeeds.
+	var pendingRedeemID, redeemCode string
+	// availableCount is only meaningful (>=0) on the new-operation path; a pending
+	// replay does not depend on it. -1 marks "not fetched" for the audit trail.
+	availableCount := -1
+
+	// Resolve an identity-matched pending redeem FIRST. It must be replayable with its
+	// original key even when the count endpoint is temporarily unavailable — a lost
+	// first response may have consumed the last credit, and only replaying the same key
+	// recovers the true terminal state (already_redeemed). The fresh count gate applies
+	// ONLY to a brand-new operation.
+	redeemID, hasPending, perr := a.lookupPendingKeeperRedeem(ctx, identity.accountID)
+	if perr != nil {
+		return keeperQuotaResetResult{}, perr
+	}
+	doConsume := hasPending
+	if !hasPending {
+		// A NEW operation requires a known authoritative available_count: a NULL/stale
+		// stored count must not be read as a known 0, and an unknown fresh count blocks
+		// the operation instead of degrading to a cooldown-only clear.
+		count, _, ok := a.fetchKeeperResetCredits(ctx, cfg, identDetail)
+		if !ok {
+			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "credit_count_unknown", "auth_index", authIndex)
+			return keeperQuotaResetResult{}, validationError("无法确认可用重置额度（快照未知），请刷新后重试")
+		}
+		availableCount = count
+		if count > 0 {
+			newID, cerr := a.createKeeperRedeem(ctx, identity.accountID)
+			if cerr != nil {
+				return keeperQuotaResetResult{}, cerr
+			}
+			redeemID = newID
+			doConsume = true
+		}
+	}
+	if doConsume {
+		code, cerr := a.consumeKeeperResetCredit(ctx, cfg, authName, identity.authIndex, identDetail, redeemID)
+		if cerr != nil {
+			// Unknown outcome: keep the ledger pending (same redeemID) so the next
+			// attempt reuses it. Fail closed; never report a redemption.
+			a.auditKeeperOp("reset-quota", authName, "result", "error", "reason", "consume_failed", "auth_index", authIndex)
+			return keeperQuotaResetResult{}, cerr
+		}
+		switch code {
+		case keeperResetCreditCodeReset, keeperResetCreditCodeAlreadyRedeemed:
+			// A credit was consumed. Do NOT finalize the ledger yet — the operation is
+			// not done until the local cooldown is cleared. Keeping it pending lets a
+			// retry after a cooldown failure reuse the same id (already_redeemed) and
+			// never burn a second credit.
+			consumed = true
+			pendingRedeemID = redeemID
+			redeemCode = code
+		case keeperResetCreditCodeNoCredit, keeperResetCreditCodeNothingToReset:
+			// Nothing was redeemed (the fresh count was stale-high) — no credit is at
+			// risk, so finalize the ledger now.
+			redeemCode = code
+			if ferr := a.finishKeeperRedeem(ctx, identity.accountID, redeemID, code); ferr != nil {
+				a.auditKeeperOp("reset-redeem-ledger", authName, "result", "error", "reason", keeperSafeReason(ferr))
+			}
+		}
+	}
+
+	// Always clear the local CLIProxyAPI 429 cooldown for this auth.
 	timeout := time.Duration(cfg.CodexKeeper.CPATimeoutSeconds) * time.Second
 	_, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/reset-quota", nil,
 		map[string]any{"auth_index": authIndex}, timeout)
 	if err != nil {
+		if consumed {
+			// Irreversible partial: the credit was consumed but the cooldown clear
+			// failed. The ledger stays pending so a retry reuses the same id. Audit the
+			// partial and return a partial-coded error so the handler does NOT overwrite
+			// this line with a generic result=error.
+			a.auditKeeperOp("reset-quota", authName, "result", "partial", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
+			return keeperQuotaResetResult{}, keeperResetPartialError()
+		}
 		return keeperQuotaResetResult{}, err
 	}
-	// A 2xx alone is not proof of a reset: require the CLIProxyAPI response to
-	// confirm status=ok for the exact auth_index we asked about, otherwise fail
-	// closed and do not count the reset.
+	// A 2xx alone is not proof of a reset: require the CLIProxyAPI response to confirm
+	// status=ok for the exact auth_index we asked about, otherwise fail closed.
 	var cpaResult struct {
 		Status    string `json:"status"`
 		AuthIndex string `json:"auth_index"`
 	}
-	// authIndex was already trimmed before the request; require CPA to echo it
-	// exactly (no lenient trimming of the response) to honor the exact-match contract.
 	if err := json.Unmarshal(payload, &cpaResult); err != nil ||
 		cpaResult.Status != "ok" || cpaResult.AuthIndex != authIndex {
+		if consumed {
+			a.auditKeeperOp("reset-quota", authName, "result", "partial", "reason", "cooldown_failed_after_consume", "code", redeemCode, "auth_index", authIndex)
+			return keeperQuotaResetResult{}, keeperResetPartialError()
+		}
 		return keeperQuotaResetResult{}, validationError("CLIProxyAPI 未确认重置成功（响应缺少 status=ok 或 auth_index 不匹配）")
 	}
+	// The whole operation succeeded — now finalize the redeem ledger. A ledger-write
+	// failure here is non-fatal: a later reset reuses the same id and OpenAI returns
+	// already_redeemed (idempotent).
+	if pendingRedeemID != "" {
+		if ferr := a.finishKeeperRedeem(ctx, identity.accountID, pendingRedeemID, redeemCode); ferr != nil {
+			a.auditKeeperOp("reset-redeem-ledger", authName, "result", "error", "reason", keeperSafeReason(ferr))
+		}
+	}
+	// The outcome is the exact terminal code when a consume ran, else cooldown-only.
+	outcome := keeperResetOutcomeCooldownOnly
+	if redeemCode != "" {
+		outcome = redeemCode
+	}
+	a.auditKeeperOp("reset-quota", authName, "result", "ok", "outcome", outcome, "consumed", consumed, "available", availableCount, "auth_index", authIndex)
+	return keeperQuotaResetResult{Name: authName, Outcome: outcome}, nil
+}
+
+// keeperResetIdentity is the validated account identity a reset acts on.
+type keeperResetIdentity struct {
+	authIndex string
+	accountID string
+}
+
+// resolveKeeperResetIdentity reads the account's list entry and download detail and
+// resolves the (auth_index, account_id) to act on, validating each source's EXPLICIT
+// identity separately. It never falls back to the auth name for an auth_index, fails
+// closed when the two sources carry conflicting explicit identities, and fails closed
+// when no explicit auth_index or no account_id can be determined.
+func (a *App) resolveKeeperResetIdentity(ctx context.Context, cfg AppConfig, authName string) (keeperResetIdentity, error) {
+	items, err := a.listKeeperRemoteAuthFiles(ctx, cfg)
+	if err != nil {
+		return keeperResetIdentity{}, err
+	}
+	var authInfo map[string]any
+	matches := 0
+	for _, item := range items {
+		if keeperString(item["name"]) == authName {
+			authInfo = item
+			matches++
+		}
+	}
+	if authInfo == nil {
+		return keeperResetIdentity{}, validationError("账号在远端列表中不存在，请刷新后重试")
+	}
+	// A duplicate name in the remote list (a malformed/corrupt response) makes the
+	// "same-row binding" ambiguous — pick nothing, fail closed rather than an arbitrary row.
+	if matches > 1 {
+		return keeperResetIdentity{}, validationError("远端存在多个同名账号条目，无法安全重置，请核对后重试")
+	}
+	// listKeeperRemoteAuthFiles returns every provider. The reset consume targets
+	// OpenAI's Codex endpoint, so require this entry to be a Codex account — an
+	// auth_name reused by / drifted to another provider must never send a non-Codex
+	// token/index to the consume.
+	if keeperString(authInfo["type"]) != "codex" {
+		return keeperResetIdentity{}, validationError("账号不是 Codex 类型，无法主动重置")
+	}
+	detail, err := a.getKeeperRemoteAuthFile(ctx, cfg, authName)
+	if err != nil {
+		return keeperResetIdentity{}, err
+	}
+	if detail == nil {
+		return keeperResetIdentity{}, validationError("读取账号详情失败，未执行主动重置")
+	}
+	// If the download detail carries an explicit name, it MUST still be the account we
+	// asked for — a proxy misroute / mismatched response must not bind another
+	// credential's detail to this target.
+	if dn := strings.TrimSpace(keeperString(detail["name"])); dn != "" && dn != authName {
+		return keeperResetIdentity{}, validationError("账号详情名称不匹配，请刷新后重试")
+	}
+	// A download detail that carries an explicit, non-Codex type is a provider drift /
+	// list-vs-detail conflict — fail closed rather than act on it.
+	if dt := keeperString(detail["type"]); dt != "" && dt != "codex" {
+		return keeperResetIdentity{}, validationError("账号类型冲突（详情非 Codex），请刷新后重试")
+	}
+	// Require a Codex access_token in the auth JSON: the consume relies on CLIProxyAPI's
+	// $TOKEN$ substitution, which otherwise falls back to api_key / id_token / cookie and
+	// could send the wrong credential to wham. Reset is irreversible, so a missing token
+	// fails closed rather than depending on an upstream 401.
+	if strings.TrimSpace(keeperString(detail["access_token"])) == "" {
+		return keeperResetIdentity{}, validationError("账号缺少 access_token，无法安全核销，请刷新后重试")
+	}
+	listAuthIndex, err := keeperExplicitAuthIndex(authInfo)
+	if err != nil {
+		return keeperResetIdentity{}, validationError("列表条目 auth_index 字段自相矛盾，请刷新后重试")
+	}
+	detailAuthIndex, err := keeperExplicitAuthIndex(detail)
+	if err != nil {
+		return keeperResetIdentity{}, validationError("详情 auth_index 字段自相矛盾，请刷新后重试")
+	}
+	authIndex, err := keeperReconcileIdentityField(listAuthIndex, detailAuthIndex)
+	if err != nil {
+		return keeperResetIdentity{}, validationError("账号 auth_index 身份冲突（列表与详情不一致），请刷新后重试")
+	}
+	if authIndex == "" {
+		return keeperResetIdentity{}, validationError("无法确定账号 auth_index，请刷新账号列表后重试")
+	}
+	// The consume header's account_id comes from the download's account_id (top-level
+	// and/or id_token claim, which must agree) and is REQUIRED. The list side's account_id
+	// is an optional second exact cross-check when present — its absence must not block a
+	// legitimate older credential.
+	accountID, err := keeperExplicitAccountID(detail)
+	if err != nil {
+		return keeperResetIdentity{}, validationError("详情 account_id 字段自相矛盾，请刷新后重试")
+	}
+	if accountID == "" {
+		return keeperResetIdentity{}, validationError("账号缺少 account_id，无法安全核销，请刷新后重试")
+	}
+	listAccountID, err := keeperExplicitAccountID(authInfo)
+	if err != nil {
+		return keeperResetIdentity{}, validationError("列表条目 account_id 字段自相矛盾，请刷新后重试")
+	}
+	if listAccountID != "" && listAccountID != accountID {
+		return keeperResetIdentity{}, validationError("账号 account_id 身份冲突（列表与详情不一致），请刷新后重试")
+	}
+	return keeperResetIdentity{authIndex: authIndex, accountID: accountID}, nil
+}
+
+var errKeeperIdentityConflict = errors.New("keeper identity conflict")
+
+// keeperReconcileIdentityField returns the agreed value of an identity field from two
+// sources: when both are present they must be equal (else a conflict error); otherwise
+// the present one, or "" when neither is present.
+func keeperReconcileIdentityField(left, right string) (string, error) {
+	left = strings.TrimSpace(left)
+	right = strings.TrimSpace(right)
+	switch {
+	case left != "" && right != "" && left != right:
+		return "", errKeeperIdentityConflict
+	case left != "":
+		return left, nil
+	default:
+		return right, nil
+	}
+}
+
+// keeperConsistentValue returns the single agreed non-empty value among candidates, or
+// an error when two present candidates disagree. Reset is irreversible, so an object
+// whose own alias fields conflict (a deceptive/corrupt entry) fails closed rather than
+// silently taking a precedence winner.
+func keeperConsistentValue(candidates ...string) (string, error) {
+	agreed := ""
+	for _, c := range candidates {
+		c = strings.TrimSpace(c)
+		if c == "" {
+			continue
+		}
+		if agreed == "" {
+			agreed = c
+		} else if agreed != c {
+			return "", errKeeperIdentityConflict
+		}
+	}
+	return agreed, nil
+}
+
+// keeperInspectionIdentity is the per-source-validated identity for an inspection: the
+// reconciled account_id and auth_index. Callers route (auth_index) and header (account_id)
+// account-scoped requests using ONLY these normalized values, never re-deriving them from the
+// raw right-biased merge (which can drop a list-only value or fall back to the auth name).
+type keeperInspectionIdentity struct {
+	accountID string
+	authIndex string
+}
+
+// keeperReconcileInspectionIdentity reconciles the account identity across BOTH sources
+// during inspection — the list entry's explicit account_id (its id_token.chatgpt_account_id,
+// the same source as the subscription claim) and auth_index, and the download detail's
+// account_id and auth_index. It returns (identity, true) when each field agrees (or only one
+// source has it, or neither), and ({}, false) when ANY field conflicts across sources or a
+// single source is self-contradictory. A false result means the merged detail mixes two
+// accounts, so the caller must not fetch/write account data from it.
+func keeperReconcileInspectionIdentity(authInfo, detail map[string]any) (keeperInspectionIdentity, bool) {
+	listAcct, lerr := keeperExplicitAccountID(authInfo)
+	detailAcct, derr := keeperExplicitAccountID(detail)
+	listIdx, lierr := keeperExplicitAuthIndex(authInfo)
+	detailIdx, dierr := keeperExplicitAuthIndex(detail)
+	if lerr != nil || derr != nil || lierr != nil || dierr != nil {
+		return keeperInspectionIdentity{}, false
+	}
+	acct, rerr := keeperReconcileIdentityField(listAcct, detailAcct)
+	if rerr != nil {
+		return keeperInspectionIdentity{}, false
+	}
+	idx, ierr := keeperReconcileIdentityField(listIdx, detailIdx)
+	if ierr != nil {
+		return keeperInspectionIdentity{}, false
+	}
+	return keeperInspectionIdentity{accountID: acct, authIndex: idx}, true
+}
+
+// keeperExplicitStringField reads an identity field that, WHEN PRESENT, must be a string.
+// It distinguishes absent (key missing or null → "", nil) from present-but-invalid (present
+// with a non-string type, e.g. a JSON number → errKeeperIdentityConflict). Identity fields
+// gate an irreversible consume, so a present-but-wrong-type alias must fail closed rather than
+// be silently ignored (keeperString maps it to "") in favor of a differently-typed sibling.
+func keeperExplicitStringField(o map[string]any, key string) (string, error) {
+	value, present := o[key]
+	if !present || value == nil {
+		return "", nil
+	}
+	text, ok := value.(string)
+	if !ok {
+		return "", errKeeperIdentityConflict
+	}
+	return strings.TrimSpace(text), nil
+}
+
+// keeperExplicitAuthIndex returns an object's explicit auth_index — NEVER the auth name —
+// validating that its alias fields (auth_index/authIndex/index) all agree. Any alias that is
+// present but not a string is illegal and fails closed (not silently skipped).
+func keeperExplicitAuthIndex(o map[string]any) (string, error) {
+	ai, err := keeperExplicitStringField(o, "auth_index")
+	if err != nil {
+		return "", err
+	}
+	aiCamel, err := keeperExplicitStringField(o, "authIndex")
+	if err != nil {
+		return "", err
+	}
+	idx, err := keeperExplicitStringField(o, "index")
+	if err != nil {
+		return "", err
+	}
+	return keeperConsistentValue(ai, aiCamel, idx)
+}
+
+// keeperExplicitAccountID returns an object's account_id, from the top-level field AND the
+// id_token's chatgpt_account_id claim, validating they all agree. The id_token may be a map
+// OR — as in CLIProxyAPI's real download auth JSON — a raw JWT string; both forms are decoded
+// (keeperIDTokenClaims), so a deceptive entry with top-level account_id A but a JWT claim B is
+// caught as a conflict instead of silently trusting A and mixing A's metadata with B's token.
+// An id_token that is present but cannot be parsed leaves the identity INDETERMINATE, so it
+// fails closed (returns a conflict) rather than trusting the un-cross-checked top-level value.
+func keeperExplicitAccountID(o map[string]any) (string, error) {
+	top, err := keeperExplicitStringField(o, "account_id")
+	if err != nil {
+		return "", err
+	}
+	candidates := []string{top}
+	if raw, present := o["id_token"]; present && raw != nil {
+		claims := keeperIDTokenClaims(raw)
+		if claims == nil {
+			return "", errKeeperIdentityConflict
+		}
+		ids, err := keeperClaimsAccountIDs(claims)
+		if err != nil {
+			return "", err
+		}
+		candidates = append(candidates, ids...)
+	}
+	return keeperConsistentValue(candidates...)
+}
+
+// consumeKeeperResetCredit redeems one reset credit for the given auth through
+// the per-auth api-call egress (CLIProxyAPI injects the account's $TOKEN$ by
+// auth_index). redeemID is the caller-owned idempotency key (from the redeem
+// ledger); it is passed through so keeperRequest's internal retries AND a later
+// reuse of a pending id both carry the same key, and OpenAI dedups — a lost
+// response can never double-consume.
+//
+// It returns (terminalCode, err). A 2xx inner status alone is NOT proof of a
+// redemption: the inner body's `code` decides, and only a recognized terminal
+// code is returned. `reset` / `already_redeemed` mean a credit was redeemed;
+// `no_credit` / `nothing_to_reset` mean nothing was redeemed (the caller still
+// clears the cooldown). Any transport error, non-2xx outer status, unparseable
+// body, non-ok inner status, or unrecognized code is an UNKNOWN outcome → returns
+// ("", err), fails closed, and (per the ledger) keeps the redeem pending for an
+// idempotent retry. No external body — not even truncated — is ever logged; the
+// audit trail carries only a stable reason plus whitelisted inner status_code /
+// recognized code.
+func (a *App) consumeKeeperResetCredit(ctx context.Context, cfg AppConfig, authName, authIndex string, detail map[string]any, redeemID string) (string, error) {
+	header := map[string]string{
+		"Authorization": "Bearer $TOKEN$",
+		"Content-Type":  "application/json",
+		"User-Agent":    "codex_cli_rs/0.76.0 (Debian 13.0.0; x86_64) WindowsTerminal",
+	}
+	if accountID := keeperString(detail["account_id"]); accountID != "" {
+		header["Chatgpt-Account-Id"] = accountID
+	}
+	body := map[string]any{
+		"auth_index": authIndex,
+		"method":     "POST",
+		"url":        keeperResetCreditsConsumeURL,
+		"header":     header,
+		"data":       fmt.Sprintf(`{"redeem_request_id":%q}`, redeemID),
+	}
+	response, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/api-call", nil, body, time.Duration(cfg.CodexKeeper.UsageTimeoutSeconds)*time.Second)
+	if err != nil {
+		a.auditKeeperOp("reset-consume", authName, "result", "error", "reason", "transport_error")
+		return "", validationError("核销主动重置额度失败：网络异常，未确认是否已核销")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		a.auditKeeperOp("reset-consume", authName, "result", "error", "reason", "management_status", "http_status", response.StatusCode)
+		return "", validationError("核销主动重置额度失败：管理接口异常")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(payload, &raw); err != nil {
+		a.auditKeeperOp("reset-consume", authName, "result", "error", "reason", "invalid_response")
+		return "", validationError("核销主动重置额度失败：响应无效")
+	}
+	innerStatus := keeperInnerStatusCode(raw)
+	if !keeperInnerStatusOK(raw) {
+		a.auditKeeperOp("reset-consume", authName, "result", "error", "reason", "inner_status", "status_code", innerStatus)
+		return "", validationError("核销主动重置额度失败：OpenAI 拒绝核销")
+	}
+	switch code := keeperString(keeperBodyJSON(raw["body"])["code"]); code {
+	case keeperResetCreditCodeReset, keeperResetCreditCodeAlreadyRedeemed, keeperResetCreditCodeNoCredit, keeperResetCreditCodeNothingToReset:
+		a.auditKeeperOp("reset-consume", authName, "result", "ok", "code", code, "status_code", innerStatus)
+		return code, nil
+	default:
+		// Do NOT echo the untrusted code value; log only the stable classification.
+		a.auditKeeperOp("reset-consume", authName, "result", "error", "reason", "unknown_code", "status_code", innerStatus)
+		return "", validationError("核销主动重置额度失败：响应状态未知")
+	}
+}
+
+// keeperInnerStatusCode returns the api-call wrapper's inner status as an int, or
+// -1 when absent/malformed. It is used only for whitelisted audit fields.
+func keeperInnerStatusCode(raw map[string]any) int {
+	value, present := raw["status_code"]
+	if !present {
+		value = raw["statusCode"]
+	}
+	if status, ok := keeperStrictNonNegInt(value); ok {
+		return status
+	}
+	return -1
+}
+
+// lookupPendingKeeperRedeem returns the pending redeem_request_id for the OpenAI account
+// accountID, if any. The ledger is keyed by the STABLE account_id (the resource identity),
+// NOT by auth_name/auth_index (routing selectors that change on file rename/move/reorder),
+// so a lost-response pending is still found after the account is re-routed. It is a pure
+// read: it does NOT depend on the fresh credit count, so a pending can be replayed even
+// when the count endpoint is temporarily unavailable. The money-critical caller (reset) MUST
+// hold the per-account_id fence — the mutex that serializes same-account consume across
+// different files/routes — around the lookup→consume→finish window (reset also holds the
+// per-auth_name lock, but that is per-file and does not by itself serialize two files of the
+// same account).
+func (a *App) lookupPendingKeeperRedeem(ctx context.Context, accountID string) (redeemID string, ok bool, err error) {
+	var id, status string
+	qerr := a.db.QueryRowContext(ctx, `SELECT redeem_request_id, status FROM codex_keeper_reset_redeems WHERE account_id = ?`, accountID).Scan(&id, &status)
+	if qerr != nil && !errors.Is(qerr, sql.ErrNoRows) {
+		return "", false, qerr
+	}
+	if qerr == nil && status == keeperRedeemStatusPending && strings.TrimSpace(id) != "" {
+		return id, true, nil
+	}
+	return "", false, nil
+}
+
+// createKeeperRedeem atomically claims a fresh pending redeem_request_id for the OpenAI
+// account accountID and returns the WINNING row's id. Keyed by account_id, the same
+// account converges on ONE key however it is routed (auth_name/auth_index may change). The
+// upsert overwrites only this account's own non-pending (terminal) row; a concurrent
+// pending row for the same account is left untouched, so two claimers (e.g. blue/green
+// instances sharing the DB) converge on ONE request_id. SQLite serializes the writes, so
+// the second upsert observes the first's committed row; within one instance the money-critical
+// caller's per-account_id fence serializes same-account callers across different files/routes
+// (the per-auth_name lock is per-file and does not, on its own, serialize two files that
+// resolve to the same account).
+//
+// This HARDENS the concurrent-overlap window but is NOT a full cross-process operation
+// lease: if one instance finalizes a redeem (terminal row) and a second, delayed request
+// then claims, it legitimately starts a NEW operation. CPA-Helper's contract is a SINGLE
+// ACTIVE INSTANCE on single-writer SQLite (no overlapping ingress during a blue/green
+// swap); true cross-process single-operation idempotency would need a client-supplied
+// idempotency key spanning the HTTP request, out of scope for this single-admin backend.
+func (a *App) createKeeperRedeem(ctx context.Context, accountID string) (string, error) {
+	newID := uuid.NewString()
 	now := dbTime(time.Now())
 	if _, err := a.db.ExecContext(ctx, `
-		INSERT INTO codex_keeper_quota_resets (auth_name, reset_count, last_reset_at)
-		VALUES (?, 1, ?)
-		ON CONFLICT(auth_name) DO UPDATE SET
-			reset_count = codex_keeper_quota_resets.reset_count + 1,
-			last_reset_at = excluded.last_reset_at
-	`, authName, now); err != nil {
-		return keeperQuotaResetResult{}, err
+		INSERT INTO codex_keeper_reset_redeems (account_id, redeem_request_id, status, updated_at)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(account_id) DO UPDATE SET
+			redeem_request_id = excluded.redeem_request_id,
+			status = excluded.status,
+			updated_at = excluded.updated_at
+		WHERE codex_keeper_reset_redeems.status != ?
+	`, accountID, newID, keeperRedeemStatusPending, now, keeperRedeemStatusPending); err != nil {
+		return "", err
 	}
-	var count int
-	var lastAt sql.NullString
-	if err := a.db.QueryRowContext(ctx, `SELECT reset_count, CAST(last_reset_at AS TEXT) FROM codex_keeper_quota_resets WHERE auth_name = ?`, authName).Scan(&count, &lastAt); err != nil {
-		return keeperQuotaResetResult{}, err
+	// Read this account's winning row. It must now be pending — either ours (INSERT /
+	// terminal-overwrite won) or a concurrent claimer's (preserved by the guard). Anything
+	// else is a lost race we must not consume against.
+	var id, status string
+	if err := a.db.QueryRowContext(ctx, `SELECT redeem_request_id, status FROM codex_keeper_reset_redeems WHERE account_id = ?`, accountID).Scan(&id, &status); err != nil {
+		return "", err
 	}
-	a.auditKeeperOp("reset-quota", authName, "result", "ok", "reset_count", count, "auth_index", authIndex)
-	return keeperQuotaResetResult{
-		Name:             authName,
-		QuotaResetCount:  count,
-		LastQuotaResetAt: apiDateTimePtr(timePtr(lastAt)),
-	}, nil
+	if status != keeperRedeemStatusPending || strings.TrimSpace(id) == "" {
+		return "", validationError("重置额度核销状态异常，请稍后重试")
+	}
+	return id, nil
+}
+
+// finishKeeperRedeem records the terminal code for a resolved redeem (by account_id) so the
+// next reset mints a fresh redeem_request_id. It only updates the row when the stored
+// request_id still matches, so a concurrent fresh redeem is never clobbered.
+func (a *App) finishKeeperRedeem(ctx context.Context, accountID, redeemID, code string) error {
+	now := dbTime(time.Now())
+	_, err := a.db.ExecContext(ctx, `
+		UPDATE codex_keeper_reset_redeems SET status = ?, updated_at = ?
+		WHERE account_id = ? AND redeem_request_id = ?
+	`, code, now, accountID, redeemID)
+	return err
 }
 
 func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[string]bool) (int, error) {
@@ -3453,29 +4204,42 @@ func (a *App) pruneKeeperMissingAuthStates(ctx context.Context, remoteNames map[
 	if len(stale) == 0 {
 		return 0, nil
 	}
-	tx, err := a.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
+	// Prune deletes only the state row for accounts absent remotely; it never touches the
+	// account_id-keyed redeem ledger, so a stale/transient-empty remote list can no longer
+	// drop an in-flight idempotency key. It still takes the per-auth lock (skip a stale
+	// name a reset currently holds) so the state row is not removed mid-reset, and skips
+	// the whole pass when there is no runner.
+	if a.keeper == nil {
+		return 0, nil
 	}
-	defer tx.Rollback()
-	stmt, err := tx.PrepareContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`)
-	if err != nil {
-		return 0, err
-	}
-	defer stmt.Close()
 	pruned := 0
 	for _, name := range stale {
-		result, err := stmt.ExecContext(ctx, name)
-		if err != nil {
-			return 0, err
+		if !a.keeper.tryLockAuthName("prune", name) {
+			continue
 		}
-		affected, _ := result.RowsAffected()
-		pruned += int(affected)
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
+		affected, derr := a.deleteKeeperStateRow(ctx, name)
+		a.keeper.unlockAuthName(name)
+		if derr != nil {
+			return pruned, derr
+		}
+		pruned += affected
 	}
 	return pruned, nil
+}
+
+// deleteKeeperStateRow removes an account's state row, returning the number of rows
+// deleted. It deliberately does NOT touch the redeem ledger: that ledger is keyed by the
+// stable account_id, not by the auth_name/file, so deleting or pruning a file must not
+// drop the account's in-flight idempotency key — if the account is re-imported (any
+// filename) the pending redeem is still replayed. Callers needing the per-auth fence hold
+// it around this call.
+func (a *App) deleteKeeperStateRow(ctx context.Context, authName string) (int, error) {
+	res, err := a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName)
+	if err != nil {
+		return 0, err
+	}
+	affected, _ := res.RowsAffected()
+	return int(affected), nil
 }
 
 func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState, error) {
@@ -3484,7 +4248,7 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
-		       reset_credit_count, CAST(reset_credits AS TEXT)
+		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT)
 		FROM codex_keeper_auth_states WHERE auth_name = ?
 	`, name)
 	if err != nil {
@@ -3503,13 +4267,13 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
-	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits sql.NullString
+	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits, subscriptionActiveUntil, accountID sql.NullString
 	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority, resetCreditCount sql.NullInt64
 	err := scanner.Scan(
 		&state.Name, &email, &authIndex, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
 		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
-		&createdAt, &updatedAt, &resetCreditCount, &resetCredits,
+		&createdAt, &updatedAt, &resetCreditCount, &resetCredits, &subscriptionActiveUntil, &accountID,
 	)
 	if err != nil {
 		return keeperAuthState{}, err
@@ -3533,6 +4297,8 @@ func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthSt
 	state.RestorePriority = nullableInt(restorePriority)
 	state.ResetCreditCount = nullableInt(resetCreditCount)
 	state.ResetCredits = parseStoredKeeperResetCredits(resetCredits)
+	state.SubscriptionActiveUntil = timePtr(subscriptionActiveUntil)
+	state.AccountID = nullableString(accountID)
 	if parsed, ok := parseDBTime(createdAt.String); ok {
 		state.CreatedAt = parsed
 	}
@@ -3554,10 +4320,13 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			auth_name, email, auth_index, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
-			reset_credit_count, reset_credits,
+			reset_credit_count, reset_credits, subscription_active_until, account_id,
 			last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
+			-- Track the current account identity, keeping the old value only on a
+			-- fetch where no account_id was observed.
+			account_id = COALESCE(excluded.account_id, codex_keeper_auth_states.account_id),
 			email = excluded.email,
 			auth_index = excluded.auth_index,
 			account_type = excluded.account_type,
@@ -3578,27 +4347,67 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			secondary_reset_at = excluded.secondary_reset_at,
 			primary_window_seconds = excluded.primary_window_seconds,
 			secondary_window_seconds = excluded.secondary_window_seconds,
-			-- Preserve-on-failed-fetch, scoped to auth identity. The snapshot is kept
-			-- (COALESCE) when the incoming auth_index is NULL (identity unknown — e.g.
-			-- a transient auth-file read failure on the same account must not drop the
-			-- schedule) OR still matches the stored one. Only a KNOWN, DIFFERENT
-			-- incoming auth_index (a genuine reassignment of auth_name to another
-			-- account) falls to ELSE and writes the incoming value, clearing the old
-			-- account's stale credits so they never surface on the new identity's row.
+			-- Preserve-on-failed-fetch, scoped to ACCOUNT identity (account_id) — CPA's file
+			-- auth_index is a hash of provider+path and stays the same when a filename is
+			-- swapped to a different account, so auth_index alone can't detect a swap:
+			--   1. identity unconfirmed (auth_index NULL, detail read failed) → preserve.
+			--   2. confirmed account SWAP (both account_ids known and DIFFERENT) → write the
+			--      incoming value, clearing the old account's stale credits (a failed fetch
+			--      writes NULL rather than inheriting the previous account's count/schedule).
+			--   3. same/undeterminable account → COALESCE: write a fresh fetch, else preserve.
 			reset_credit_count = CASE
-				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
-					THEN COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
-				ELSE excluded.reset_credit_count
+				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credit_count
+				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
+					AND codex_keeper_auth_states.account_id <> excluded.account_id
+					THEN excluded.reset_credit_count
+				ELSE COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
 			END,
 			reset_credits = CASE
-				WHEN excluded.auth_index IS NULL OR codex_keeper_auth_states.auth_index = excluded.auth_index
-					THEN COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
-				ELSE excluded.reset_credits
+				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credits
+				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
+					AND codex_keeper_auth_states.account_id <> excluded.account_id
+					THEN excluded.reset_credits
+				ELSE COALESCE(excluded.reset_credits, codex_keeper_auth_states.reset_credits)
+			END,
+			-- Tri-state, scoped to ACCOUNT identity (account_id), because CPA's file
+			-- auth_index is a hash of provider+path and stays the same when a filename is
+			-- swapped to a different OpenAI account:
+			--   1. known claim + confirmed identity (auth_index present) → write authoritatively.
+			--   2. identity unconfirmed this inspection (auth_index NULL, detail read failed)
+			--      → preserve the previous snapshot (transient failure, not a change).
+			--   3. confirmed account SWAP (both account_ids known and DIFFERENT) → write the
+			--      incoming value so the new account never inherits the old renewal date.
+			--   4. otherwise (same/undeterminable account) → preserve on an unknown claim.
+			subscription_active_until = CASE
+				WHEN ? AND excluded.auth_index IS NOT NULL THEN excluded.subscription_active_until
+				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.subscription_active_until
+				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
+					AND codex_keeper_auth_states.account_id <> excluded.account_id
+					THEN excluded.subscription_active_until
+				ELSE COALESCE(excluded.subscription_active_until, codex_keeper_auth_states.subscription_active_until)
 			END,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, checkedAt, lastHealthy, now, now, result.ClearRestorePriority)
+	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, dbTimePtr(result.SubscriptionActiveUntil), result.AccountID, checkedAt, lastHealthy, now, now, result.ClearRestorePriority, boolValue(&result.SubscriptionKnown))
+	return err
+}
+
+// markKeeperIdentityError records an identity-conflict inspection outcome WITHOUT touching
+// any business column. A list/detail identity conflict means the merged detail mixes two
+// accounts, so the incoming email/auth_index/account_id/account_type/disabled/priority/usage/
+// quota/reset-credit/subscription values are untrustworthy; the prior snapshot is authoritative
+// and must survive intact (a cleared auth_index would also block a later reset). This only
+// stamps last_error/latest_action and the check time. It deliberately does NOT set
+// last_healthy_at (an identity conflict is never a healthy refresh) and does NOT INSERT: if no
+// row exists yet it touches zero rows rather than persisting a partial/ambiguous identity.
+func (a *App) markKeeperIdentityError(ctx context.Context, authName string, message *string, checkedAt time.Time) error {
+	now := dbTime(time.Now())
+	_, err := a.db.ExecContext(ctx, `
+		UPDATE codex_keeper_auth_states
+		SET last_error = ?, latest_action = ?, last_checked_at = ?, updated_at = ?
+		WHERE auth_name = ?
+	`, message, message, dbTime(checkedAt), now, authName)
 	return err
 }
 
@@ -3607,6 +4416,18 @@ func (a *App) setKeeperAccountDisabled(ctx context.Context, authName string, dis
 	if err != nil {
 		return err
 	}
+	// Share the per-auth fence: an enable/disable must not change the remote credential
+	// or DB identity while a reset holds the lock mid-consume (it would drift the row the
+	// consume/cooldown is bound to). This is handler-only; processKeeperAuth uses the
+	// lock-free setKeeperRemoteDisabled helper, so there is no self-conflict.
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全操作")
+	}
+	if !a.keeper.tryLockAuthName("toggle", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
@@ -3647,6 +4468,19 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err != nil {
 		return err
 	}
+	// Delete shares the per-auth fence with reset/inspection so it never removes the state
+	// row while a reset holds the lock mid-consume. It does NOT touch the redeem ledger:
+	// that ledger is keyed by the stable account_id, so deleting the file cannot drop the
+	// account's in-flight key (a re-import under any filename still replays it). Fail closed
+	// if the runner is missing.
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全删除")
+	}
+	if !a.keeper.tryLockAuthName("delete", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
@@ -3657,7 +4491,7 @@ func (a *App) deleteKeeperAccount(ctx context.Context, authName string) error {
 	if err := a.deleteKeeperRemoteAuthFile(ctx, cfg, authName); err != nil {
 		return err
 	}
-	if _, err = a.db.ExecContext(ctx, `DELETE FROM codex_keeper_auth_states WHERE auth_name = ?`, authName); err != nil {
+	if _, err := a.deleteKeeperStateRow(ctx, authName); err != nil {
 		return err
 	}
 	a.auditKeeperOp("delete", authName, "result", "ok")
@@ -3692,6 +4526,16 @@ func (a *App) updateKeeperAccountPriority(ctx context.Context, authName string, 
 	if err != nil {
 		return err
 	}
+	// Share the per-auth fence (handler-only; processKeeperAuth uses the lock-free
+	// setKeeperRemotePriority helper, so no self-conflict).
+	if a.keeper == nil {
+		return validationError("Keeper 未初始化，无法安全操作")
+	}
+	if !a.keeper.tryLockAuthName("priority", authName) {
+		return conflictError("账号正在巡检或重置中，请稍后重试")
+	}
+	defer a.keeper.unlockAuthName(authName)
+
 	state, err := a.getKeeperState(ctx, authName)
 	if err != nil {
 		return err
@@ -3980,6 +4824,32 @@ func keeperIDTokenPlanValues(value any) []string {
 		}
 	}
 	return values
+}
+
+// keeperClaimsAccountIDs pulls chatgpt_account_id from id_token claims, from BOTH the top
+// level and the OpenAI auth namespace claim (https://api.openai.com/auth) where OpenAI's real
+// id_token nests it. Both are returned so keeperConsistentValue validates they agree with each
+// other and with the object's top-level account_id — any disagreement is an identity conflict.
+// A present-but-wrong-type claim (a non-string account id, or a namespace that is present but
+// not an object) is illegal and fails closed rather than being silently ignored.
+func keeperClaimsAccountIDs(claims map[string]any) ([]string, error) {
+	top, err := keeperExplicitStringField(claims, "chatgpt_account_id")
+	if err != nil {
+		return nil, err
+	}
+	ids := []string{top}
+	if ns, present := claims["https://api.openai.com/auth"]; present && ns != nil {
+		auth, ok := ns.(map[string]any)
+		if !ok {
+			return nil, errKeeperIdentityConflict
+		}
+		nested, err := keeperExplicitStringField(auth, "chatgpt_account_id")
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, nested)
+	}
+	return ids, nil
 }
 
 func keeperIDTokenClaims(value any) map[string]any {

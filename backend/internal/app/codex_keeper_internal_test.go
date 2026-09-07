@@ -2263,8 +2263,8 @@ func keeperWebsocketUsageSuccessPayload(usedPercent int) map[string]any {
 // resetCreditSnapshotJSON is a single valid projected reset credit for identity tests.
 const resetCreditSnapshotJSON = `[{"id":"c1","reset_type":"codex_rate_limits","status":"available","granted_at":"2026-08-22T00:08:46.146320Z","expires_at":"2026-09-21T00:08:46.146320Z"}]`
 
-func healthyResetResult(name, authIndex string, count *int, credits *string) keeperAccountResult {
-	return keeperAccountResult{
+func healthyResetResult(name, authIndex, accountID string, count *int, credits *string) keeperAccountResult {
+	r := keeperAccountResult{
 		Name:             name,
 		Result:           "healthy",
 		AuthIndex:        stringPtr(authIndex),
@@ -2272,13 +2272,17 @@ func healthyResetResult(name, authIndex string, count *int, credits *string) kee
 		ResetCreditCount: count,
 		ResetCredits:     credits,
 	}
+	if accountID != "" {
+		r.AccountID = stringPtr(accountID)
+	}
+	return r
 }
 
 // TestUpsertKeeperStateClearsResetCreditsOnIdentityChange pins the identity
-// boundary: when an auth_name is reassigned a new auth_index and the new account's
-// reset-credit fetch fails (nil count/credits), the previous identity's snapshot
-// must NOT be preserved by COALESCE — it must be cleared so the wrong account's
-// schedule never surfaces on the new index's row.
+// boundary: when an auth_name is rebound to a different ACCOUNT (a new account_id)
+// and the new account's reset-credit fetch fails (nil count/credits), the previous
+// account's snapshot must NOT be preserved by COALESCE — it must be cleared so the
+// wrong account's schedule never surfaces on the new identity's row.
 func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -2290,7 +2294,7 @@ func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 
 	// idx-1 inspects healthy with a populated reset-credit snapshot.
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert idx-1: %v", err)
 	}
 	state, err := app.getKeeperState(ctx, "reused.json")
@@ -2302,7 +2306,7 @@ func TestUpsertKeeperStateClearsResetCreditsOnIdentityChange(t *testing.T) {
 	}
 
 	// Same auth_name reassigned to idx-2; the new identity's fetch failed (nil).
-	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-2", nil, nil)); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("reused.json", "idx-2", "acct-2", nil, nil)); err != nil {
 		t.Fatalf("upsert idx-2: %v", err)
 	}
 	state, err = app.getKeeperState(ctx, "reused.json")
@@ -2333,11 +2337,11 @@ func TestUpsertKeeperStatePreservesResetCreditsOnSameIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert first: %v", err)
 	}
 	// Same identity, failed fetch (nil count/credits).
-	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", nil, nil)); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("stable.json", "idx-1", "acct-1", nil, nil)); err != nil {
 		t.Fatalf("upsert second: %v", err)
 	}
 	state, err := app.getKeeperState(ctx, "stable.json")
@@ -2365,7 +2369,7 @@ func TestUpsertKeeperStatePreservesResetCreditsOnUnknownIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	two := 2
-	if err := app.upsertKeeperState(ctx, healthyResetResult("same.json", "idx-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
+	if err := app.upsertKeeperState(ctx, healthyResetResult("same.json", "idx-1", "acct-1", &two, stringPtr(resetCreditSnapshotJSON))); err != nil {
 		t.Fatalf("upsert idx-1: %v", err)
 	}
 	// A transport/404 failure on the auth-file read: nil AuthIndex, network_error.
@@ -2650,10 +2654,10 @@ func TestKeeperResetCreditsFetchFailureFlagged(t *testing.T) {
 // (e.g. ResetCreditsUnavailable) is not silently dropped by the generalized
 // aggregation. Every field is given a distinct value and must sum.
 func TestKeeperStatsAddSumsEveryField(t *testing.T) {
-	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, ResetCreditsUnavailable: 9, StateWriteError: 11}
-	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, ResetCreditsUnavailable: 90, StateWriteError: 110}
+	base := keeperStats{Total: 1, Healthy: 2, StatusDisabled: 3, StatusEnabled: 4, PriorityDegraded: 5, PriorityRestored: 6, Skipped: 7, NetworkError: 8, IdentityError: 12, ResetCreditsUnavailable: 9, StateWriteError: 11}
+	delta := keeperStats{Total: 10, Healthy: 20, StatusDisabled: 30, StatusEnabled: 40, PriorityDegraded: 50, PriorityRestored: 60, Skipped: 70, NetworkError: 80, IdentityError: 120, ResetCreditsUnavailable: 90, StateWriteError: 110}
 	base.add(delta)
-	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, ResetCreditsUnavailable: 99, StateWriteError: 121}
+	want := keeperStats{Total: 11, Healthy: 22, StatusDisabled: 33, StatusEnabled: 44, PriorityDegraded: 55, PriorityRestored: 66, Skipped: 77, NetworkError: 88, IdentityError: 132, ResetCreditsUnavailable: 99, StateWriteError: 121}
 	if base != want {
 		t.Fatalf("add sum = %+v, want %+v", base, want)
 	}
@@ -2764,5 +2768,938 @@ func TestKeeperResetInspectStateWriteFailure(t *testing.T) {
 	}
 	if !sawMarker {
 		t.Fatal("expected a stable state_write_error marker in the Keeper log")
+	}
+}
+
+// TestKeeperSubscriptionActiveUntil pins the tri-state contract: a parsed value
+// is known, a confirmed-absent claim is known-and-nil (clears the stored value),
+// and an unreadable/malformed claim is unknown (preserves the stored value).
+func TestKeeperSubscriptionActiveUntil(t *testing.T) {
+	idToken := func(m map[string]any) map[string]any {
+		return map[string]any{"id_token": m}
+	}
+	want := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name      string
+		authInfo  map[string]any
+		wantTime  *time.Time
+		wantKnown bool
+	}{
+		{"unix-seconds", idToken(map[string]any{"chatgpt_subscription_active_until": float64(want.Unix())}), &want, true},
+		{"rfc3339", idToken(map[string]any{"chatgpt_subscription_active_until": "2026-10-01T00:00:00Z"}), &want, true},
+		{"date-only", idToken(map[string]any{"chatgpt_subscription_active_until": "2026-10-01"}), &want, true},
+		{"unix-string", idToken(map[string]any{"chatgpt_subscription_active_until": "1790812800"}), &want, true},
+		// Confirmed absent: id_token readable but no claim -> known, nil (clear).
+		{"claim-absent", idToken(map[string]any{"plan_type": "pro"}), nil, true},
+		{"claim-null", idToken(map[string]any{"chatgpt_subscription_active_until": nil}), nil, true},
+		// Unknown: unreadable id_token or malformed claim -> preserve.
+		{"no-id-token", map[string]any{"name": "x"}, nil, false},
+		{"id-token-not-map", map[string]any{"id_token": "raw.jwt.string"}, nil, false},
+		{"empty-string", idToken(map[string]any{"chatgpt_subscription_active_until": ""}), nil, false},
+		{"non-positive", idToken(map[string]any{"chatgpt_subscription_active_until": float64(0)}), nil, false},
+		{"garbage-string", idToken(map[string]any{"chatgpt_subscription_active_until": "not-a-time"}), nil, false},
+		{"wrong-type", idToken(map[string]any{"chatgpt_subscription_active_until": true}), nil, false},
+		// Strict numeric: fractional, non-finite, and out-of-range epochs are rejected.
+		{"fractional", idToken(map[string]any{"chatgpt_subscription_active_until": float64(want.Unix()) + 0.5}), nil, false},
+		{"nan", idToken(map[string]any{"chatgpt_subscription_active_until": math.NaN()}), nil, false},
+		{"positive-inf", idToken(map[string]any{"chatgpt_subscription_active_until": math.Inf(1)}), nil, false},
+		{"negative-inf", idToken(map[string]any{"chatgpt_subscription_active_until": math.Inf(-1)}), nil, false},
+		{"below-range", idToken(map[string]any{"chatgpt_subscription_active_until": float64(100)}), nil, false},        // ~1970
+		{"above-range", idToken(map[string]any{"chatgpt_subscription_active_until": float64(5000000000)}), nil, false}, // ~2128
+		{"max-int64", idToken(map[string]any{"chatgpt_subscription_active_until": float64(math.MaxInt64)}), nil, false},
+		{"negative", idToken(map[string]any{"chatgpt_subscription_active_until": float64(-1)}), nil, false},
+		{"fractional-explicit", idToken(map[string]any{"chatgpt_subscription_active_until": float64(1700000000.5)}), nil, false},
+		{"unix-string-out-of-range", idToken(map[string]any{"chatgpt_subscription_active_until": "100"}), nil, false},
+		// String date forms are range-gated too, not just the numeric path.
+		{"rfc3339-year-0001", idToken(map[string]any{"chatgpt_subscription_active_until": "0001-01-01T00:00:00Z"}), nil, false},
+		{"rfc3339-year-9999", idToken(map[string]any{"chatgpt_subscription_active_until": "9999-12-31T23:59:59Z"}), nil, false},
+		{"date-year-1000", idToken(map[string]any{"chatgpt_subscription_active_until": "1000-01-01"}), nil, false},
+		{"date-year-2500", idToken(map[string]any{"chatgpt_subscription_active_until": "2500-01-01"}), nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, known := keeperSubscriptionActiveUntil(tc.authInfo)
+			if known != tc.wantKnown {
+				t.Fatalf("known = %v, want %v", known, tc.wantKnown)
+			}
+			switch {
+			case tc.wantTime == nil && got != nil:
+				t.Fatalf("time = %v, want nil", got)
+			case tc.wantTime != nil && (got == nil || !got.Equal(*tc.wantTime)):
+				t.Fatalf("time = %v, want %v", got, tc.wantTime)
+			}
+		})
+	}
+}
+
+// TestUpsertSubscriptionPreservedWhenIdentityUnconfirmed proves the subscription write is
+// gated on a confirmed identity: a later inspection whose detail read failed (AuthIndex
+// nil) must NOT overwrite/clear the stored renewal time even though SubscriptionKnown was
+// set early from the list claim.
+func TestUpsertSubscriptionPreservedWhenIdentityUnconfirmed(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-sub"
+	known := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	// A confirmed inspection stores a known subscription renewal time.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "sub.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, SubscriptionActiveUntil: &known, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	// A later inspection whose DETAIL read failed: identity is unconfirmed (AuthIndex
+	// nil) but SubscriptionKnown is still true. The stored value must be preserved.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "sub.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: nil, SubscriptionActiveUntil: nil, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+
+	st, err := app.getKeeperState(ctx, "sub.json")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(known) {
+		t.Fatalf("subscription not preserved on unconfirmed identity: got %v, want %v", st.SubscriptionActiveUntil, known)
+	}
+}
+
+// TestCreateKeeperRedeemConvergesAcrossApps proves the DB-atomic claim is truly
+// cross-process, not just in-process: two App instances with independent DB handles on
+// the SAME SQLite file concurrently claim a fresh redeem for the same identity and both
+// converge on ONE winner request_id (so OpenAI dedups a single logical key).
+func TestCreateKeeperRedeemConvergesAcrossApps(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app1, err := New()
+	if err != nil {
+		t.Fatalf("New() app1: %v", err)
+	}
+	defer app1.Close()
+	// Same data dir → same SQLite file, but a distinct *sql.DB handle (a second process).
+	app2, err := New()
+	if err != nil {
+		t.Fatalf("New() app2: %v", err)
+	}
+	defer app2.Close()
+
+	ctx := context.Background()
+	var wg sync.WaitGroup
+	ids := make([]string, 2)
+	errs := make([]error, 2)
+	apps := []*App{app1, app2}
+	wg.Add(2)
+	for i := range apps {
+		go func(i int) {
+			defer wg.Done()
+			ids[i], errs[i] = apps[i].createKeeperRedeem(ctx, "acct-shared")
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("app%d claim: %v", i+1, err)
+		}
+	}
+	if ids[0] == "" || ids[0] != ids[1] {
+		t.Fatalf("cross-process claims did not converge on one request_id: %v", ids)
+	}
+}
+
+// keeperInsertPendingRedeem seeds a pending redeem ledger row (keyed by account_id).
+func keeperInsertPendingRedeem(t *testing.T, app *App, accountID, id string) {
+	t.Helper()
+	if _, err := app.db.ExecContext(context.Background(),
+		`INSERT INTO codex_keeper_reset_redeems (account_id, redeem_request_id, status, updated_at) VALUES (?, ?, 'pending', '2026-01-01 00:00:00')`,
+		accountID, id); err != nil {
+		t.Fatalf("seed pending redeem: %v", err)
+	}
+}
+
+func keeperInsertStateRow(t *testing.T, app *App, authName string) {
+	t.Helper()
+	if err := app.upsertKeeperState(context.Background(), keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("seed state row: %v", err)
+	}
+}
+
+// TestPruneKeepsAccountLedger proves prune deletes an absent account's STATE row but never
+// touches the account_id-keyed redeem ledger, so a pending idempotency key survives a
+// transient/empty remote list and the account can replay it after re-import.
+func TestPruneKeepsAccountLedger(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	keeperInsertStateRow(t, app, "gone.json")
+	keeperInsertPendingRedeem(t, app, "acct-gone", "rid-gone")
+
+	// A transient/empty remote list marks the account stale.
+	pruned, err := app.pruneKeeperMissingAuthStates(ctx, map[string]bool{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("pruned = %d, want 1", pruned)
+	}
+	if st, _ := app.getKeeperState(ctx, "gone.json"); st != nil {
+		t.Fatal("stale account state should have been pruned")
+	}
+	// The account_id-keyed ledger row must survive the prune.
+	if id, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-gone"); !ok || id != "rid-gone" {
+		t.Fatalf("prune dropped the account's ledger key: got (%q,%v), want (rid-gone,true)", id, ok)
+	}
+}
+
+// TestPruneFailsClosedWithoutRunner proves prune deletes nothing when there is no runner
+// (no per-auth fence), rather than proceeding unlocked.
+func TestPruneFailsClosedWithoutRunner(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	keeperInsertStateRow(t, app, "orphan.json")
+	app.keeper = nil // simulate a maintenance/test variant without a runner
+
+	pruned, err := app.pruneKeeperMissingAuthStates(ctx, map[string]bool{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("prune without a runner deleted %d rows; must fail closed", pruned)
+	}
+	if st, _ := app.getKeeperState(ctx, "orphan.json"); st == nil {
+		t.Fatal("prune without a fence deleted state; must skip")
+	}
+}
+
+// TestDeleteStateRowKeepsLedger proves deleting a file's state row never drops the
+// account_id-keyed redeem ledger, so a re-import (any filename) still replays the pending
+// key rather than minting a new one.
+func TestDeleteStateRowKeepsLedger(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	keeperInsertStateRow(t, app, "del.json")
+	keeperInsertPendingRedeem(t, app, "acct-del", "rid-del")
+
+	if _, err := app.deleteKeeperStateRow(ctx, "del.json"); err != nil {
+		t.Fatalf("delete state row: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "del.json"); st != nil {
+		t.Fatal("state row was not deleted")
+	}
+	if id, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-del"); !ok || id != "rid-del" {
+		t.Fatalf("delete dropped the account's ledger key: got (%q,%v), want (rid-del,true)", id, ok)
+	}
+}
+
+// TestUpsertSubscriptionClearedOnAccountSwapSameIndex proves the subscription snapshot is
+// scoped to the ACCOUNT, not just auth_index: when the same auth_name+auth_index is swapped
+// to a different account_id and the new claim is unknown, the previous account's renewal
+// date is NOT inherited (it is cleared); the same-account unknown case still preserves.
+func TestUpsertSubscriptionClearedOnAccountSwapSameIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-fixed"
+	acctA := "acct-A"
+	acctB := "acct-B"
+	known := time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)
+
+	// Account A stores a known renewal date.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, SubscriptionActiveUntil: &known, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+
+	// Same auth_index, same account, unknown claim → preserve.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, SubscriptionActiveUntil: nil, SubscriptionKnown: false,
+	}); err != nil {
+		t.Fatalf("same-account unknown: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "swap.json"); st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(known) {
+		t.Fatalf("same-account unknown must preserve; got %v", st.SubscriptionActiveUntil)
+	}
+
+	// Same auth_index but the file now backs a DIFFERENT account, unknown claim → clear
+	// (must not inherit A's renewal date).
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "swap.json", Result: "error", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctB, SubscriptionActiveUntil: nil, SubscriptionKnown: false,
+	}); err != nil {
+		t.Fatalf("swap unknown: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "swap.json"); st.SubscriptionActiveUntil != nil {
+		t.Fatalf("account swap must clear the inherited renewal date; got %v", st.SubscriptionActiveUntil)
+	}
+}
+
+// TestUpsertResetCreditClearedOnAccountSwapSameIndex proves the reset-credit snapshot is
+// scoped to the ACCOUNT (account_id), not just auth_index: when the same auth_name+index is
+// swapped to a different account and the new fetch failed, the old account's count/credits
+// are cleared (not inherited); the same-account failed fetch still preserves.
+func TestUpsertResetCreditClearedOnAccountSwapSameIndex(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	idx := "idx-rc"
+	acctA := "acct-A"
+	acctB := "acct-B"
+	count := 2
+	credits := `[{"id":"c1","reset_type":"codex_rate_limits","status":"available"}]`
+
+	// Account A stores a reset-credit snapshot.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, ResetCreditCount: &count, ResetCredits: &credits,
+	}); err != nil {
+		t.Fatalf("seed A: %v", err)
+	}
+
+	// Same account, fetch failed (nil snapshot) → preserve.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctA, ResetCreditCount: nil, ResetCredits: nil,
+	}); err != nil {
+		t.Fatalf("same-account failed fetch: %v", err)
+	}
+	if st, _ := app.getKeeperState(ctx, "rc.json"); st.ResetCreditCount == nil || *st.ResetCreditCount != 2 {
+		t.Fatalf("same-account failed fetch must preserve count; got %v", st.ResetCreditCount)
+	}
+
+	// Same auth_index, DIFFERENT account, fetch failed → clear (do not inherit).
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "rc.json", Result: "healthy", CheckedAt: time.Now(),
+		AuthIndex: &idx, AccountID: &acctB, ResetCreditCount: nil, ResetCredits: nil,
+	}); err != nil {
+		t.Fatalf("swap failed fetch: %v", err)
+	}
+	st, _ := app.getKeeperState(ctx, "rc.json")
+	if st.ResetCreditCount != nil {
+		t.Fatalf("account swap must clear the inherited reset-credit count; got %v", *st.ResetCreditCount)
+	}
+	if len(st.ResetCredits) != 0 {
+		t.Fatalf("account swap must clear the inherited reset-credit list; got %v", st.ResetCredits)
+	}
+}
+
+// TestKeeperReconcileInspectionAccountID pins the cross-source identity reconciliation:
+// the list id_token.chatgpt_account_id and the download account_id must AGREE (or only one
+// present) to be trusted; a conflict — or a single source that is self-contradictory —
+// yields (·, false) so the caller treats the identity as unknown.
+func TestKeeperReconcileInspectionIdentity(t *testing.T) {
+	idTokenAcct := func(id string) map[string]any {
+		return map[string]any{"id_token": map[string]any{"chatgpt_account_id": id}}
+	}
+	cases := []struct {
+		name     string
+		authInfo map[string]any
+		detail   map[string]any
+		wantID   string
+		wantOK   bool
+	}{
+		{"agree", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-A"}, "acct-A", true},
+		{"list-only", idTokenAcct("acct-A"), map[string]any{}, "acct-A", true},
+		{"detail-only", map[string]any{}, map[string]any{"account_id": "acct-B"}, "acct-B", true},
+		{"neither", map[string]any{}, map[string]any{}, "", true},
+		{"account-conflict", idTokenAcct("acct-A"), map[string]any{"account_id": "acct-B"}, "", false},
+		// A single source self-contradicting (top-level vs id_token claim) is also untrusted.
+		{"detail-self-conflict", map[string]any{}, map[string]any{"account_id": "acct-B", "id_token": map[string]any{"chatgpt_account_id": "acct-C"}}, "", false},
+		// auth_index conflict alone (accounts agree) is also untrusted.
+		{"authindex-conflict", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-B", "account_id": "acct-A"}, "", false},
+		// account AND auth_index agree.
+		{"both-agree", map[string]any{"auth_index": "idx-A", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"auth_index": "idx-A", "account_id": "acct-A"}, "acct-A", true},
+		// A raw JWT id_token string (CLIProxyAPI's real download form) is decoded and its
+		// chatgpt_account_id claim cross-checked against the top-level account_id.
+		{"rawjwt-agree", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"chatgpt_account_id": "acct-A"})}, "acct-A", true},
+		// The deceptive case: top-level account_id A but a raw JWT claim B → conflict, untrusted.
+		{"rawjwt-conflict", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"chatgpt_account_id": "acct-B"})}, "", false},
+		// The claim nested under the OpenAI auth namespace is also cross-checked.
+		{"rawjwt-namespace-conflict", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})}, "", false},
+		// An id_token that is present but unparseable leaves the identity indeterminate → fail closed.
+		{"idtoken-unparseable", map[string]any{}, map[string]any{"account_id": "acct-A", "id_token": "not-a-jwt"}, "", false},
+		// A present-but-wrong-type identity alias must fail closed, not be silently ignored in
+		// favor of a differently-typed sibling.
+		{"authindex-wrong-type", map[string]any{"id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, map[string]any{"account_id": "acct-A", "auth_index": float64(123), "authIndex": "idx-A"}, "", false},
+		{"account-id-wrong-type", map[string]any{}, map[string]any{"account_id": float64(123), "id_token": map[string]any{"chatgpt_account_id": "acct-A"}}, "", false},
+		// The JWT auth namespace present but not an object is illegal.
+		{"jwt-namespace-not-object", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": "not-object"})}, "", false},
+		// The nested claim present but not a string is illegal.
+		{"jwt-nested-claim-wrong-type", map[string]any{"account_id": "acct-A"}, map[string]any{"account_id": "acct-A", "id_token": keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": float64(7)}})}, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := keeperReconcileInspectionIdentity(tc.authInfo, tc.detail)
+			if ok != tc.wantOK || got.accountID != tc.wantID {
+				t.Fatalf("reconcile = (%q,%v), want (%q,%v)", got.accountID, ok, tc.wantID, tc.wantOK)
+			}
+		})
+	}
+}
+
+// keeperTestJWT builds a raw JWT string (header.payload.sig, base64url) carrying the given
+// claims — the shape CLIProxyAPI's real download auth JSON uses for id_token, so tests can
+// exercise the raw-JWT identity cross-check. The signature is a placeholder (identity parsing
+// reads the payload, it does not verify the signature).
+func keeperTestJWT(t *testing.T, claims map[string]any) string {
+	t.Helper()
+	enc := func(v any) string {
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal jwt part: %v", err)
+		}
+		return base64.RawURLEncoding.EncodeToString(b)
+	}
+	return enc(map[string]any{"alg": "none", "typ": "JWT"}) + "." + enc(claims) + ".sig"
+}
+
+// TestKeeperLedgerPerAccountAndRouteAgnostic proves the redeem ledger keys on the stable
+// account_id: distinct accounts keep separate rows, the SAME account converges on one key
+// regardless of how it is routed (a claim reusing the same account_id returns the existing
+// pending id), and a resolved (terminal) row lets the next claim mint a fresh id.
+func TestKeeperLedgerPerAccountAndRouteAgnostic(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	// Two distinct accounts get distinct pending rows.
+	idA, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("claim A: %v", err)
+	}
+	idB, err := app.createKeeperRedeem(ctx, "acct-B")
+	if err != nil {
+		t.Fatalf("claim B: %v", err)
+	}
+	if idA == idB {
+		t.Fatalf("distinct accounts share a request_id %q; each must get its own", idA)
+	}
+
+	// The SAME account, however it is now routed, converges on its existing pending id
+	// (route-agnostic) rather than minting a new one.
+	idAAgain, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("re-claim A: %v", err)
+	}
+	if idAAgain != idA {
+		t.Fatalf("re-claim of account A minted a new id %q (want existing %q)", idAAgain, idA)
+	}
+	if got, ok, _ := app.lookupPendingKeeperRedeem(ctx, "acct-A"); !ok || got != idA {
+		t.Fatalf("account A pending lookup = (%q,%v), want (%q,true)", got, ok, idA)
+	}
+
+	// After A resolves (terminal), the next claim mints a fresh id.
+	if err := app.finishKeeperRedeem(ctx, "acct-A", idA, keeperResetCreditCodeReset); err != nil {
+		t.Fatalf("finish A: %v", err)
+	}
+	idAFresh, err := app.createKeeperRedeem(ctx, "acct-A")
+	if err != nil {
+		t.Fatalf("fresh claim A: %v", err)
+	}
+	if idAFresh == idA {
+		t.Fatalf("claim after a resolved redeem reused the terminal id %q; must mint fresh", idA)
+	}
+}
+
+// TestKeeperInspectIdentityConflictPreservesSnapshot proves an inspection whose list and
+// download identities conflict (list account_id A, detail account_id B) bails out with an
+// identity_error: it does NOT fetch the reset credits, preserves the previous snapshot, and
+// the refresh audit reports error (never a healthy/ok refresh).
+func TestKeeperInspectIdentityConflictPreservesSnapshot(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "conflict.json"
+	var mu sync.Mutex
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// List identity: account A.
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "id_token": map[string]any{"chatgpt_account_id": "acct-LIST-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Download identity: account B (conflicts with the list).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1", "account_id": "acct-DETAIL-B",
+				"email": "c@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a FULL good prior snapshot for account B: every business column set, so we can
+	// prove the identity-conflict write preserves all of them, not just reset credits.
+	idx, acctB, count := "idx-1", "acct-DETAIL-B", 5
+	email, acctType := "b@example.com", "pro"
+	prio, prim, sec, qt := 1, 40, 20, 80
+	dis := false
+	healthyAt := time.Now().Add(-time.Hour).Truncate(time.Second)
+	sub := time.Now().Add(720 * time.Hour).Truncate(time.Second)
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: healthyAt, Email: &email, AuthIndex: &idx,
+		AccountID: &acctB, AccountType: &acctType, Disabled: &dis, Priority: &prio,
+		PrimaryUsedPercent: &prim, SecondaryUsedPercent: &sec, QuotaThreshold: &qt,
+		SubscriptionActiveUntil: &sub, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	before, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("read seeded state: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	if stats.IdentityError != 1 || stats.Healthy != 0 {
+		t.Fatalf("stats = %+v, want IdentityError=1, Healthy=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "identity_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, identity_error)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times on identity conflict; must not fetch from a mixed detail", fetches)
+	}
+	// EVERY business column of the prior snapshot must survive intact — an identity
+	// conflict must not clobber email/auth_index/account_id/account_type/disabled/priority/
+	// usage/quota/reset-credit/subscription to NULL (a cleared auth_index would also block a
+	// later reset). Only last_error/latest_action/last_checked_at may change.
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.Email == nil || *st.Email != "b@example.com" || st.AuthIndex == nil || *st.AuthIndex != "idx-1" ||
+		st.AccountID == nil || *st.AccountID != "acct-DETAIL-B" || st.AccountType == nil || *st.AccountType != "pro" ||
+		st.Disabled != false || st.Priority == nil || *st.Priority != 1 {
+		t.Fatalf("identity fields not preserved on conflict: %+v", st)
+	}
+	if st.PrimaryUsedPercent == nil || *st.PrimaryUsedPercent != 40 ||
+		st.SecondaryUsedPercent == nil || *st.SecondaryUsedPercent != 20 ||
+		st.QuotaThreshold == nil || *st.QuotaThreshold != 80 {
+		t.Fatalf("usage/quota not preserved on conflict: %+v", st)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
+		t.Fatalf("reset credits not preserved on conflict: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(*before.SubscriptionActiveUntil) {
+		t.Fatalf("subscription not preserved on conflict: got=%v want=%v", st.SubscriptionActiveUntil, before.SubscriptionActiveUntil)
+	}
+	// last_healthy_at must NOT advance (a conflict is not a healthy refresh).
+	if st.LastHealthyAt == nil || before.LastHealthyAt == nil || !st.LastHealthyAt.Equal(*before.LastHealthyAt) {
+		t.Fatalf("last_healthy_at changed on conflict: got=%v want=%v", st.LastHealthyAt, before.LastHealthyAt)
+	}
+	// The error/latest_action IS updated, and the check time advances.
+	if st.LastError == nil {
+		t.Fatal("identity conflict did not record an error on the account")
+	}
+	if st.LastCheckedAt == nil || !st.LastCheckedAt.After(healthyAt) {
+		t.Fatalf("last_checked_at not advanced on conflict: got=%v seed=%v", st.LastCheckedAt, healthyAt)
+	}
+}
+
+// TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites proves that when neither the list
+// nor the download detail carries an account_id (a legacy auth_index-only credential), the
+// inspection does NOT fetch a reset-credit snapshot (it cannot attribute it to a resource) and
+// does NOT bind the list's subscription claim; it preserves the prior account-scoped snapshot
+// (reset credits, subscription, the previously-known account_id) and reports the refresh as
+// partial/reset_credits_unavailable — never a falsely-healthy ok that overwrote account state.
+func TestKeeperInspectNeitherAccountIDSkipsAccountScopedWrites(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "legacy.json"
+	// The list carries a PARSEABLE renewal claim that DIFFERS from the seeded snapshot but
+	// still no account_id — so this pins the subscription guard: with an unknown account_id
+	// the list's renewal must NOT be bound; the old snapshot value must be preserved.
+	listSub := time.Now().Add(1000 * time.Hour).UTC().Truncate(time.Second)
+	var mu sync.Mutex
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// List entry: auth_index + a subscription claim, but NO account_id (the id_token
+			// has chatgpt_subscription_active_until yet no chatgpt_account_id).
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1",
+					"id_token": map[string]any{"chatgpt_subscription_active_until": listSub.Format(time.RFC3339)}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Download detail: auth_index only, NO account_id.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1",
+				"email": "legacy@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a prior account-scoped snapshot bound to a KNOWN account_id, with reset credits
+	// and a subscription renewal date — none of which this inspection may overwrite.
+	idx, priorAcct, count := "idx-1", "acct-KNOWN-X", 5
+	sub := time.Now().Add(720 * time.Hour).Truncate(time.Second)
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &priorAcct,
+		ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+		SubscriptionActiveUntil: &sub, SubscriptionKnown: true,
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	// Usage ran (an ok-family outcome) but the reset-credit snapshot could not be refreshed,
+	// and this is never an identity/network error.
+	okFamily := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okFamily != 1 || stats.ResetCreditsUnavailable != 1 || stats.IdentityError != 0 || stats.NetworkError != 0 {
+		t.Fatalf("stats = %+v, want ok-family=1, ResetCreditsUnavailable=1, IdentityError=0, NetworkError=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "partial" || reason != "reset_credits_unavailable" {
+		t.Fatalf("audit outcome = (%q,%q), want (partial, reset_credits_unavailable)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times with no account_id; must not attribute a snapshot to an unknown resource", fetches)
+	}
+	// The prior account-scoped snapshot must survive: reset credits, subscription, AND the
+	// previously-known account_id (COALESCE preserves it when this inspection had none).
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 || len(st.ResetCredits) != 1 {
+		t.Fatalf("reset credits not preserved with unknown account_id: count=%v credits=%d", st.ResetCreditCount, len(st.ResetCredits))
+	}
+	if st.SubscriptionActiveUntil == nil || !st.SubscriptionActiveUntil.Equal(sub) {
+		t.Fatalf("subscription not preserved with unknown account_id: got=%v want=%v", st.SubscriptionActiveUntil, sub)
+	}
+	if st.SubscriptionActiveUntil.Equal(listSub) {
+		t.Fatalf("list renewal claim was bound despite unknown account_id: got=%v (list=%v)", st.SubscriptionActiveUntil, listSub)
+	}
+	if st.AccountID == nil || *st.AccountID != "acct-KNOWN-X" {
+		t.Fatalf("prior account_id not preserved with unknown inspection identity: %v", st.AccountID)
+	}
+}
+
+// TestKeeperInspectRawJWTAccountConflictPreservesSnapshot proves the inspection path also
+// catches a deceptive raw-JWT identity: the download detail has top-level account_id=A but a
+// raw JWT id_token whose account claim (nested under the OpenAI auth namespace — the real
+// on-wire location) is B. The detail is self-contradictory, so the inspection bails as
+// identity_error: NO reset-credit fetch, NO usage/credit snapshot write, the prior snapshot
+// preserved, and the refresh audited as an error.
+func TestKeeperInspectRawJWTAccountConflictPreservesSnapshot(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "jwt-conflict.json"
+	var mu sync.Mutex
+	creditFetches := 0
+	deceptiveJWT := keeperTestJWT(t, map[string]any{"https://api.openai.com/auth": map[string]any{"chatgpt_account_id": "acct-B"}})
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Top-level account_id=A, but the raw JWT's own claim is B → self-contradictory.
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": "idx-1", "account_id": "acct-A",
+				"id_token": deceptiveJWT, "email": "j@example.com", "account_type": "pro",
+				"disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL string `json:"url"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			if strings.Contains(p.URL, "rate-limit-reset-credits") {
+				mu.Lock()
+				creditFetches++
+				mu.Unlock()
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 99, "reset_after_seconds": 3600}}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed a prior snapshot with a KNOWN usage percent + reset credits to prove they survive.
+	idx, acct, count, used := "idx-1", "acct-A", 5, 42
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx, AccountID: &acct,
+		PrimaryUsedPercent: &used, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+	}); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	if stats.IdentityError != 1 || stats.Healthy != 0 {
+		t.Fatalf("stats = %+v, want IdentityError=1, Healthy=0", stats)
+	}
+	if result, reason := keeperRefreshAuditOutcome(stats, nil); result != "error" || reason != "identity_error" {
+		t.Fatalf("audit outcome = (%q,%q), want (error, identity_error)", result, reason)
+	}
+	mu.Lock()
+	fetches := creditFetches
+	mu.Unlock()
+	if fetches != 0 {
+		t.Fatalf("reset-credit fetched %d times on a raw-JWT identity conflict; must not fetch", fetches)
+	}
+	// The usage snapshot must NOT be overwritten by the deceptive inspection's fresh 99%.
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.PrimaryUsedPercent == nil || *st.PrimaryUsedPercent != 42 {
+		t.Fatalf("usage snapshot overwritten on raw-JWT conflict: got=%v want=42", st.PrimaryUsedPercent)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 5 {
+		t.Fatalf("reset credits not preserved on raw-JWT conflict: %v", st.ResetCreditCount)
+	}
+	if st.LastError == nil {
+		t.Fatal("raw-JWT identity conflict did not record an error")
+	}
+}
+
+// TestKeeperInspectListOnlyAccountIDSetsHeader proves that when the account_id is known only
+// from the LIST entry's id_token claim (the download detail is a legacy raw file with no
+// top-level account_id), the inspection still sends the Chatgpt-Account-Id header on BOTH the
+// usage and reset-credit api-call egress (attributing the request to the confirmed account),
+// AND writes the reset-credit snapshot — i.e. a known account_id never sends an account-less
+// request while writing an account-scoped snapshot.
+func TestKeeperInspectListOnlyAccountIDSetsHeader(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "list-only.json"
+	var mu sync.Mutex
+	usageHeader, creditHeader, creditRouteIndex := "", "", ""
+	creditFetches := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// account_id AND auth_index known ONLY from the list entry.
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-1", "id_token": map[string]any{"chatgpt_account_id": "acct-A"}},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			// Legacy raw detail: token only, NO top-level account_id, NO id_token, and an
+			// EXPLICIT-null auth_index (the dangerous case a right-biased merge would let
+			// overwrite the list's idx-1, then keeperAuthIndex would fall back to the name).
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "codex", "auth_index": nil,
+				"email": "a@example.com", "account_type": "pro", "disabled": false, "priority": 1, "access_token": "test-token",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			var p struct {
+				URL       string            `json:"url"`
+				AuthIndex string            `json:"auth_index"`
+				Header    map[string]string `json:"header"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&p)
+			switch {
+			case strings.Contains(p.URL, "rate-limit-reset-credits"):
+				mu.Lock()
+				creditFetches++
+				creditHeader = p.Header["Chatgpt-Account-Id"]
+				creditRouteIndex = p.AuthIndex
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"available_count": 1, "credits": []map[string]any{
+					{"id": "RateLimitResetCredit_A", "reset_type": "codex_rate_limits", "status": "available", "granted_at": "2026-08-22T00:08:46.146320Z", "expires_at": "2026-09-21T00:08:46.146320Z"},
+				}}})
+			default:
+				mu.Lock()
+				usageHeader = p.Header["Chatgpt-Account-Id"]
+				mu.Unlock()
+				_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": map[string]any{"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": 10, "reset_after_seconds": 3600}}}})
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	okFamily := stats.Healthy + stats.StatusEnabled + stats.PriorityDegraded + stats.PriorityRestored
+	if okFamily != 1 || stats.ResetCreditsUnavailable != 0 || stats.IdentityError != 0 {
+		t.Fatalf("stats = %+v, want ok-family=1, ResetCreditsUnavailable=0, IdentityError=0", stats)
+	}
+	mu.Lock()
+	uh, ch, cri, fetches := usageHeader, creditHeader, creditRouteIndex, creditFetches
+	mu.Unlock()
+	if uh != "acct-A" {
+		t.Fatalf("usage Chatgpt-Account-Id = %q, want acct-A (known from list claim)", uh)
+	}
+	if fetches != 1 || ch != "acct-A" {
+		t.Fatalf("reset-credit fetch=%d header=%q, want 1 fetch with Chatgpt-Account-Id=acct-A", fetches, ch)
+	}
+	// Routing uses the reconciled list auth_index, not the auth NAME (the detail's explicit-null
+	// auth_index must not win the merge and force a name fallback).
+	if cri != "idx-1" {
+		t.Fatalf("reset-credit routed auth_index = %q, want idx-1 (reconciled from the list, not the name)", cri)
+	}
+	// The snapshot is written and account-scoped to the confirmed account_id.
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get state: %v", err)
+	}
+	if st.AccountID == nil || *st.AccountID != "acct-A" {
+		t.Fatalf("stored account_id = %v, want acct-A", st.AccountID)
+	}
+	if st.ResetCreditCount == nil || *st.ResetCreditCount != 1 {
+		t.Fatalf("reset-credit snapshot not written: %v", st.ResetCreditCount)
+	}
+}
+
+// TestKeeperResetNullAccountRefusedUntilInspected proves a legacy pre-account_id (NULL) state
+// row cannot be reset: the account fence keys on the stored account_id and is taken before any
+// remote resolve, so an unconfirmed identity is refused (fail closed) rather than fenced on an
+// unknown key. No consume / cooldown is attempted.
+func TestKeeperResetNullAccountRefusedUntilInspected(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "legacy-null.json"
+	var mu sync.Mutex
+	remoteCalls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		remoteCalls++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		http.NotFound(w, r)
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) { cfg.CodexKeeper.DryRun = false })
+	ctx := context.Background()
+
+	// Seed a legacy NULL-account row (auth_index set, account_id NULL).
+	idx := "idx-1"
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{Name: authName, Result: "healthy", CheckedAt: time.Now(), AuthIndex: &idx}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, rerr := app.resetKeeperQuota(ctx, authName); rerr == nil {
+		t.Fatal("reset on a NULL-account row must fail closed (require inspection first)")
+	}
+	// It must fail before ANY remote resolve/consume.
+	mu.Lock()
+	defer mu.Unlock()
+	if remoteCalls != 0 {
+		t.Fatalf("reset on an unconfirmed identity made %d remote calls; must refuse before resolving", remoteCalls)
 	}
 }

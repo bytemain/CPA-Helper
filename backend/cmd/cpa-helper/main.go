@@ -39,6 +39,41 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 	case "serve":
 		return serve(ctx)
 	case "migrate":
+		// `migrate down-to <version>` rolls the schema DOWN to an allowlisted rollback
+		// target (destructive; see docs/migrations-rollback.md). Bare `migrate` runs Up.
+		// A destructive subcommand rejects unknown subcommands/flags rather than silently
+		// falling back to Up or ignoring a typo.
+		if len(args) >= 2 {
+			sub := strings.TrimSpace(args[1])
+			if sub != "down-to" {
+				printUsage(stdout)
+				return fmt.Errorf("unknown migrate subcommand %q", sub)
+			}
+			if len(args) < 3 {
+				printUsage(stdout)
+				return fmt.Errorf("migrate down-to requires a target version")
+			}
+			target, err := strconv.ParseInt(strings.TrimSpace(args[2]), 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid target version %q: %w", args[2], err)
+			}
+			allowPending := false
+			for _, extra := range args[3:] {
+				switch strings.TrimSpace(extra) {
+				case "--allow-pending":
+					allowPending = true
+				default:
+					printUsage(stdout)
+					return fmt.Errorf("unknown flag %q for migrate down-to", extra)
+				}
+			}
+			report, err := backendApp.MigrateDownTo(ctx, target, allowPending)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(stdout, "rollback completed: db=%s previous_version=%d current_version=%d target_version=%d\n", report.DBPath, report.PreviousVersion, report.CurrentVersion, report.TargetVersion)
+			return nil
+		}
 		report, err := backendApp.Migrate(ctx)
 		if err != nil {
 			return err
@@ -110,7 +145,9 @@ func printUsage(w io.Writer) {
 	fmt.Fprint(w, `Usage:
   cpa-helper            Run migrations, then start the service
   cpa-helper start      Run migrations, then start the service
-  cpa-helper migrate    Run database migrations and exit
+  cpa-helper migrate    Run database migrations (Up) and exit
+  cpa-helper migrate down-to <version>
+                        Roll the schema DOWN to an allowlisted version (destructive)
   cpa-helper serve      Start only after read-only startup checks pass
   cpa-helper doctor     Run read-only startup checks and exit
 `)
