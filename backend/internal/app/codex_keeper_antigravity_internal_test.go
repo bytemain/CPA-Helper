@@ -392,14 +392,17 @@ func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 
 	// Seed a fully-populated Codex row.
 	codex := keeperProviderCodex
-	idx, used, count, acct := "idx-1", 40, 3, "acct-A"
+	idx, used, count, acct, restore := "idx-1", 40, 3, "acct-A", 9
 	sub := timeMust(t, "2026-10-01T00:00:00Z")
 	if err := app.upsertKeeperState(ctx, keeperAccountResult{
 		Name: authName, Result: "healthy", CheckedAt: timeMust(t, "2026-09-09T00:00:00Z"), Provider: &codex,
 		AuthIndex: &idx, PrimaryUsedPercent: &used, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
-		SubscriptionActiveUntil: &sub, SubscriptionKnown: true, AccountID: &acct,
+		SubscriptionActiveUntil: &sub, SubscriptionKnown: true, AccountID: &acct, RestorePriority: &restore,
 	}); err != nil {
 		t.Fatalf("seed codex: %v", err)
+	}
+	if seeded, _ := app.getKeeperState(ctx, authName); seeded.RestorePriority == nil || *seeded.RestorePriority != 9 {
+		t.Fatalf("seed restore_priority not stored: %v", seeded.RestorePriority)
 	}
 
 	// Same filename now inspected as antigravity.
@@ -422,6 +425,9 @@ func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 	}
 	if st.PrimaryUsedPercent != nil || st.ResetCreditCount != nil || st.ResetCredits != nil || st.SubscriptionActiveUntil != nil || st.AccountID != nil {
 		t.Fatalf("codex-only fields not cleared on provider switch: %+v", st.keeperAccount)
+	}
+	if st.RestorePriority != nil {
+		t.Fatalf("codex restore_priority not cleared on provider switch: %v", st.RestorePriority)
 	}
 
 	// Switch back to codex → the antigravity quota must be cleared.

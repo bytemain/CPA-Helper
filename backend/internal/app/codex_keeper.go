@@ -4378,6 +4378,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			disabled = excluded.disabled,
 			priority = excluded.priority,
 			restore_priority = CASE
+				WHEN excluded.provider = 'antigravity' THEN NULL
 				WHEN ? THEN NULL
 				WHEN excluded.restore_priority IS NOT NULL THEN excluded.restore_priority
 				ELSE codex_keeper_auth_states.restore_priority
