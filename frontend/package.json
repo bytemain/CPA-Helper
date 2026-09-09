@@ -10,7 +10,8 @@
     "test:i18n": "node scripts/i18n-smoke.mjs",
     "test:antigravity-countdown": "node scripts/antigravity-countdown-smoke.mjs",
     "test:antigravity-window": "node scripts/antigravity-window-smoke.mjs",
-    "test:keeper-quota-exhaustion": "node scripts/keeper-quota-exhaustion-smoke.mjs"
+    "test:keeper-quota-exhaustion": "node scripts/keeper-quota-exhaustion-smoke.mjs",
+    "test:antigravity-quota-format": "node scripts/antigravity-quota-format-smoke.mjs"
   },
   "dependencies": {
     "echarts": "^5.5.1",

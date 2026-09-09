@@ -51,6 +51,11 @@ import {
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import { formatAntigravityResetCountdown } from '@/features/codex-keeper/antigravityCountdown'
 import { normalizeAntigravityWindow } from '@/features/codex-keeper/antigravityWindow'
+import {
+  antigravityGroupLine,
+  antigravityResetWithCountdown,
+  joinAntigravityBuckets,
+} from '@/features/codex-keeper/antigravityQuotaFormat'
 import { isQuotaExhaustedAccount } from '@/features/codex-keeper/keeperQuotaExhaustion'
 import type {
   AntigravityQuotaBucket,
@@ -1230,7 +1235,7 @@ function renderAntigravityQuotaCell(account: CodexKeeperAccount) {
                 h('span', { class: 'quota-window-label' }, label),
                 h('span', { class: 'quota-window-meta' }, [
                   h('span', { class: 'quota-window-percent' }, t(`剩余 ${remainingPercent}%`, `${remainingPercent}% remaining`)),
-                  resetTime ? h('span', { class: 'quota-window-reset' }, countdown ? `${resetTime}（${countdown}）` : resetTime) : null,
+                  resetTime ? h('span', { class: 'quota-window-reset' }, antigravityResetWithCountdown(resetTime, countdown, currentLanguage.value)) : null,
                 ]),
               ]),
               h('div', { class: 'quota-window-track' }, [
@@ -1256,29 +1261,28 @@ function antigravityQuotaText(account: CodexKeeperAccount): string {
   }
   return groups
     .map((group) => {
-      const buckets = group.buckets
-        .map((bucket) => {
-          const remainingPercent = antigravityRemainingPercent(bucket)
-          const resetTime = formatQuotaResetTime(bucket.reset_at)
-          const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
-          const label = antigravityWindowLabel(bucket)
-          if (resetTime) {
-            const reset = countdown ? `${resetTime}（${countdown}）` : resetTime
-            return t(
-              `${label}剩余 ${remainingPercent}%，刷新 ${reset}`,
-              `${label} ${remainingPercent}% remaining, refreshes ${reset}`,
-            )
-          }
-          if (countdown) {
-            return t(
-              `${label}剩余 ${remainingPercent}%，${countdown}`,
-              `${label} ${remainingPercent}% remaining, ${countdown}`,
-            )
-          }
-          return t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
-        })
-        .join('，')
-      return `${antigravityGroupLabel(group)}：${buckets}`
+      const bucketParts = group.buckets.map((bucket) => {
+        const remainingPercent = antigravityRemainingPercent(bucket)
+        const resetTime = formatQuotaResetTime(bucket.reset_at)
+        const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
+        const label = antigravityWindowLabel(bucket)
+        if (resetTime) {
+          const reset = antigravityResetWithCountdown(resetTime, countdown, currentLanguage.value)
+          return t(
+            `${label}剩余 ${remainingPercent}%，刷新 ${reset}`,
+            `${label} ${remainingPercent}% remaining, refreshes ${reset}`,
+          )
+        }
+        if (countdown) {
+          return t(
+            `${label}剩余 ${remainingPercent}%，${countdown}`,
+            `${label} ${remainingPercent}% remaining, ${countdown}`,
+          )
+        }
+        return t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
+      })
+      const buckets = joinAntigravityBuckets(bucketParts, currentLanguage.value)
+      return antigravityGroupLine(antigravityGroupLabel(group), buckets, currentLanguage.value)
     })
     .join(' / ')
 }
