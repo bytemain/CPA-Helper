@@ -254,6 +254,23 @@ export interface CodexKeeperAccount {
   reset_credit_count: number | null
   reset_credits: CodexKeeperResetCredit[] | null
   subscription_active_until: string | null
+  provider: string | null
+  antigravity_quota: AntigravityQuotaGroup[] | null
+}
+
+export interface AntigravityQuotaBucket {
+  bucket_id: string
+  display_name: string
+  window: string
+  remaining_fraction: number
+  reset_at: string | null
+  description?: string
+}
+
+export interface AntigravityQuotaGroup {
+  display_name: string
+  description?: string
+  buckets: AntigravityQuotaBucket[]
 }
 
 export interface CodexKeeperResetCredit {

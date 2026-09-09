@@ -37,6 +37,7 @@ import {
   stopCodexKeeper,
   updateCodexKeeperSettings,
 } from '@/features/codex-keeper/api/codexKeeperApi'
+import { isQuotaExhaustedAccount } from '@/features/codex-keeper/keeperQuotaExhaustion'
 import type {
   CodexKeeperAccount,
   CodexKeeperPriorityRule,
@@ -181,9 +182,6 @@ function applySettings(nextSettings: Awaited<ReturnType<typeof getCodexKeeperSet
   priorityRules.value = nextSettings.priority_rules.map((rule) => ({ ...rule }))
 }
 
-function isQuotaExhaustedAccount(account: CodexKeeperAccount): boolean {
-  return !account.disabled && (account.priority ?? 0) === -1
-}
 
 async function loadAll() {
   isLoading.value = true
@@ -511,7 +509,7 @@ onBeforeUnmount(() => {
     <div class="page-header">
       <div>
         <h1 class="page-title">{{ t('巡检设置', 'Inspection Settings') }}</h1>
-        <p class="page-subtitle">{{ t('维护 Codex auth file 的健康状态和调度优先级', 'Maintain Codex auth file health and scheduling priorities') }}</p>
+        <p class="page-subtitle">{{ t('维护 Keeper 账号的健康状态和调度优先级', 'Maintain Keeper account health and scheduling priorities') }}</p>
       </div>
       <NSpace>
         <NButton secondary :loading="isLoading" @click="loadAll">{{ t('重新加载', 'Reload') }}</NButton>

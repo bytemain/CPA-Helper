@@ -49,7 +49,17 @@ import {
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
+import { formatAntigravityResetCountdown } from '@/features/codex-keeper/antigravityCountdown'
+import { normalizeAntigravityWindow } from '@/features/codex-keeper/antigravityWindow'
+import {
+  antigravityGroupLine,
+  antigravityResetWithCountdown,
+  joinAntigravityBuckets,
+} from '@/features/codex-keeper/antigravityQuotaFormat'
+import { isQuotaExhaustedAccount } from '@/features/codex-keeper/keeperQuotaExhaustion'
 import type {
+  AntigravityQuotaBucket,
+  AntigravityQuotaGroup,
   CodexKeeperAccount,
   CodexKeeperPriorityRule,
   CodexKeeperQuotaWindowUsage,
@@ -696,9 +706,6 @@ function accountPriority(account: CodexKeeperAccount): number {
   return account.priority ?? 0
 }
 
-function isQuotaExhaustedAccount(account: CodexKeeperAccount): boolean {
-  return !account.disabled && accountPriority(account) === -1
-}
 
 function priorityTypeFilter(accountType: string): PriorityTypeFilter {
   return `type:${accountType}`
@@ -832,6 +839,76 @@ function accountTypeLabel(accountType: string | null): string {
     return 'K12'
   }
   return accountType ?? normalized
+}
+
+// providerAwareAccountTypeLabel returns the antigravity provider label for
+// antigravity accounts, otherwise the codex account-type label.
+function providerAwareAccountTypeLabel(account: CodexKeeperAccount): string {
+  if (isAntigravityAccount(account)) return 'Antigravity'
+  return accountTypeLabel(account.account_type)
+}
+
+function isAntigravityAccount(account: CodexKeeperAccount): boolean {
+  return account.provider === 'antigravity'
+}
+
+// antigravityQuotaGroups returns the non-empty quota groups for an antigravity
+// account, or an empty list for codex accounts / missing data.
+function antigravityQuotaGroups(account: CodexKeeperAccount): AntigravityQuotaGroup[] {
+  if (!isAntigravityAccount(account)) {
+    return []
+  }
+  return (account.antigravity_quota ?? []).filter((group) => (group.buckets?.length ?? 0) > 0)
+}
+
+// antigravityWindowLabel maps the bucket window to a localized label. The quota schema uses
+// several aliases for the same window (CPAMC's reference covers e.g. "5h"/"5 hour"/"5-hour",
+// "weekly"/"week", "daily", "monthly"), so we normalize by lower-casing and stripping spaces,
+// hyphens, and underscores before matching. Only a genuinely unknown window falls back to the
+// bucket's own display_name (which would render in English and bypass i18n).
+function antigravityWindowLabel(bucket: AntigravityQuotaBucket): string {
+  switch (normalizeAntigravityWindow(bucket.window)) {
+    case '5h':
+      return t('5 小时', '5-hour')
+    case 'weekly':
+      return t('每周', 'Weekly')
+    case 'daily':
+      return t('每日', 'Daily')
+    case 'monthly':
+      return t('每月', 'Monthly')
+    default:
+      return bucket.display_name
+  }
+}
+
+// antigravityGroupLabel maps the group's known English display_name to a
+// localized label, falling back to the raw display_name for unknown groups.
+function antigravityGroupLabel(group: AntigravityQuotaGroup): string {
+  const name = (group.display_name ?? '').trim()
+  if (name === 'Gemini Models') return t('Gemini 模型', 'Gemini Models')
+  if (name === 'Claude and GPT models') return t('Claude 和 GPT 模型', 'Claude and GPT models')
+  return group.display_name
+}
+
+// antigravityDescriptionText localizes the known upstream group description
+// prefix ("Models within this group: ..."), falling back to the raw free-text
+// description for any unknown wording.
+function antigravityDescriptionText(description: string | undefined): string {
+  const raw = (description ?? '').trim()
+  if (!raw) return ''
+  const prefix = 'Models within this group:'
+  if (raw.startsWith(prefix)) {
+    const models = raw.slice(prefix.length).trim()
+    return t(`此分组包含：${models}`, `Models in this group: ${models}`)
+  }
+  return raw // unknown free-text description → raw fallback
+}
+
+// antigravityRemainingPercent clamps remaining_fraction (0..1) to a 0..100 integer
+// percentage for the remaining-quota bar.
+function antigravityRemainingPercent(bucket: AntigravityQuotaBucket): number {
+  const fraction = Number.isFinite(bucket.remaining_fraction) ? bucket.remaining_fraction : 0
+  return Math.max(0, Math.min(100, Math.round(fraction * 100)))
 }
 
 function isPaidQuotaWindowAccount(accountType: string | null): boolean {
@@ -1006,6 +1083,9 @@ function formatQuotaResetCountdown(value: string | null): string | null {
 }
 
 function quotaText(account: CodexKeeperAccount): string {
+  if (isAntigravityAccount(account)) {
+    return antigravityQuotaText(account)
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1055,6 +1135,19 @@ function quotaWindowUsageTags(item: QuotaWindowItem): QuotaUsageTag[] {
 function quotaWindowResetText(item: QuotaWindowItem): string {
   const resetTime = formatQuotaResetTime(item.resetAt)
   return resetTime ? t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`) : t('未记录刷新时间', 'No refresh time recorded')
+}
+
+// antigravityCardResetText renders the reset time + countdown hint for an
+// antigravity quota bucket inside the account card quota block. Null-safe.
+function antigravityCardResetText(resetAt: string | null): string {
+  const resetTime = formatQuotaResetTime(resetAt)
+  if (!resetTime) {
+    return t('未记录刷新时间', 'No refresh time recorded')
+  }
+  const countdown = formatAntigravityResetCountdown(resetAt, nowMs.value, currentLanguage.value)
+  return countdown
+    ? t(`刷新 ${resetTime}（${countdown}）`, `Refreshes ${resetTime} (${countdown})`)
+    : t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`)
 }
 
 function quotaWindowUsageTitle(item: QuotaWindowItem): string {
@@ -1107,7 +1200,97 @@ function disabledStatusCodeTitle(account: CodexKeeperAccount): string | null {
   return text === null ? null : `HTTP ${text}`
 }
 
+// renderAntigravityQuotaCell renders the antigravity provider's quota groups and
+// their buckets. Each bucket shows a remaining-quota bar (remaining_fraction * 100)
+// reusing the codex quota-window bar styling, plus the reset time and countdown.
+function renderAntigravityQuotaCell(account: CodexKeeperAccount) {
+  const groups = antigravityQuotaGroups(account)
+  if (groups.length === 0) {
+    return '-'
+  }
+  return h(
+    'div',
+    { class: 'quota-window-cell' },
+    groups.map((group) =>
+      h('div', { class: 'quota-antigravity-group' }, [
+        h('div', { class: 'quota-antigravity-group-title', title: antigravityDescriptionText(group.description) || group.display_name }, antigravityGroupLabel(group)),
+        ...group.buckets.map((bucket) => {
+          const remainingPercent = antigravityRemainingPercent(bucket)
+          const label = antigravityWindowLabel(bucket)
+          const resetTime = formatQuotaResetTime(bucket.reset_at)
+          const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
+          return h(
+            'div',
+            {
+              class: 'quota-window-item',
+              title: bucket.description
+                ? t(
+                    `${label} 剩余 ${remainingPercent}%；${bucket.description}`,
+                    `${label} ${remainingPercent}% remaining; ${bucket.description}`,
+                  )
+                : t(`${label} 剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`),
+            },
+            [
+              h('div', { class: 'quota-window-head' }, [
+                h('span', { class: 'quota-window-label' }, label),
+                h('span', { class: 'quota-window-meta' }, [
+                  h('span', { class: 'quota-window-percent' }, t(`剩余 ${remainingPercent}%`, `${remainingPercent}% remaining`)),
+                  resetTime ? h('span', { class: 'quota-window-reset' }, antigravityResetWithCountdown(resetTime, countdown, currentLanguage.value)) : null,
+                ]),
+              ]),
+              h('div', { class: 'quota-window-track' }, [
+                h('div', {
+                  class: ['quota-window-fill', quotaBarTone(remainingPercent)],
+                  style: { width: `${remainingPercent}%` },
+                }),
+              ]),
+            ],
+          )
+        }),
+      ]),
+    ),
+  )
+}
+
+// antigravityQuotaText renders a compact single-line summary of the antigravity
+// quota groups/buckets for the account detail drawer.
+function antigravityQuotaText(account: CodexKeeperAccount): string {
+  const groups = antigravityQuotaGroups(account)
+  if (groups.length === 0) {
+    return '-'
+  }
+  return groups
+    .map((group) => {
+      const bucketParts = group.buckets.map((bucket) => {
+        const remainingPercent = antigravityRemainingPercent(bucket)
+        const resetTime = formatQuotaResetTime(bucket.reset_at)
+        const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
+        const label = antigravityWindowLabel(bucket)
+        if (resetTime) {
+          const reset = antigravityResetWithCountdown(resetTime, countdown, currentLanguage.value)
+          return t(
+            `${label}剩余 ${remainingPercent}%，刷新 ${reset}`,
+            `${label} ${remainingPercent}% remaining, refreshes ${reset}`,
+          )
+        }
+        if (countdown) {
+          return t(
+            `${label}剩余 ${remainingPercent}%，${countdown}`,
+            `${label} ${remainingPercent}% remaining, ${countdown}`,
+          )
+        }
+        return t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
+      })
+      const buckets = joinAntigravityBuckets(bucketParts, currentLanguage.value)
+      return antigravityGroupLine(antigravityGroupLabel(group), buckets, currentLanguage.value)
+    })
+    .join(' / ')
+}
+
 function renderQuotaCell(account: CodexKeeperAccount) {
+  if (isAntigravityAccount(account)) {
+    return renderAntigravityQuotaCell(account)
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1152,6 +1335,9 @@ function renderQuotaCell(account: CodexKeeperAccount) {
 }
 
 function renderQuotaUsageCell(account: CodexKeeperAccount) {
+  if (isAntigravityAccount(account)) {
+    return '-'
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1185,6 +1371,10 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
 // countdown — the account's "主动重置过期时间" from wham/rate-limit-reset-credits.
 // A null expires_at means the credit never expires; such entries are still shown.
 function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
+  // Reset credits are a codex-only concept; antigravity accounts have none.
+  if (isAntigravityAccount(account)) {
+    return '—'
+  }
   const credits = account.reset_credits ?? []
   const count = account.reset_credit_count
   // The authoritative count is reset_credit_count. When it is null the snapshot is
@@ -1226,6 +1416,10 @@ function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
 // CPA from the account's id_token `chatgpt_subscription_active_until` claim) plus
 // a coarse countdown. A null value (no subscription / unknown) renders a dash.
 function renderSubscriptionCell(account: CodexKeeperAccount) {
+  // Subscription renewal is codex-specific; antigravity accounts do not carry it.
+  if (isAntigravityAccount(account)) {
+    return '—'
+  }
   const value = account.subscription_active_until
   if (!value) {
     return '-'
@@ -1275,7 +1469,7 @@ function renderAccountIdentityCell(account: CodexKeeperAccount) {
 }
 
 function renderAccountTypeCell(account: CodexKeeperAccount) {
-  const typeLabel = accountTypeLabel(account.account_type)
+  const typeLabel = providerAwareAccountTypeLabel(account)
   return h(
     'span',
     { class: ['account-table-chip', 'is-type'], title: typeLabel },
@@ -1902,18 +2096,21 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
             },
             { default: () => t('刷新', 'Refresh') },
           ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              quaternary: true,
-              type: 'warning',
-              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
-              loading: isActionLoading(row, 'reset-quota'),
-              onClick: () => confirmResetQuota(row),
-            },
-            { default: () => t('重置', 'Reset') },
-          ),
+          // Reset credits do not apply to antigravity accounts, so omit the button.
+          isAntigravityAccount(row)
+            ? null
+            : h(
+                NButton,
+                {
+                  size: 'small',
+                  quaternary: true,
+                  type: 'warning',
+                  disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+                  loading: isActionLoading(row, 'reset-quota'),
+                  onClick: () => confirmResetQuota(row),
+                },
+                { default: () => t('重置', 'Reset') },
+              ),
         ],
       },
     )
@@ -1970,18 +2167,21 @@ const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]
             },
             { default: () => t('刷新', 'Refresh') },
           ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              quaternary: true,
-              type: 'warning',
-              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
-              loading: isActionLoading(row, 'reset-quota'),
-              onClick: () => confirmResetQuota(row),
-            },
-            { default: () => t('重置', 'Reset') },
-          ),
+          // Reset credits do not apply to antigravity accounts, so omit the button.
+          isAntigravityAccount(row)
+            ? null
+            : h(
+                NButton,
+                {
+                  size: 'small',
+                  quaternary: true,
+                  type: 'warning',
+                  disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+                  loading: isActionLoading(row, 'reset-quota'),
+                  onClick: () => confirmResetQuota(row),
+                },
+                { default: () => t('重置', 'Reset') },
+              ),
         ],
       },
     )
@@ -2077,7 +2277,7 @@ onBeforeUnmount(() => {
             </NButton>
           </div>
         </div>
-        <p class="page-subtitle">{{ t('查看 Codex auth file 的健康、额度和优先级维护结果', 'View Codex auth file health, quota, and priority maintenance results') }}</p>
+        <p class="page-subtitle">{{ t('查看 Keeper 账号的健康、额度和优先级维护结果', 'View Keeper account health, quota, and priority maintenance results') }}</p>
       </div>
     </div>
 
@@ -2465,7 +2665,7 @@ onBeforeUnmount(() => {
               <div class="account-card-meta-grid">
                 <div class="account-card-meta-item">
                   <span>{{ t('类型', 'Type') }}</span>
-                  <strong>{{ accountTypeLabel(account.account_type) }}</strong>
+                  <strong>{{ providerAwareAccountTypeLabel(account) }}</strong>
                 </div>
                 <div class="account-card-meta-item">
                   <span>{{ t('优先级', 'Priority') }}</span>
@@ -2487,7 +2687,79 @@ onBeforeUnmount(() => {
                 <strong>{{ disabledCardErrorText(account) }}</strong>
               </div>
               <div v-else-if="shouldShowQuotaWindow(account)" class="account-card-quota">
-                <template v-if="quotaWindowItems(account).length > 0">
+                <template v-if="isAntigravityAccount(account)">
+                  <template v-if="antigravityQuotaGroups(account).length > 0">
+                    <template v-if="isBarCardView">
+                      <div
+                        v-for="group in antigravityQuotaGroups(account)"
+                        :key="group.display_name"
+                        class="card-quota-antigravity-group"
+                      >
+                        <div
+                          class="quota-antigravity-group-title"
+                          :title="antigravityDescriptionText(group.description) || group.display_name"
+                        >
+                          {{ antigravityGroupLabel(group) }}
+                        </div>
+                        <div
+                          v-for="bucket in group.buckets"
+                          :key="bucket.bucket_id"
+                          class="card-quota-bar"
+                        >
+                          <div class="card-quota-head">
+                            <span>{{ antigravityWindowLabel(bucket) }}</span>
+                            <strong>{{ t(`剩余 ${antigravityRemainingPercent(bucket)}%`, `${antigravityRemainingPercent(bucket)}% remaining`) }}</strong>
+                          </div>
+                          <div class="card-quota-track">
+                            <div
+                              class="card-quota-fill"
+                              :class="quotaBarTone(antigravityRemainingPercent(bucket))"
+                              :style="{ width: `${antigravityRemainingPercent(bucket)}%` }"
+                            />
+                          </div>
+                          <span class="card-quota-reset">
+                            {{ antigravityCardResetText(bucket.reset_at) }}
+                          </span>
+                        </div>
+                      </div>
+                    </template>
+                    <div v-else class="card-quota-rings">
+                      <div
+                        v-for="group in antigravityQuotaGroups(account)"
+                        :key="group.display_name"
+                        class="card-quota-antigravity-group"
+                      >
+                        <div
+                          class="quota-antigravity-group-title"
+                          :title="antigravityDescriptionText(group.description) || group.display_name"
+                        >
+                          {{ antigravityGroupLabel(group) }}
+                        </div>
+                        <div
+                          v-for="bucket in group.buckets"
+                          :key="bucket.bucket_id"
+                          class="card-quota-ring-item"
+                        >
+                          <div class="card-quota-ring-head">
+                            <div
+                              class="quota-ring"
+                              :class="quotaBarTone(antigravityRemainingPercent(bucket))"
+                              :style="{ '--quota-deg': `${antigravityRemainingPercent(bucket) * 3.6}deg` }"
+                            >
+                              <span>{{ antigravityRemainingPercent(bucket) }}%</span>
+                            </div>
+                            <div class="quota-ring-caption">
+                              <strong>{{ antigravityWindowLabel(bucket) }}</strong>
+                              <span>{{ antigravityCardResetText(bucket.reset_at) }}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                  <div v-else class="card-quota-empty">{{ t('暂无额度窗口', 'No quota windows') }}</div>
+                </template>
+                <template v-else-if="quotaWindowItems(account).length > 0">
                   <template v-if="isBarCardView">
                     <div
                       v-for="item in quotaWindowItems(account)"
@@ -2600,7 +2872,7 @@ onBeforeUnmount(() => {
           <NDescriptionsItem :label="t('账号', 'Account')">{{ selectedAccount.name }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('邮箱', 'Email')">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('账号类型', 'Account Type')">
-            {{ accountTypeLabel(selectedAccount.account_type) }}
+            {{ providerAwareAccountTypeLabel(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('启用状态', 'Enabled Status')">
             {{ selectedAccount.disabled ? t('已禁用', 'Disabled') : t('启用中', 'Enabled') }}
@@ -2623,7 +2895,10 @@ onBeforeUnmount(() => {
           <NDescriptionsItem :label="t('最近巡检', 'Last Inspection')">
             {{ formatDateTime(selectedAccount.last_checked_at) }}
           </NDescriptionsItem>
-          <NDescriptionsItem :label="t('续期时间', 'Renews At')">
+          <NDescriptionsItem
+            v-if="!isAntigravityAccount(selectedAccount)"
+            :label="t('续期时间', 'Renews At')"
+          >
             {{ subscriptionDetailText(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近操作', 'Latest Action')">
@@ -3333,6 +3608,25 @@ onBeforeUnmount(() => {
   padding-top: 2px;
 }
 
+.card-quota-antigravity-group {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--account-card-inner-border);
+}
+
+.card-quota-antigravity-group:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.card-quota-antigravity-group .card-quota-bar,
+.card-quota-antigravity-group .card-quota-bar:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
 .card-quota-bar {
   display: grid;
   gap: 7px;
@@ -3653,6 +3947,22 @@ onBeforeUnmount(() => {
   gap: 4px;
   min-width: 0;
   min-height: 38px;
+}
+
+:global(.quota-antigravity-group) {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+:global(.quota-antigravity-group-title) {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 :global(.quota-window-head) {

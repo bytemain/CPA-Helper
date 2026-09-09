@@ -162,6 +162,24 @@ try {
     'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.',
   )
   assert.equal(
+    localizedServerMessage('账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id/email 不一致，已保留原快照'),
+    'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id/email; the previous snapshot was preserved.',
+  )
+  // Antigravity quota inspection log/last_error strings must localize (English account page
+  // must not show Chinese): a bare failure exact, plus name-prefixed success/failure log lines.
+  assert.equal(
+    localizedServerMessage('Antigravity 配额读取失败'),
+    'Failed to read Antigravity quota',
+  )
+  assert.equal(
+    localizedServerMessage('antigravity@example.com.json：Antigravity 配额刷新成功（2 组）'),
+    'antigravity@example.com.json: Antigravity quota refreshed (2 groups)',
+  )
+  assert.equal(
+    localizedServerMessage('antigravity@example.com.json：Antigravity 配额读取失败'),
+    'antigravity@example.com.json: Failed to read Antigravity quota',
+  )
+  assert.equal(
     localizedServerMessage('账号 account_id 身份冲突（列表与详情不一致），请刷新后重试'),
     'Account account_id identity conflict (list and detail disagree). Refresh and try again.',
   )
