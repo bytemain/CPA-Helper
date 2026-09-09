@@ -51,6 +51,7 @@ import {
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import { formatAntigravityResetCountdown } from '@/features/codex-keeper/antigravityCountdown'
 import { normalizeAntigravityWindow } from '@/features/codex-keeper/antigravityWindow'
+import { isQuotaExhaustedAccount } from '@/features/codex-keeper/keeperQuotaExhaustion'
 import type {
   AntigravityQuotaBucket,
   AntigravityQuotaGroup,
@@ -700,11 +701,6 @@ function accountPriority(account: CodexKeeperAccount): number {
   return account.priority ?? 0
 }
 
-function isQuotaExhaustedAccount(account: CodexKeeperAccount): boolean {
-  // priority === -1 is the Codex quota->priority policy's "exhausted" marker; Antigravity does not
-  // run that policy, so a -1 there must not be interpreted as quota exhausted.
-  return !account.disabled && !isAntigravityAccount(account) && accountPriority(account) === -1
-}
 
 function priorityTypeFilter(accountType: string): PriorityTypeFilter {
   return `type:${accountType}`

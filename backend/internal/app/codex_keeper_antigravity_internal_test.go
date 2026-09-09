@@ -892,6 +892,54 @@ func TestKeeperUpsertLegacyUnboundQuotaClearedWhenIdentityKnown(t *testing.T) {
 	}
 }
 
+// TestKeeperCachedAntigravityPriorityNotDegraded proves the cache-audit stat entry
+// (keeperCachedAuthStats → mergeCachedState, used by conditional-refresh / cache-skip accounting)
+// does NOT count an Antigravity account at priority -1 as PriorityDegraded: the Codex
+// quota-usage→priority=-1 "degraded" semantic does not apply to Antigravity, so it falls through to
+// healthy. A Codex control row at priority -1 IS still counted as degraded, proving the provider
+// guard is load-bearing rather than blanket-suppressing the branch.
+func TestKeeperCachedAntigravityPriorityNotDegraded(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+
+	minusOne := -1
+	ag, codex := keeperProviderAntigravity, keeperProviderCodex
+	agIdx, cIdx := "idx-ag", "idx-c"
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "ag.json", Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &agIdx, Priority: &minusOne,
+	}); err != nil {
+		t.Fatalf("seed antigravity: %v", err)
+	}
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: "codex.json", Result: "healthy", CheckedAt: time.Now(), Provider: &codex, AuthIndex: &cIdx, Priority: &minusOne,
+	}); err != nil {
+		t.Fatalf("seed codex: %v", err)
+	}
+
+	// Antigravity at priority -1: falls through to healthy, NOT degraded.
+	agStats, err := app.keeperCachedAuthStats(ctx, []string{"ag.json"})
+	if err != nil {
+		t.Fatalf("ag stats: %v", err)
+	}
+	if agStats.PriorityDegraded != 0 || agStats.Healthy != 1 {
+		t.Fatalf("antigravity priority=-1 miscounted: %+v (want PriorityDegraded=0, Healthy=1)", agStats)
+	}
+
+	// Codex control at priority -1: still counted as degraded (the guard is provider-specific).
+	cStats, err := app.keeperCachedAuthStats(ctx, []string{"codex.json"})
+	if err != nil {
+		t.Fatalf("codex stats: %v", err)
+	}
+	if cStats.PriorityDegraded != 1 || cStats.Healthy != 0 {
+		t.Fatalf("codex priority=-1 should be degraded: %+v (want PriorityDegraded=1, Healthy=0)", cStats)
+	}
+}
+
 func timeMust(t *testing.T, s string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, s)

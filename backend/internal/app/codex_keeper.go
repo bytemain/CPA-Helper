@@ -3133,7 +3133,12 @@ func (stats *keeperStats) mergeCachedState(state keeperAuthState) {
 		stats.NetworkError++
 		return
 	}
-	if state.Priority != nil && *state.Priority == -1 {
+	// The quota-usage → priority=-1 "degraded" semantic is Codex-only; Antigravity has no such
+	// mechanism (priority is managed differently and -1 is not a quota-exhaustion marker). So an
+	// Antigravity cached row at priority -1 must NOT be counted as degraded — it falls through to
+	// the healthy/timestamp branch like any other provider. Mirrors the frontend's
+	// isQuotaExhaustedAccount() !isAntigravity guard.
+	if *keeperProviderOrCodex(state.Provider) != keeperProviderAntigravity && state.Priority != nil && *state.Priority == -1 {
 		stats.PriorityDegraded++
 		return
 	}
