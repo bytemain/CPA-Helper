@@ -494,6 +494,70 @@ func TestKeeperConditionalReconcilePreservesAntigravity(t *testing.T) {
 	}
 }
 
+// TestKeeperWebsocketFailureClearsStaleAntigravityProvider reproduces the provider-switch probe on
+// the credential-websocket failure path: a row stored as Antigravity whose remote file is now Codex
+// and whose websocket-enable PATCH fails must still be re-tagged provider=codex (clearing the stale
+// antigravity_quota), not left showing as Antigravity.
+func TestKeeperWebsocketFailureClearsStaleAntigravityProvider(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "switched.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// The file is now a Codex account (websockets not yet enabled).
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "codex", "auth_index": "idx-c", "websockets": false},
+			}})
+		case r.Method == http.MethodPatch && r.URL.Path == "/v0/management/auth-files/fields":
+			http.Error(w, "boom", http.StatusBadGateway) // enabling websockets fails
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, func(cfg *AppConfig) {
+		cfg.CodexKeeper.EnableCredentialWebsockets = true
+		cfg.CodexKeeper.DryRun = false
+	})
+	ctx := context.Background()
+
+	// Seed a prior Antigravity row with quota (the file used to be antigravity).
+	seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+	encoded, _ := json.Marshal(seed)
+	blob := string(encoded)
+	ag, idx := keeperProviderAntigravity, "idx-c"
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx, AntigravityQuota: &blob,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+	if err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	if stats.NetworkError != 1 {
+		t.Fatalf("stats = %+v, want NetworkError=1 (websocket enable failed)", stats)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.Provider == nil || *st.Provider != "codex" {
+		t.Fatalf("stale provider not switched to codex on websocket-failure path: %v", st.Provider)
+	}
+	if len(st.AntigravityQuota) != 0 {
+		t.Fatalf("stale antigravity_quota not cleared on provider switch: %+v", st.AntigravityQuota)
+	}
+}
+
 func timeMust(t *testing.T, s string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, s)

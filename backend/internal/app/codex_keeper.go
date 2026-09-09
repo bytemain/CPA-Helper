@@ -2635,8 +2635,13 @@ func (a *App) ensureKeeperAuthWebsockets(
 		if err := a.setKeeperRemoteWebsockets(ctx, cfg, name); err != nil {
 			message := "启用 WebSocket 传输失败：" + err.Error()
 			disabled := keeperBool(item["disabled"])
+			// This path only runs for Codex items (antigravity is split out before the websocket
+			// step), so tag the result Codex — otherwise upsertKeeperState's COALESCE would keep a
+			// stale provider/antigravity_quota from a row that was previously an Antigravity file.
+			codex := keeperProviderCodex
 			result := keeperAccountResult{
 				Name:         name,
+				Provider:     &codex,
 				AuthIndex:    keeperRemoteAuthIndex(item),
 				AccountType:  accountTypeFromKeeperDetail(item, nil),
 				Disabled:     &disabled,
