@@ -700,7 +700,9 @@ function accountPriority(account: CodexKeeperAccount): number {
 }
 
 function isQuotaExhaustedAccount(account: CodexKeeperAccount): boolean {
-  return !account.disabled && accountPriority(account) === -1
+  // priority === -1 is the Codex quota->priority policy's "exhausted" marker; Antigravity does not
+  // run that policy, so a -1 there must not be interpreted as quota exhausted.
+  return !account.disabled && !isAntigravityAccount(account) && accountPriority(account) === -1
 }
 
 function priorityTypeFilter(accountType: string): PriorityTypeFilter {
