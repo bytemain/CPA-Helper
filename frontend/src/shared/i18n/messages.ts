@@ -42,7 +42,8 @@ const exactServerMessages: MessagePair[] = [
   ['账号身份已变化（account_id 不一致），请刷新账号列表后重试', 'The account identity has changed (account_id mismatch). Refresh the account list and try again.'],
   ['账号尚未确认身份（缺少 account_id），请先刷新账号列表后再重置', 'The account identity is not confirmed yet (no account_id). Refresh the account list before resetting.'],
   ['账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照', 'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.'],
-  ['账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id 不一致，已保留原快照', 'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id; the previous snapshot was preserved.'],
+  ['账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id/email 不一致，已保留原快照', 'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id/email; the previous snapshot was preserved.'],
+  ['Antigravity 配额读取失败', 'Failed to read Antigravity quota'],
   ['无法确认可用重置额度（快照未知），请刷新后重试', 'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.'],
   ['核销主动重置额度失败：网络异常，未确认是否已核销', 'Failed to redeem the reset credit: network error; redemption is unconfirmed.'],
   ['核销主动重置额度失败：管理接口异常', 'Failed to redeem the reset credit: management API error.'],
@@ -226,6 +227,10 @@ const serverTermTranslations: MessagePair[] = [
 ]
 
 const serverMessagePatterns: ServerMessagePattern[] = [
+  // Antigravity quota log lines must be matched BEFORE the generic `…失败` family below, or the
+  // name-prefixed failure line falls through to `(.+)失败` and renders half-translated.
+  [/^(.+?)：Antigravity 配额刷新成功（(\d+) 组）$/, ([, name, count]) => `${name}: Antigravity quota refreshed (${count} groups)`],
+  [/^(.+?)：Antigravity 配额读取失败$/, ([, name]) => `${name}: Failed to read Antigravity quota`],
   [/^操作失败$/, () => 'Operation failed'],
   [/^加载(.+)失败$/, ([, subject]) => `Failed to load ${translateTerms(subject ?? '')}`],
   [/^保存(.+)失败$/, ([, subject]) => `Failed to save ${translateTerms(subject ?? '')}`],

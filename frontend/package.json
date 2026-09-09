@@ -8,7 +8,8 @@
     "build": "vue-tsc -b && vite build",
     "lint": "eslint . --max-warnings=0",
     "test:i18n": "node scripts/i18n-smoke.mjs",
-    "test:antigravity-countdown": "node scripts/antigravity-countdown-smoke.mjs"
+    "test:antigravity-countdown": "node scripts/antigravity-countdown-smoke.mjs",
+    "test:antigravity-window": "node scripts/antigravity-window-smoke.mjs"
   },
   "dependencies": {
     "echarts": "^5.5.1",

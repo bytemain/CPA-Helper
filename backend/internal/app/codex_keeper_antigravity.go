@@ -161,36 +161,6 @@ func keeperParseFraction(values ...any) (float64, bool) {
 	return 0, false
 }
 
-// keeperAntigravityProjectID resolves the Google project id the quota call needs, from the auth
-// file: the top-level field (where CPA's real antigravity-*.json carries it), then the
-// metadata/attributes maps, then the installed/web OAuth blocks. Empty means unresolved.
-func keeperAntigravityProjectID(detail map[string]any) string {
-	if v := keeperStringFirst(detail["project_id"], detail["projectId"]); v != "" {
-		return v
-	}
-	if m, ok := detail["metadata"].(map[string]any); ok {
-		if v := keeperStringFirst(m["project_id"], m["projectId"]); v != "" {
-			return v
-		}
-	}
-	if m, ok := detail["attributes"].(map[string]any); ok {
-		if v := keeperStringFirst(m["project_id"], m["projectId"], m["gemini_virtual_project"]); v != "" {
-			return v
-		}
-	}
-	if m, ok := detail["installed"].(map[string]any); ok {
-		if v := keeperStringFirst(m["project_id"], m["projectId"]); v != "" {
-			return v
-		}
-	}
-	if m, ok := detail["web"].(map[string]any); ok {
-		if v := keeperStringFirst(m["project_id"], m["projectId"]); v != "" {
-			return v
-		}
-	}
-	return ""
-}
-
 // parseAntigravityQuotaGroups projects a retrieveUserQuotaSummary body into groups → buckets.
 // A group is kept only when it has at least one valid bucket (a valid remaining fraction; a
 // present-but-unparseable reset time drops just that bucket). ok=false means the body had no
@@ -315,8 +285,8 @@ func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name st
 	// account. Reconcile the account email across list+detail (present must be a string; both
 	// present must agree) and fold it into the stored identity digest, so a credential swap to a
 	// different email under the same project is detected as an identity change.
-	listEmail, leerr := keeperExplicitStringField(authInfo, "email")
-	detailEmail, deerr := keeperExplicitStringField(detail, "email")
+	listEmail, leerr := keeperExplicitAntigravityEmail(authInfo)
+	detailEmail, deerr := keeperExplicitAntigravityEmail(detail)
 	if leerr != nil || deerr != nil {
 		return antigravityIdentity{}, false
 	}
@@ -324,12 +294,17 @@ func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name st
 	if eerr != nil {
 		return antigravityIdentity{}, false
 	}
+	// The resource key is provider+project+email, and a Google project can be shared across
+	// accounts, so an empty email would make two distinct credentials under the same project
+	// indistinguishable (one could inherit the other's quota). CPA's Antigravity login requires a
+	// non-empty userinfo email, so a missing email means the identity is unproven: fail closed
+	// (identity_error / no quota call) rather than degrade to a project-only digest.
+	if strings.TrimSpace(email) == "" {
+		return antigravityIdentity{}, false
+	}
 	return antigravityIdentity{authIndex: idx, projectID: project, email: email}, true
 }
 
-// keeperProjectDigest returns a stable, versioned one-way digest of a project id. Only this digest
-// is persisted (never the raw project id), so the DB can detect a project swap without storing or
-// exposing the project identifier. The "v1:" prefix allows changing the scheme later.
 // keeperAntigravityIdentityDigest returns a stable, versioned one-way digest of the Antigravity
 // account identity (provider + project id + normalized email). Only this digest is persisted —
 // never the raw project id or email — so the DB can detect an identity swap (project OR email
@@ -341,26 +316,63 @@ func keeperAntigravityIdentityDigest(projectID, email string) string {
 	return "v1:" + hex.EncodeToString(sum[:])
 }
 
-// keeperExplicitAntigravityProjectID resolves the project id with present-invalid detection: the
-// top-level project_id / projectId must be a string when present (a present-but-wrong-type value
-// fails closed). When the top level is absent it falls back to the lenient nested resolution
-// (metadata / attributes / installed / web).
+// keeperExplicitAntigravityEmail resolves the account email across the same aliases the result
+// layer reads (email / account_email / user_email), normalized to lowercase, with present-invalid
+// detection: each present alias must be a string and they must all agree (case-insensitively). A
+// present-but-wrong-type value or two disagreeing aliases fail closed, so the identity digest can't
+// be bound to an arbitrary alias while a conflicting one is ignored.
+func keeperExplicitAntigravityEmail(o map[string]any) (string, error) {
+	candidates := []string{}
+	for _, k := range []string{"email", "account_email", "user_email"} {
+		v, err := keeperExplicitStringField(o, k)
+		if err != nil {
+			return "", err
+		}
+		if v != "" {
+			candidates = append(candidates, strings.ToLower(v))
+		}
+	}
+	return keeperConsistentValue(candidates...)
+}
+
+// keeperExplicitAntigravityProjectID resolves the project id across every alias location (top-level
+// project_id/projectId and the nested metadata/attributes/installed/web blocks, plus attributes'
+// gemini_virtual_project) with present-invalid detection: each present alias must be a string and
+// they must all agree. A present-but-wrong-type value or two disagreeing aliases fail closed.
 func keeperExplicitAntigravityProjectID(o map[string]any) (string, error) {
-	pid, err := keeperExplicitStringField(o, "project_id")
-	if err != nil {
+	candidates := []string{}
+	collect := func(m map[string]any, keys ...string) error {
+		for _, k := range keys {
+			v, err := keeperExplicitStringField(m, k)
+			if err != nil {
+				return err
+			}
+			if v != "" {
+				candidates = append(candidates, v)
+			}
+		}
+		return nil
+	}
+	if err := collect(o, "project_id", "projectId"); err != nil {
 		return "", err
 	}
-	if pid != "" {
-		return pid, nil
+	for _, nestedKey := range []string{"metadata", "attributes", "installed", "web"} {
+		nested, ok := o[nestedKey].(map[string]any)
+		if !ok {
+			continue
+		}
+		keys := []string{"project_id", "projectId"}
+		if nestedKey == "attributes" {
+			keys = append(keys, "gemini_virtual_project")
+		}
+		if err := collect(nested, keys...); err != nil {
+			return "", err
+		}
 	}
-	pidCamel, err := keeperExplicitStringField(o, "projectId")
-	if err != nil {
-		return "", err
-	}
-	if pidCamel != "" {
-		return pidCamel, nil
-	}
-	return keeperAntigravityProjectID(o), nil
+	// Every present alias (top-level + nested) must be a string and they must all agree; a
+	// present-but-wrong-type value or two disagreeing aliases fail closed rather than silently
+	// binding the identity digest to an arbitrary first value.
+	return keeperConsistentValue(candidates...)
 }
 
 // processKeeperAntigravityAuth inspects one Antigravity account: it reads the download detail,
@@ -403,7 +415,7 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 	// preserve the prior snapshot, and make NO quota call.
 	identity, ok := keeperReconcileAntigravityIdentity(authInfo, detail, name)
 	if !ok {
-		message := "账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id 不一致，已保留原快照"
+		message := "账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id/email 不一致，已保留原快照"
 		result.Result = "identity_error"
 		result.LastError = &message
 		result.LatestAction = &message

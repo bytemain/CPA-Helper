@@ -449,6 +449,11 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
 		t.Fatal("head is missing codex_keeper_auth_states.account_id")
 	}
+	for _, col := range []string{"provider", "antigravity_quota", "antigravity_identity_digest"} {
+		if !testColumnExists(t, db, "codex_keeper_auth_states", col) {
+			t.Fatalf("head is missing codex_keeper_auth_states.%s (migration 202609060005)", col)
+		}
+	}
 	if !testTableExists(t, db, "codex_keeper_reset_redeems") {
 		t.Fatal("head is missing codex_keeper_reset_redeems")
 	}
@@ -481,6 +486,11 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	if testColumnExists(t, db, "codex_keeper_auth_states", "account_id") {
 		t.Fatal("rollback left codex_keeper_auth_states.account_id behind")
 	}
+	for _, col := range []string{"provider", "antigravity_quota", "antigravity_identity_digest"} {
+		if testColumnExists(t, db, "codex_keeper_auth_states", col) {
+			t.Fatalf("rollback left codex_keeper_auth_states.%s behind", col)
+		}
+	}
 
 	// Replay: from the prod baseline (202609040002) migrate Up to head again — the whole
 	// release must be re-runnable after a rollback (040002 → head → 040002 → head).
@@ -495,6 +505,9 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 		t.Fatalf("post-replay version = %d, want head %d", v, backendMigrations.LatestVersion)
 	}
 	if !testColumnExists(t, db, "codex_keeper_auth_states", "account_id") ||
+		!testColumnExists(t, db, "codex_keeper_auth_states", "provider") ||
+		!testColumnExists(t, db, "codex_keeper_auth_states", "antigravity_quota") ||
+		!testColumnExists(t, db, "codex_keeper_auth_states", "antigravity_identity_digest") ||
 		!testTableExists(t, db, "codex_keeper_reset_redeems") ||
 		testTableExists(t, db, "codex_keeper_quota_resets") {
 		t.Fatal("replay to head did not restore the full head schema")

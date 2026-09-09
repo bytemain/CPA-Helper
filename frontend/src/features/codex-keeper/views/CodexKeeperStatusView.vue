@@ -50,6 +50,7 @@ import {
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import { formatAntigravityResetCountdown } from '@/features/codex-keeper/antigravityCountdown'
+import { normalizeAntigravityWindow } from '@/features/codex-keeper/antigravityWindow'
 import type {
   AntigravityQuotaBucket,
   AntigravityQuotaGroup,
@@ -859,17 +860,24 @@ function antigravityQuotaGroups(account: CodexKeeperAccount): AntigravityQuotaGr
   return (account.antigravity_quota ?? []).filter((group) => (group.buckets?.length ?? 0) > 0)
 }
 
-// antigravityWindowLabel maps the bucket window ("weekly"/"5h") to a localized
-// label, falling back to the bucket's own display_name for unknown windows.
+// antigravityWindowLabel maps the bucket window to a localized label. The quota schema uses
+// several aliases for the same window (CPAMC's reference covers e.g. "5h"/"5 hour"/"5-hour",
+// "weekly"/"week", "daily", "monthly"), so we normalize by lower-casing and stripping spaces,
+// hyphens, and underscores before matching. Only a genuinely unknown window falls back to the
+// bucket's own display_name (which would render in English and bypass i18n).
 function antigravityWindowLabel(bucket: AntigravityQuotaBucket): string {
-  const window = bucket.window?.trim().toLowerCase()
-  if (window === 'weekly') {
-    return t('每周', 'Weekly')
+  switch (normalizeAntigravityWindow(bucket.window)) {
+    case '5h':
+      return t('5 小时', '5-hour')
+    case 'weekly':
+      return t('每周', 'Weekly')
+    case 'daily':
+      return t('每日', 'Daily')
+    case 'monthly':
+      return t('每月', 'Monthly')
+    default:
+      return bucket.display_name
   }
-  if (window === '5h') {
-    return t('5 小时', '5-hour')
-  }
-  return bucket.display_name
 }
 
 // antigravityGroupLabel maps the group's known English display_name to a
@@ -1256,13 +1264,22 @@ function antigravityQuotaText(account: CodexKeeperAccount): string {
         .map((bucket) => {
           const remainingPercent = antigravityRemainingPercent(bucket)
           const resetTime = formatQuotaResetTime(bucket.reset_at)
+          const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
           const label = antigravityWindowLabel(bucket)
-          return resetTime
-            ? t(
-                `${label}剩余 ${remainingPercent}%，刷新 ${resetTime}`,
-                `${label} ${remainingPercent}% remaining, refreshes ${resetTime}`,
-              )
-            : t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
+          if (resetTime) {
+            const reset = countdown ? `${resetTime}（${countdown}）` : resetTime
+            return t(
+              `${label}剩余 ${remainingPercent}%，刷新 ${reset}`,
+              `${label} ${remainingPercent}% remaining, refreshes ${reset}`,
+            )
+          }
+          if (countdown) {
+            return t(
+              `${label}剩余 ${remainingPercent}%，${countdown}`,
+              `${label} ${remainingPercent}% remaining, ${countdown}`,
+            )
+          }
+          return t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
         })
         .join('，')
       return `${antigravityGroupLabel(group)}：${buckets}`

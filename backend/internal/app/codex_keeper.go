@@ -4452,22 +4452,30 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			-- leaves it nil); antigravity_quota: preserve on a failed/skipped fetch (nil) like
 			-- reset_credits, otherwise write the fresh snapshot.
 			provider = COALESCE(excluded.provider, codex_keeper_auth_states.provider),
-			-- The antigravity project id is the resource identity. On a codex inspection it clears
-			-- (this is not a codex column); on antigravity it takes the freshly resolved project
-			-- (set even on a failed quota fetch) so a project SWAP is detectable.
+			-- The antigravity identity digest is the resource identity. A codex inspection clears it
+			-- (not a codex column). An antigravity inspection with a RESOLVED identity writes the
+			-- fresh digest; when the identity is UNKNOWN this inspection (excluded digest NULL, e.g.
+			-- the detail read failed) it must PRESERVE the stored digest — wiping it would erase the
+			-- swap-detection anchor and let the next inspection's COALESCE keep a different account's
+			-- quota. So COALESCE(fresh, stored) rather than force-writing the (possibly NULL) fresh.
 			antigravity_identity_digest = CASE
 				WHEN excluded.provider = 'codex' THEN NULL
-				WHEN excluded.provider = 'antigravity' THEN excluded.antigravity_identity_digest
 				ELSE COALESCE(excluded.antigravity_identity_digest, codex_keeper_auth_states.antigravity_identity_digest)
 			END,
 			antigravity_quota = CASE
 				WHEN excluded.provider = 'codex' THEN NULL
-				-- Confirmed project SWAP (stored and incoming project ids both known and DIFFERENT):
-				-- write the incoming value, which is NULL on a failed fetch, so the previous
-				-- project's quota is cleared rather than shown against the new project.
-				WHEN codex_keeper_auth_states.antigravity_identity_digest IS NOT NULL AND excluded.antigravity_identity_digest IS NOT NULL
-					AND codex_keeper_auth_states.antigravity_identity_digest <> excluded.antigravity_identity_digest
+				-- Incoming identity is KNOWN and the stored quota is NOT proven to belong to it —
+				-- either the stored digest is NULL (legacy/unbound snapshot: no identity binding, so
+				-- it cannot be shown to be this account's) OR the stored digest DIFFERS (confirmed
+				-- swap). Write the incoming value, which is NULL on a failed fetch, so an unprovable
+				-- or stale quota is CLEARED rather than inherited by the current identity.
+				WHEN excluded.antigravity_identity_digest IS NOT NULL
+					AND (codex_keeper_auth_states.antigravity_identity_digest IS NULL
+						OR codex_keeper_auth_states.antigravity_identity_digest <> excluded.antigravity_identity_digest)
 					THEN excluded.antigravity_quota
+				-- Same proven identity, or incoming identity UNKNOWN (excluded digest NULL): preserve
+				-- the stored quota across a transient fetch failure (COALESCE keeps stored when the
+				-- fresh value is NULL). Preserve-on-unknown pairs with the digest COALESCE above.
 				ELSE COALESCE(excluded.antigravity_quota, codex_keeper_auth_states.antigravity_quota)
 			END,
 			last_checked_at = excluded.last_checked_at,

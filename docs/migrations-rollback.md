@@ -14,7 +14,7 @@ This release added, on top of `202609040002`:
 - `202609060002` — **DROP** of the obsolete `codex_keeper_quota_resets` table.
 - `202609060003` — `codex_keeper_reset_redeems` (redeem ledger) table.
 - `202609060004` — `codex_keeper_auth_states.account_id` column (subscription identity scope).
-- `202609060005` — `codex_keeper_auth_states.provider` + `antigravity_quota` columns (multi-provider inspection: Antigravity accounts). Its Down drops both columns; no data beyond the Antigravity quota snapshot / provider tag is lost.
+- `202609060005` — `codex_keeper_auth_states.provider` + `antigravity_quota` + `antigravity_identity_digest` columns (multi-provider inspection: Antigravity accounts; the identity column stores a one-way digest, never the raw project/email). Its Down drops all three columns; no data beyond the Antigravity quota snapshot / provider tag / identity digest is lost.
 
 The previous binary (`a996697`, target version `202609040002`) both refuses to start
 against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
@@ -45,7 +45,7 @@ against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
    ```
 
    This runs the Down migrations for `202609060005`, `202609060004`, `202609060003`,
-   `202609060002`, and `202609060001`: it drops the `provider` + `antigravity_quota` columns,
+   `202609060002`, and `202609060001`: it drops the `provider` + `antigravity_quota` + `antigravity_identity_digest` columns,
    drops the `account_id` column, drops `codex_keeper_reset_redeems`,
    drops the `subscription_active_until` column, and **recreates an empty
    `codex_keeper_quota_resets`** so the old binary's `/accounts` query works.

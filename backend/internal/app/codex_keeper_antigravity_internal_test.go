@@ -108,23 +108,40 @@ func TestParseAntigravityQuotaGroupsEdgeCases(t *testing.T) {
 	}
 }
 
-func TestKeeperAntigravityProjectID(t *testing.T) {
+func TestKeeperExplicitAntigravityProjectID(t *testing.T) {
 	cases := []struct {
-		name   string
-		detail map[string]any
-		want   string
+		name    string
+		detail  map[string]any
+		want    string
+		wantErr bool
 	}{
-		{"top-level", map[string]any{"project_id": "aicode-consumers"}, "aicode-consumers"},
-		{"camel", map[string]any{"projectId": "p2"}, "p2"},
-		{"metadata", map[string]any{"metadata": map[string]any{"project_id": "p3"}}, "p3"},
-		{"attributes-virtual", map[string]any{"attributes": map[string]any{"gemini_virtual_project": "p4"}}, "p4"},
-		{"installed", map[string]any{"installed": map[string]any{"project_id": "p5"}}, "p5"},
-		{"web", map[string]any{"web": map[string]any{"project_id": "p6"}}, "p6"},
-		{"none", map[string]any{"email": "x@y.com"}, ""},
+		{"top-level", map[string]any{"project_id": "aicode-consumers"}, "aicode-consumers", false},
+		{"camel", map[string]any{"projectId": "p2"}, "p2", false},
+		{"metadata", map[string]any{"metadata": map[string]any{"project_id": "p3"}}, "p3", false},
+		{"attributes-virtual", map[string]any{"attributes": map[string]any{"gemini_virtual_project": "p4"}}, "p4", false},
+		{"installed", map[string]any{"installed": map[string]any{"project_id": "p5"}}, "p5", false},
+		{"web", map[string]any{"web": map[string]any{"project_id": "p6"}}, "p6", false},
+		{"none", map[string]any{"email": "x@y.com"}, "", false},
+		// All present aliases must agree and be strings.
+		{"top-level-agree", map[string]any{"project_id": "p", "projectId": "p"}, "p", false},
+		{"top-level-conflict", map[string]any{"project_id": "p", "projectId": "other"}, "", true},
+		{"top-level-wrong-type", map[string]any{"project_id": float64(1)}, "", true},
+		{"nested-wrong-type", map[string]any{"metadata": map[string]any{"project_id": float64(2)}}, "", true},
+		{"nested-vs-top-conflict", map[string]any{"projectId": "other", "metadata": map[string]any{"project_id": "p"}}, "", true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := keeperAntigravityProjectID(tc.detail); got != tc.want {
+			got, err := keeperExplicitAntigravityProjectID(tc.detail)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error (conflict/wrong-type), got %q", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tc.want {
 				t.Fatalf("projectID = %q, want %q", got, tc.want)
 			}
 		})
@@ -316,6 +333,33 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 		{"detail-project-wrong-type",
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": float64(7), "access_token": "t"}},
+		// project-id aliases (top-level + nested) must all agree and be strings.
+		{"detail-project-alias-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "projectId": "other", "access_token": "t"}},
+		{"detail-nested-project-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "metadata": map[string]any{"project_id": float64(5)}, "access_token": "t"}},
+		{"detail-nested-vs-top-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "projectId": "other", "metadata": map[string]any{"project_id": "p"}, "access_token": "t"}},
+		// email aliases (email/account_email/user_email) must agree and be strings, across sources too.
+		{"email-alias-cross-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "account_email": "b@x.com", "access_token": "t"}},
+		{"detail-email-alias-self-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com", "account_email": "b@x.com", "access_token": "t"}},
+		{"detail-email-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": float64(9), "access_token": "t"}},
+		// Missing email on BOTH sides: the resource key is provider+project+email and a project can be
+		// shared, so an unbound (email-less) identity is unprovable and must fail closed — not degrade
+		// to a project-only digest that a second email-less credential could inherit. Everything else
+		// (name/type/index/project) is consistent, so the ONLY reason this fails is the missing email.
+		{"missing-email-both-sides",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -580,11 +624,11 @@ func TestKeeperInspectAntigravityProjectSwapClearsStaleQuotaOnFailure(t *testing
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
-				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B"},
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "email": "sw@example.com"},
 			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "access_token": "t",
+				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "email": "sw@example.com", "access_token": "t",
 			})
 		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
 			http.Error(w, "quota boom", http.StatusBadGateway) // project-B quota fetch fails
@@ -606,7 +650,7 @@ func TestKeeperInspectAntigravityProjectSwapClearsStaleQuotaOnFailure(t *testing
 	seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
 	encoded, _ := json.Marshal(seed)
 	blob := string(encoded)
-	ag, idx, projectADigest := keeperProviderAntigravity, "idx-ag", keeperAntigravityIdentityDigest("project-A", "")
+	ag, idx, projectADigest := keeperProviderAntigravity, "idx-ag", keeperAntigravityIdentityDigest("project-A", "sw@example.com")
 	if err := app.upsertKeeperState(ctx, keeperAccountResult{
 		Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx,
 		AntigravityQuota: &blob, AntigravityIdentityDigest: &projectADigest,
@@ -621,7 +665,7 @@ func TestKeeperInspectAntigravityProjectSwapClearsStaleQuotaOnFailure(t *testing
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-B", "") {
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-B", "sw@example.com") {
 		t.Fatalf("project digest not rebound to project-B: %v", st.AntigravityIdentityDigest)
 	}
 	// The stored digest must NOT be the raw project id (privacy contract).
@@ -691,6 +735,151 @@ func TestKeeperInspectAntigravityEmailSwapClearsStaleQuotaOnFailure(t *testing.T
 	}
 	if len(st.AntigravityQuota) != 0 {
 		t.Fatalf("stale quota kept under a different email (shared project): %+v", st.AntigravityQuota)
+	}
+}
+
+// TestKeeperInspectAntigravityDetailFailurePreservesIdentityDigest reproduces the 3-phase probe: a
+// transient detail-read failure (identity UNKNOWN) must NOT wipe the stored identity digest, or the
+// next inspection loses its swap anchor and keeps the old account's quota. Phase 1 stores project-A
+// + quota; phase 2 fails the download (list still A) — digest+quota preserved; phase 3 resolves
+// project-B but the quota fetch fails — the A digest is still present so the swap is detected and
+// A's quota is cleared (not shown under B).
+func TestKeeperInspectAntigravityDetailFailurePreservesIdentityDigest(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "digest-preserve.json"
+	const email = "a@x.com"
+	var mu sync.Mutex
+	project := "project-A"
+	downloadFail := false
+	quotaFail := false
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		curProject, dFail, qFail := project, downloadFail, quotaFail
+		mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": curProject, "email": email},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			if dFail {
+				http.Error(w, "download boom", http.StatusBadGateway)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": curProject, "email": email, "access_token": "t",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			if qFail {
+				http.Error(w, "quota boom", http.StatusBadGateway)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": antigravityGoldenMap(t)})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	inspect := func() {
+		if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+			t.Fatalf("InspectAccountsLocked: %v", err)
+		}
+	}
+
+	// Phase 1: project-A resolves + quota fetched.
+	inspect()
+	st, _ := app.getKeeperState(ctx, authName)
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-A", email) || len(st.AntigravityQuota) != 2 {
+		t.Fatalf("phase1: digest/quota not stored: %v %d", st.AntigravityIdentityDigest, len(st.AntigravityQuota))
+	}
+
+	// Phase 2: download fails (identity unknown) — digest AND quota must be preserved.
+	mu.Lock()
+	downloadFail = true
+	mu.Unlock()
+	inspect()
+	st, _ = app.getKeeperState(ctx, authName)
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-A", email) {
+		t.Fatalf("phase2: identity digest was wiped on a transient detail failure: %v", st.AntigravityIdentityDigest)
+	}
+	if len(st.AntigravityQuota) != 2 {
+		t.Fatalf("phase2: quota not preserved on transient failure: %d", len(st.AntigravityQuota))
+	}
+
+	// Phase 3: detail recovers as project-B but the quota fetch fails — swap detected, A quota cleared.
+	mu.Lock()
+	downloadFail = false
+	project = "project-B"
+	quotaFail = true
+	mu.Unlock()
+	inspect()
+	st, _ = app.getKeeperState(ctx, authName)
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-B", email) {
+		t.Fatalf("phase3: digest not rebound to project-B: %v", st.AntigravityIdentityDigest)
+	}
+	if len(st.AntigravityQuota) != 0 {
+		t.Fatalf("phase3: stale project-A quota shown under project-B: %+v", st.AntigravityQuota)
+	}
+}
+
+// TestKeeperUpsertLegacyUnboundQuotaClearedWhenIdentityKnown proves the digest-CASE fail-closed
+// branch for a legacy/unbound snapshot: a stored antigravity_quota whose identity digest is NULL
+// (a pre-digest row, or a snapshot never bound to an identity) has no provable owner. When a new
+// inspection resolves a KNOWN identity but its quota fetch FAILS (incoming quota NULL), the unbound
+// quota must be CLEARED rather than COALESCE-preserved and inherited by the now-known identity. The
+// same-identity transient failure (preserve-on-unknown) is covered by the 3-phase test above.
+func TestKeeperUpsertLegacyUnboundQuotaClearedWhenIdentityKnown(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	const authName = "legacy-unbound.json"
+
+	// Seed a legacy row: quota present, identity digest NULL (never bound to an identity).
+	seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+	encoded, _ := json.Marshal(seed)
+	blob := string(encoded)
+	ag, idx := keeperProviderAntigravity, "idx-ag"
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx,
+		AntigravityQuota: &blob, // AntigravityIdentityDigest left nil (unbound)
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if seeded, _ := app.getKeeperState(ctx, authName); seeded.AntigravityIdentityDigest != nil || len(seeded.AntigravityQuota) != 2 {
+		t.Fatalf("seed precondition: digest=%v quota=%d (want NULL digest, 2 groups)", seeded.AntigravityIdentityDigest, len(seeded.AntigravityQuota))
+	}
+
+	// New inspection: identity now KNOWN, but the quota fetch failed (incoming quota NULL).
+	digest := keeperAntigravityIdentityDigest("proj", "e@x.com")
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "network_error", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx,
+		AntigravityIdentityDigest: &digest, // AntigravityQuota nil (fetch failed)
+	}); err != nil {
+		t.Fatalf("upsert: %v", err)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != digest {
+		t.Fatalf("identity digest not bound: %v", st.AntigravityIdentityDigest)
+	}
+	if len(st.AntigravityQuota) != 0 {
+		t.Fatalf("unbound legacy quota not cleared once identity known + fetch failed: %+v", st.AntigravityQuota)
 	}
 }
 
