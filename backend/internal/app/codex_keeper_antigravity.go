@@ -284,11 +284,16 @@ func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name st
 	if ierr != nil || strings.TrimSpace(idx) == "" {
 		return antigravityIdentity{}, false
 	}
-	projectID := keeperAntigravityProjectID(detail)
-	if projectID == "" {
+	// The CPA list entry also exposes project_id; when BOTH sources carry one they must agree
+	// (a same-name file swap / memory-vs-disk drift would otherwise let the detail's project run a
+	// quota call for a different account). A non-empty project must be resolvable.
+	listProject := keeperAntigravityProjectID(authInfo)
+	detailProject := keeperAntigravityProjectID(detail)
+	project, perr := keeperReconcileIdentityField(listProject, detailProject)
+	if perr != nil || strings.TrimSpace(project) == "" {
 		return antigravityIdentity{}, false
 	}
-	return antigravityIdentity{authIndex: idx, projectID: projectID}, true
+	return antigravityIdentity{authIndex: idx, projectID: project}, true
 }
 
 // processKeeperAntigravityAuth inspects one Antigravity account: it reads the download detail,

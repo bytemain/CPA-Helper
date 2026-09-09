@@ -300,6 +300,9 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 		{"no-explicit-auth-index",
 			map[string]any{"name": authName, "type": "antigravity"},
 			map[string]any{"name": authName, "type": "antigravity", "project_id": "p", "access_token": "t"}},
+		{"project-id-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-A"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "access_token": "t"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
