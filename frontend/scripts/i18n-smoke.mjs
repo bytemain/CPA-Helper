@@ -162,8 +162,8 @@ try {
     'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.',
   )
   assert.equal(
-    localizedServerMessage('账号身份冲突：Antigravity 列表与详情的 name/type/auth_index 不一致，已保留原快照'),
-    'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index; the previous snapshot was preserved.',
+    localizedServerMessage('账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id 不一致，已保留原快照'),
+    'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id; the previous snapshot was preserved.',
   )
   assert.equal(
     localizedServerMessage('账号 account_id 身份冲突（列表与详情不一致），请刷新后重试'),

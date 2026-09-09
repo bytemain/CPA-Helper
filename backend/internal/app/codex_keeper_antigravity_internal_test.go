@@ -291,9 +291,12 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 		listEntry map[string]any
 		download  map[string]any
 	}{
-		{"different-name-and-index",
-			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
-			map[string]any{"name": "other.json", "type": "antigravity", "auth_index": "idx-other", "project_id": "p", "access_token": "t"}},
+		{"name-only-mismatch",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": "other.json", "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},
+		{"index-only-mismatch",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-other", "project_id": "p", "access_token": "t"}},
 		{"type-drift-to-codex",
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
 			map[string]any{"name": authName, "type": "codex", "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},

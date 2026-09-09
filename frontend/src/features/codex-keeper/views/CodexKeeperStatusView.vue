@@ -836,6 +836,13 @@ function accountTypeLabel(accountType: string | null): string {
   return accountType ?? normalized
 }
 
+// providerAwareAccountTypeLabel returns the antigravity provider label for
+// antigravity accounts, otherwise the codex account-type label.
+function providerAwareAccountTypeLabel(account: CodexKeeperAccount): string {
+  if (isAntigravityAccount(account)) return 'Antigravity'
+  return accountTypeLabel(account.account_type)
+}
+
 function isAntigravityAccount(account: CodexKeeperAccount): boolean {
   return account.provider === 'antigravity'
 }
@@ -860,6 +867,15 @@ function antigravityWindowLabel(bucket: AntigravityQuotaBucket): string {
     return t('5 小时', '5-hour')
   }
   return bucket.display_name
+}
+
+// antigravityGroupLabel maps the group's known English display_name to a
+// localized label, falling back to the raw display_name for unknown groups.
+function antigravityGroupLabel(group: AntigravityQuotaGroup): string {
+  const name = (group.display_name ?? '').trim()
+  if (name === 'Gemini Models') return t('Gemini 模型', 'Gemini Models')
+  if (name === 'Claude and GPT models') return t('Claude 和 GPT 模型', 'Claude and GPT models')
+  return group.display_name
 }
 
 // antigravityRemainingPercent clamps remaining_fraction (0..1) to a 0..100 integer
@@ -1171,11 +1187,10 @@ function renderAntigravityQuotaCell(account: CodexKeeperAccount) {
     { class: 'quota-window-cell' },
     groups.map((group) =>
       h('div', { class: 'quota-antigravity-group' }, [
-        h('div', { class: 'quota-antigravity-group-title', title: group.description ?? group.display_name }, group.display_name),
+        h('div', { class: 'quota-antigravity-group-title', title: group.description ?? group.display_name }, antigravityGroupLabel(group)),
         ...group.buckets.map((bucket) => {
           const remainingPercent = antigravityRemainingPercent(bucket)
-          const windowLabel = antigravityWindowLabel(bucket)
-          const label = `${bucket.display_name}（${windowLabel}）`
+          const label = antigravityWindowLabel(bucket)
           const resetTime = formatQuotaResetTime(bucket.reset_at)
           const countdown = formatQuotaResetCountdown(bucket.reset_at)
           return h(
@@ -1223,9 +1238,8 @@ function antigravityQuotaText(account: CodexKeeperAccount): string {
       const buckets = group.buckets
         .map((bucket) => {
           const remainingPercent = antigravityRemainingPercent(bucket)
-          const windowLabel = antigravityWindowLabel(bucket)
           const resetTime = formatQuotaResetTime(bucket.reset_at)
-          const label = `${bucket.display_name}（${windowLabel}）`
+          const label = antigravityWindowLabel(bucket)
           return resetTime
             ? t(
                 `${label}剩余 ${remainingPercent}%，刷新 ${resetTime}`,
@@ -1234,7 +1248,7 @@ function antigravityQuotaText(account: CodexKeeperAccount): string {
             : t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
         })
         .join('，')
-      return `${group.display_name}：${buckets}`
+      return `${antigravityGroupLabel(group)}：${buckets}`
     })
     .join(' / ')
 }
@@ -1421,9 +1435,7 @@ function renderAccountIdentityCell(account: CodexKeeperAccount) {
 }
 
 function renderAccountTypeCell(account: CodexKeeperAccount) {
-  const typeLabel = isAntigravityAccount(account)
-    ? t('Antigravity', 'Antigravity')
-    : accountTypeLabel(account.account_type)
+  const typeLabel = providerAwareAccountTypeLabel(account)
   return h(
     'span',
     { class: ['account-table-chip', 'is-type'], title: typeLabel },
@@ -2619,7 +2631,7 @@ onBeforeUnmount(() => {
               <div class="account-card-meta-grid">
                 <div class="account-card-meta-item">
                   <span>{{ t('类型', 'Type') }}</span>
-                  <strong>{{ accountTypeLabel(account.account_type) }}</strong>
+                  <strong>{{ providerAwareAccountTypeLabel(account) }}</strong>
                 </div>
                 <div class="account-card-meta-item">
                   <span>{{ t('优先级', 'Priority') }}</span>
@@ -2653,7 +2665,7 @@ onBeforeUnmount(() => {
                           class="quota-antigravity-group-title"
                           :title="group.description ?? group.display_name"
                         >
-                          {{ group.display_name }}
+                          {{ antigravityGroupLabel(group) }}
                         </div>
                         <div
                           v-for="bucket in group.buckets"
@@ -2687,7 +2699,7 @@ onBeforeUnmount(() => {
                           class="quota-antigravity-group-title"
                           :title="group.description ?? group.display_name"
                         >
-                          {{ group.display_name }}
+                          {{ antigravityGroupLabel(group) }}
                         </div>
                         <div
                           v-for="bucket in group.buckets"
@@ -2826,7 +2838,7 @@ onBeforeUnmount(() => {
           <NDescriptionsItem :label="t('账号', 'Account')">{{ selectedAccount.name }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('邮箱', 'Email')">{{ selectedAccount.email ?? '-' }}</NDescriptionsItem>
           <NDescriptionsItem :label="t('账号类型', 'Account Type')">
-            {{ accountTypeLabel(selectedAccount.account_type) }}
+            {{ providerAwareAccountTypeLabel(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('启用状态', 'Enabled Status')">
             {{ selectedAccount.disabled ? t('已禁用', 'Disabled') : t('启用中', 'Enabled') }}

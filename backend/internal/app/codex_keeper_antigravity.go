@@ -336,7 +336,7 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 	// preserve the prior snapshot, and make NO quota call.
 	identity, ok := keeperReconcileAntigravityIdentity(authInfo, detail, name)
 	if !ok {
-		message := "账号身份冲突：Antigravity 列表与详情的 name/type/auth_index 不一致，已保留原快照"
+		message := "账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id 不一致，已保留原快照"
 		result.Result = "identity_error"
 		result.LastError = &message
 		result.LatestAction = &message
