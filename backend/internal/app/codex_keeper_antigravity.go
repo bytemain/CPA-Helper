@@ -357,9 +357,15 @@ func keeperExplicitAntigravityProjectID(o map[string]any) (string, error) {
 		return "", err
 	}
 	for _, nestedKey := range []string{"metadata", "attributes", "installed", "web"} {
-		nested, ok := o[nestedKey].(map[string]any)
-		if !ok {
+		raw, present := o[nestedKey]
+		if !present || raw == nil {
 			continue
+		}
+		// A present container of the wrong type (e.g. a JSON number) is NOT absent — treating it as
+		// absent would let a malformed detail slip past the present-invalid contract. Fail closed.
+		nested, ok := raw.(map[string]any)
+		if !ok {
+			return "", errKeeperIdentityConflict
 		}
 		keys := []string{"project_id", "projectId"}
 		if nestedKey == "attributes" {

@@ -128,6 +128,15 @@ func TestKeeperExplicitAntigravityProjectID(t *testing.T) {
 		{"top-level-wrong-type", map[string]any{"project_id": float64(1)}, "", true},
 		{"nested-wrong-type", map[string]any{"metadata": map[string]any{"project_id": float64(2)}}, "", true},
 		{"nested-vs-top-conflict", map[string]any{"projectId": "other", "metadata": map[string]any{"project_id": "p"}}, "", true},
+		// A nested container that is PRESENT but not an object is present-invalid, not absent —
+		// even when the top-level project id is valid, a wrong-type container must fail closed
+		// (the whole detail is untrustworthy) rather than being silently skipped.
+		{"metadata-non-object", map[string]any{"project_id": "p", "metadata": float64(7)}, "", true},
+		{"attributes-non-object", map[string]any{"project_id": "p", "attributes": float64(7)}, "", true},
+		{"installed-non-object", map[string]any{"project_id": "p", "installed": float64(7)}, "", true},
+		{"web-non-object", map[string]any{"project_id": "p", "web": float64(7)}, "", true},
+		// A null (or absent) container is genuinely absent and is skipped, not an error.
+		{"nested-null-skipped", map[string]any{"project_id": "p", "metadata": nil}, "p", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
