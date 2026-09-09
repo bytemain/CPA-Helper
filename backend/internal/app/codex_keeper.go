@@ -147,27 +147,34 @@ type keeperQuotaResetRequest struct {
 }
 
 type keeperAccount struct {
-	Name                    string              `json:"name"`
-	Email                   *string             `json:"email"`
-	AuthIndex               *string             `json:"auth_index"`
-	AccountType             *string             `json:"account_type"`
-	Disabled                bool                `json:"disabled"`
-	Priority                *int                `json:"priority"`
-	PrimaryUsedPercent      *int                `json:"primary_used_percent"`
-	SecondaryUsedPercent    *int                `json:"secondary_used_percent"`
-	PrimaryResetAt          *time.Time          `json:"primary_reset_at"`
-	SecondaryResetAt        *time.Time          `json:"secondary_reset_at"`
-	PrimaryWindowSeconds    *int                `json:"primary_window_seconds"`
-	SecondaryWindowSeconds  *int                `json:"secondary_window_seconds"`
-	QuotaThreshold          *int                `json:"quota_threshold"`
-	LastStatusCode          *int                `json:"last_status_code"`
-	ResetCreditCount        *int                `json:"reset_credit_count"`
-	ResetCredits            []keeperResetCredit `json:"reset_credits"`
-	SubscriptionActiveUntil *time.Time          `json:"subscription_active_until"`
-	LastError               *string             `json:"last_error"`
-	LatestAction            *string             `json:"latest_action"`
-	LastCheckedAt           *time.Time          `json:"last_checked_at"`
-	LastHealthyAt           *time.Time          `json:"last_healthy_at"`
+	Name        string  `json:"name"`
+	Email       *string `json:"email"`
+	AuthIndex   *string `json:"auth_index"`
+	AccountType *string `json:"account_type"`
+	// Provider is the upstream this account belongs to: "codex" or "antigravity". Nil/absent is
+	// treated as codex (rows predating multi-provider support). The frontend uses it to choose the
+	// Codex vs Antigravity quota UI and to hide Codex-only actions (reset/subscription).
+	Provider *string `json:"provider"`
+	// AntigravityQuota is the Antigravity quota summary (groups -> buckets) for antigravity
+	// accounts; nil for codex accounts.
+	AntigravityQuota        []keeperAntigravityGroup `json:"antigravity_quota"`
+	Disabled                bool                     `json:"disabled"`
+	Priority                *int                     `json:"priority"`
+	PrimaryUsedPercent      *int                     `json:"primary_used_percent"`
+	SecondaryUsedPercent    *int                     `json:"secondary_used_percent"`
+	PrimaryResetAt          *time.Time               `json:"primary_reset_at"`
+	SecondaryResetAt        *time.Time               `json:"secondary_reset_at"`
+	PrimaryWindowSeconds    *int                     `json:"primary_window_seconds"`
+	SecondaryWindowSeconds  *int                     `json:"secondary_window_seconds"`
+	QuotaThreshold          *int                     `json:"quota_threshold"`
+	LastStatusCode          *int                     `json:"last_status_code"`
+	ResetCreditCount        *int                     `json:"reset_credit_count"`
+	ResetCredits            []keeperResetCredit      `json:"reset_credits"`
+	SubscriptionActiveUntil *time.Time               `json:"subscription_active_until"`
+	LastError               *string                  `json:"last_error"`
+	LatestAction            *string                  `json:"latest_action"`
+	LastCheckedAt           *time.Time               `json:"last_checked_at"`
+	LastHealthyAt           *time.Time               `json:"last_healthy_at"`
 }
 
 // keeperResetCredit is the safe projection of one entry from
@@ -343,6 +350,11 @@ type keeperAccountResult struct {
 	// StateWriteFailed is set when persisting this result to the DB failed, so the
 	// inspection did not actually update the stored state.
 	StateWriteFailed bool
+	// Provider is the upstream this inspection processed ("codex" or "antigravity").
+	Provider *string
+	// AntigravityQuota is the parsed Antigravity quota summary serialized to JSON; nil (a
+	// failed/skipped fetch) preserves the previous snapshot in upsertKeeperState via COALESCE.
+	AntigravityQuota *string
 }
 
 func NewKeeperRunner(app *App) *KeeperRunner {
@@ -1891,7 +1903,7 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	filtered := make([]map[string]any, 0, len(authFiles))
 	remoteCodexNames := map[string]bool{}
 	for _, item := range authFiles {
-		if keeperString(item["type"]) != "codex" {
+		if !keeperIsInspectableProvider(keeperString(item["type"])) {
 			continue
 		}
 		name := keeperString(item["name"])
@@ -1916,8 +1928,19 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	}
 	stats.Total = len(filtered)
 	if cfg.CodexKeeper.EnableCredentialWebsockets && !cfg.CodexKeeper.DryRun {
+		// The credential-websocket transport is Codex-specific; keep non-Codex (Antigravity)
+		// items out of it and recombine afterward so they are still inspected.
+		var codexItems, otherItems []map[string]any
+		for _, item := range filtered {
+			if keeperString(item["type"]) == keeperProviderAntigravity {
+				otherItems = append(otherItems, item)
+			} else {
+				codexItems = append(codexItems, item)
+			}
+		}
 		var websocketFailures []keeperAccountResult
-		filtered, websocketFailures = a.ensureKeeperAuthWebsockets(ctx, cfg, options.Mode, filtered, logFn, options.TryLockAuthName, options.UnlockAuthName)
+		codexItems, websocketFailures = a.ensureKeeperAuthWebsockets(ctx, cfg, options.Mode, codexItems, logFn, options.TryLockAuthName, options.UnlockAuthName)
+		filtered = append(codexItems, otherItems...)
 		for _, result := range websocketFailures {
 			a.mergeKeeperStats(&stats, result)
 			if runID > 0 {
@@ -2630,12 +2653,18 @@ func (a *App) ensureKeeperAuthWebsockets(
 }
 
 func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map[string]any, logFn func(string), manualRefresh bool) keeperAccountResult {
+	// Dispatch by provider: an Antigravity account takes a separate quota path with none of the
+	// ChatGPT-specific usage/reset/subscription logic below.
+	if keeperString(authInfo["type"]) == keeperProviderAntigravity {
+		return a.processKeeperAntigravityAuth(ctx, cfg, authInfo, logFn, manualRefresh)
+	}
 	now := time.Now().In(appTimeLocation)
 	name := keeperString(authInfo["name"])
 	if name == "" {
 		name = "unknown"
 	}
-	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now}
+	codexProvider := keeperProviderCodex
+	result := keeperAccountResult{Name: name, Result: "skipped", CheckedAt: now, Provider: &codexProvider}
 	// Subscription renewal time comes from the auth-file list entry's parsed
 	// id_token claims (available regardless of the usage-fetch outcome), so set it
 	// up front to persist on every path.
@@ -3522,7 +3551,8 @@ func (a *App) listKeeperAccounts(ctx context.Context) ([]keeperAccount, error) {
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
-		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT)
+		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT),
+		       provider, CAST(antigravity_quota AS TEXT)
 		FROM codex_keeper_auth_states
 		ORDER BY COALESCE(email, ''), auth_name
 	`)
@@ -4248,7 +4278,8 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 		       secondary_used_percent, CAST(primary_reset_at AS TEXT), CAST(secondary_reset_at AS TEXT), quota_threshold,
 		       last_status_code, last_error, latest_action, CAST(last_checked_at AS TEXT), CAST(last_healthy_at AS TEXT),
 		       primary_window_seconds, secondary_window_seconds, restore_priority, CAST(created_at AS TEXT), CAST(updated_at AS TEXT),
-		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT)
+		       reset_credit_count, CAST(reset_credits AS TEXT), CAST(subscription_active_until AS TEXT), CAST(account_id AS TEXT),
+		       provider, CAST(antigravity_quota AS TEXT)
 		FROM codex_keeper_auth_states WHERE auth_name = ?
 	`, name)
 	if err != nil {
@@ -4267,17 +4298,19 @@ func (a *App) getKeeperState(ctx context.Context, name string) (*keeperAuthState
 
 func scanKeeperState(scanner interface{ Scan(dest ...any) error }) (keeperAuthState, error) {
 	var state keeperAuthState
-	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits, subscriptionActiveUntil, accountID sql.NullString
+	var email, authIndex, accountType, primaryReset, secondaryReset, lastError, latestAction, lastChecked, lastHealthy, createdAt, updatedAt, resetCredits, subscriptionActiveUntil, accountID, provider, antigravityQuota sql.NullString
 	var priority, primaryUsed, secondaryUsed, quotaThreshold, lastStatus, primaryWindowSeconds, secondaryWindowSeconds, restorePriority, resetCreditCount sql.NullInt64
 	err := scanner.Scan(
 		&state.Name, &email, &authIndex, &accountType, &state.Disabled, &priority, &primaryUsed,
 		&secondaryUsed, &primaryReset, &secondaryReset, &quotaThreshold, &lastStatus,
 		&lastError, &latestAction, &lastChecked, &lastHealthy, &primaryWindowSeconds, &secondaryWindowSeconds, &restorePriority,
-		&createdAt, &updatedAt, &resetCreditCount, &resetCredits, &subscriptionActiveUntil, &accountID,
+		&createdAt, &updatedAt, &resetCreditCount, &resetCredits, &subscriptionActiveUntil, &accountID, &provider, &antigravityQuota,
 	)
 	if err != nil {
 		return keeperAuthState{}, err
 	}
+	state.Provider = keeperProviderOrCodex(nullableString(provider))
+	state.AntigravityQuota = parseStoredAntigravityQuota(antigravityQuota)
 	state.Email = nullableString(email)
 	state.AuthIndex = nullableString(authIndex)
 	state.AccountType = keeperAccountTypeOrUnknown(nullableString(accountType))
@@ -4320,9 +4353,9 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			auth_name, email, auth_index, account_type, disabled, priority, restore_priority, latest_action, last_error,
 			last_status_code, primary_used_percent, secondary_used_percent, quota_threshold,
 			primary_reset_at, secondary_reset_at, primary_window_seconds, secondary_window_seconds,
-			reset_credit_count, reset_credits, subscription_active_until, account_id,
+			reset_credit_count, reset_credits, subscription_active_until, account_id, provider, antigravity_quota,
 			last_checked_at, last_healthy_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			-- Track the current account identity, keeping the old value only on a
 			-- fetch where no account_id was observed.
@@ -4386,10 +4419,15 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 					THEN excluded.subscription_active_until
 				ELSE COALESCE(excluded.subscription_active_until, codex_keeper_auth_states.subscription_active_until)
 			END,
+			-- provider: keep the stored value when this inspection did not set it (a Codex path
+			-- leaves it nil); antigravity_quota: preserve on a failed/skipped fetch (nil) like
+			-- reset_credits, otherwise write the fresh snapshot.
+			provider = COALESCE(excluded.provider, codex_keeper_auth_states.provider),
+			antigravity_quota = COALESCE(excluded.antigravity_quota, codex_keeper_auth_states.antigravity_quota),
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at
-	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, dbTimePtr(result.SubscriptionActiveUntil), result.AccountID, checkedAt, lastHealthy, now, now, result.ClearRestorePriority, boolValue(&result.SubscriptionKnown))
+	`, result.Name, result.Email, result.AuthIndex, result.AccountType, boolValue(result.Disabled), result.Priority, result.RestorePriority, result.LatestAction, result.LastError, result.LastStatusCode, result.PrimaryUsedPercent, result.SecondaryUsedPercent, result.QuotaThreshold, dbTimePtr(result.PrimaryResetAt), dbTimePtr(result.SecondaryResetAt), result.PrimaryWindowSeconds, result.SecondaryWindowSeconds, result.ResetCreditCount, result.ResetCredits, dbTimePtr(result.SubscriptionActiveUntil), result.AccountID, result.Provider, result.AntigravityQuota, checkedAt, lastHealthy, now, now, result.ClearRestorePriority, boolValue(&result.SubscriptionKnown))
 	return err
 }
 

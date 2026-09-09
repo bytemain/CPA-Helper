@@ -6,7 +6,7 @@ version is newer than the binary** (goose reports
 `database migration version is newer than this application`). A binary rollback
 therefore always requires migrating the schema **down first**.
 
-## Rolling back the reset-credit-consume release (migrations 202609060001–202609060004)
+## Rolling back the keeper releases (migrations 202609060001–202609060005)
 
 This release added, on top of `202609040002`:
 
@@ -14,6 +14,7 @@ This release added, on top of `202609040002`:
 - `202609060002` — **DROP** of the obsolete `codex_keeper_quota_resets` table.
 - `202609060003` — `codex_keeper_reset_redeems` (redeem ledger) table.
 - `202609060004` — `codex_keeper_auth_states.account_id` column (subscription identity scope).
+- `202609060005` — `codex_keeper_auth_states.provider` + `antigravity_quota` columns (multi-provider inspection: Antigravity accounts). Its Down drops both columns; no data beyond the Antigravity quota snapshot / provider tag is lost.
 
 The previous binary (`a996697`, target version `202609040002`) both refuses to start
 against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
@@ -43,8 +44,9 @@ against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
    cpa-helper migrate down-to 202609040002 --allow-pending
    ```
 
-   This runs the Down migrations for `202609060004`, `202609060003`, `202609060002`, and
-   `202609060001`: it drops the `account_id` column, drops `codex_keeper_reset_redeems`,
+   This runs the Down migrations for `202609060005`, `202609060004`, `202609060003`,
+   `202609060002`, and `202609060001`: it drops the `provider` + `antigravity_quota` columns,
+   drops the `account_id` column, drops `codex_keeper_reset_redeems`,
    drops the `subscription_active_until` column, and **recreates an empty
    `codex_keeper_quota_resets`** so the old binary's `/accounts` query works.
    `202609040002` is the only allowlisted rollback target; the command refuses any other
