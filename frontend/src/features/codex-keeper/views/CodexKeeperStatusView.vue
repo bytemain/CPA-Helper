@@ -50,6 +50,8 @@ import {
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
 import type {
+  AntigravityQuotaBucket,
+  AntigravityQuotaGroup,
   CodexKeeperAccount,
   CodexKeeperPriorityRule,
   CodexKeeperQuotaWindowUsage,
@@ -834,6 +836,39 @@ function accountTypeLabel(accountType: string | null): string {
   return accountType ?? normalized
 }
 
+function isAntigravityAccount(account: CodexKeeperAccount): boolean {
+  return account.provider === 'antigravity'
+}
+
+// antigravityQuotaGroups returns the non-empty quota groups for an antigravity
+// account, or an empty list for codex accounts / missing data.
+function antigravityQuotaGroups(account: CodexKeeperAccount): AntigravityQuotaGroup[] {
+  if (!isAntigravityAccount(account)) {
+    return []
+  }
+  return (account.antigravity_quota ?? []).filter((group) => (group.buckets?.length ?? 0) > 0)
+}
+
+// antigravityWindowLabel maps the bucket window ("weekly"/"5h") to a localized
+// label, falling back to the bucket's own display_name for unknown windows.
+function antigravityWindowLabel(bucket: AntigravityQuotaBucket): string {
+  const window = bucket.window?.trim().toLowerCase()
+  if (window === 'weekly') {
+    return t('每周', 'Weekly')
+  }
+  if (window === '5h') {
+    return t('5 小时', '5-hour')
+  }
+  return bucket.display_name
+}
+
+// antigravityRemainingPercent clamps remaining_fraction (0..1) to a 0..100 integer
+// percentage for the remaining-quota bar.
+function antigravityRemainingPercent(bucket: AntigravityQuotaBucket): number {
+  const fraction = Number.isFinite(bucket.remaining_fraction) ? bucket.remaining_fraction : 0
+  return Math.max(0, Math.min(100, Math.round(fraction * 100)))
+}
+
 function isPaidQuotaWindowAccount(accountType: string | null): boolean {
   const normalized = accountType?.trim().toLowerCase()
   return normalized === 'plus' || normalized === 'team' || normalized === 'k12' || normalized?.startsWith('pro') === true
@@ -1006,6 +1041,9 @@ function formatQuotaResetCountdown(value: string | null): string | null {
 }
 
 function quotaText(account: CodexKeeperAccount): string {
+  if (isAntigravityAccount(account)) {
+    return antigravityQuotaText(account)
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1107,7 +1145,91 @@ function disabledStatusCodeTitle(account: CodexKeeperAccount): string | null {
   return text === null ? null : `HTTP ${text}`
 }
 
+// renderAntigravityQuotaCell renders the antigravity provider's quota groups and
+// their buckets. Each bucket shows a remaining-quota bar (remaining_fraction * 100)
+// reusing the codex quota-window bar styling, plus the reset time and countdown.
+function renderAntigravityQuotaCell(account: CodexKeeperAccount) {
+  const groups = antigravityQuotaGroups(account)
+  if (groups.length === 0) {
+    return '-'
+  }
+  return h(
+    'div',
+    { class: 'quota-window-cell' },
+    groups.map((group) =>
+      h('div', { class: 'quota-antigravity-group' }, [
+        h('div', { class: 'quota-antigravity-group-title', title: group.description ?? group.display_name }, group.display_name),
+        ...group.buckets.map((bucket) => {
+          const remainingPercent = antigravityRemainingPercent(bucket)
+          const windowLabel = antigravityWindowLabel(bucket)
+          const label = `${bucket.display_name}（${windowLabel}）`
+          const resetTime = formatQuotaResetTime(bucket.reset_at)
+          const countdown = formatQuotaResetCountdown(bucket.reset_at)
+          return h(
+            'div',
+            {
+              class: 'quota-window-item',
+              title: bucket.description
+                ? t(
+                    `${label} 剩余 ${remainingPercent}%；${bucket.description}`,
+                    `${label} ${remainingPercent}% remaining; ${bucket.description}`,
+                  )
+                : t(`${label} 剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`),
+            },
+            [
+              h('div', { class: 'quota-window-head' }, [
+                h('span', { class: 'quota-window-label' }, label),
+                h('span', { class: 'quota-window-meta' }, [
+                  h('span', { class: 'quota-window-percent' }, t(`剩余 ${remainingPercent}%`, `${remainingPercent}% remaining`)),
+                  resetTime ? h('span', { class: 'quota-window-reset' }, countdown ? `${resetTime}（${countdown}）` : resetTime) : null,
+                ]),
+              ]),
+              h('div', { class: 'quota-window-track' }, [
+                h('div', {
+                  class: ['quota-window-fill', quotaBarTone(remainingPercent)],
+                  style: { width: `${remainingPercent}%` },
+                }),
+              ]),
+            ],
+          )
+        }),
+      ]),
+    ),
+  )
+}
+
+// antigravityQuotaText renders a compact single-line summary of the antigravity
+// quota groups/buckets for the account detail drawer.
+function antigravityQuotaText(account: CodexKeeperAccount): string {
+  const groups = antigravityQuotaGroups(account)
+  if (groups.length === 0) {
+    return '-'
+  }
+  return groups
+    .map((group) => {
+      const buckets = group.buckets
+        .map((bucket) => {
+          const remainingPercent = antigravityRemainingPercent(bucket)
+          const windowLabel = antigravityWindowLabel(bucket)
+          const resetTime = formatQuotaResetTime(bucket.reset_at)
+          const label = `${bucket.display_name}（${windowLabel}）`
+          return resetTime
+            ? t(
+                `${label}剩余 ${remainingPercent}%，刷新 ${resetTime}`,
+                `${label} ${remainingPercent}% remaining, refreshes ${resetTime}`,
+              )
+            : t(`${label}剩余 ${remainingPercent}%`, `${label} ${remainingPercent}% remaining`)
+        })
+        .join('，')
+      return `${group.display_name}：${buckets}`
+    })
+    .join(' / ')
+}
+
 function renderQuotaCell(account: CodexKeeperAccount) {
+  if (isAntigravityAccount(account)) {
+    return renderAntigravityQuotaCell(account)
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1152,6 +1274,9 @@ function renderQuotaCell(account: CodexKeeperAccount) {
 }
 
 function renderQuotaUsageCell(account: CodexKeeperAccount) {
+  if (isAntigravityAccount(account)) {
+    return '-'
+  }
   const items = quotaWindowItems(account)
   if (items.length === 0) {
     return '-'
@@ -1185,6 +1310,10 @@ function renderQuotaUsageCell(account: CodexKeeperAccount) {
 // countdown — the account's "主动重置过期时间" from wham/rate-limit-reset-credits.
 // A null expires_at means the credit never expires; such entries are still shown.
 function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
+  // Reset credits are a codex-only concept; antigravity accounts have none.
+  if (isAntigravityAccount(account)) {
+    return '—'
+  }
   const credits = account.reset_credits ?? []
   const count = account.reset_credit_count
   // The authoritative count is reset_credit_count. When it is null the snapshot is
@@ -1226,6 +1355,10 @@ function renderResetCreditScheduleCell(account: CodexKeeperAccount) {
 // CPA from the account's id_token `chatgpt_subscription_active_until` claim) plus
 // a coarse countdown. A null value (no subscription / unknown) renders a dash.
 function renderSubscriptionCell(account: CodexKeeperAccount) {
+  // Subscription renewal is codex-specific; antigravity accounts do not carry it.
+  if (isAntigravityAccount(account)) {
+    return '—'
+  }
   const value = account.subscription_active_until
   if (!value) {
     return '-'
@@ -1275,7 +1408,9 @@ function renderAccountIdentityCell(account: CodexKeeperAccount) {
 }
 
 function renderAccountTypeCell(account: CodexKeeperAccount) {
-  const typeLabel = accountTypeLabel(account.account_type)
+  const typeLabel = isAntigravityAccount(account)
+    ? t('Antigravity', 'Antigravity')
+    : accountTypeLabel(account.account_type)
   return h(
     'span',
     { class: ['account-table-chip', 'is-type'], title: typeLabel },
@@ -1902,18 +2037,21 @@ const disabledActionColumn = computed<DataTableColumns<CodexKeeperAccount>[numbe
             },
             { default: () => t('刷新', 'Refresh') },
           ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              quaternary: true,
-              type: 'warning',
-              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
-              loading: isActionLoading(row, 'reset-quota'),
-              onClick: () => confirmResetQuota(row),
-            },
-            { default: () => t('重置', 'Reset') },
-          ),
+          // Reset credits do not apply to antigravity accounts, so omit the button.
+          isAntigravityAccount(row)
+            ? null
+            : h(
+                NButton,
+                {
+                  size: 'small',
+                  quaternary: true,
+                  type: 'warning',
+                  disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+                  loading: isActionLoading(row, 'reset-quota'),
+                  onClick: () => confirmResetQuota(row),
+                },
+                { default: () => t('重置', 'Reset') },
+              ),
         ],
       },
     )
@@ -1970,18 +2108,21 @@ const normalActionColumn = computed<DataTableColumns<CodexKeeperAccount>[number]
             },
             { default: () => t('刷新', 'Refresh') },
           ),
-          h(
-            NButton,
-            {
-              size: 'small',
-              quaternary: true,
-              type: 'warning',
-              disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
-              loading: isActionLoading(row, 'reset-quota'),
-              onClick: () => confirmResetQuota(row),
-            },
-            { default: () => t('重置', 'Reset') },
-          ),
+          // Reset credits do not apply to antigravity accounts, so omit the button.
+          isAntigravityAccount(row)
+            ? null
+            : h(
+                NButton,
+                {
+                  size: 'small',
+                  quaternary: true,
+                  type: 'warning',
+                  disabled: isRowActing(row) || isBulkDeleting.value || isBulkRefreshing.value,
+                  loading: isActionLoading(row, 'reset-quota'),
+                  onClick: () => confirmResetQuota(row),
+                },
+                { default: () => t('重置', 'Reset') },
+              ),
         ],
       },
     )
@@ -2623,7 +2764,10 @@ onBeforeUnmount(() => {
           <NDescriptionsItem :label="t('最近巡检', 'Last Inspection')">
             {{ formatDateTime(selectedAccount.last_checked_at) }}
           </NDescriptionsItem>
-          <NDescriptionsItem :label="t('续期时间', 'Renews At')">
+          <NDescriptionsItem
+            v-if="!isAntigravityAccount(selectedAccount)"
+            :label="t('续期时间', 'Renews At')"
+          >
             {{ subscriptionDetailText(selectedAccount) }}
           </NDescriptionsItem>
           <NDescriptionsItem :label="t('最近操作', 'Latest Action')">
@@ -3653,6 +3797,22 @@ onBeforeUnmount(() => {
   gap: 4px;
   min-width: 0;
   min-height: 38px;
+}
+
+:global(.quota-antigravity-group) {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+}
+
+:global(.quota-antigravity-group-title) {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--cpa-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 :global(.quota-window-head) {

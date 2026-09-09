@@ -4358,8 +4358,12 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			-- Track the current account identity, keeping the old value only on a
-			-- fetch where no account_id was observed.
-			account_id = COALESCE(excluded.account_id, codex_keeper_auth_states.account_id),
+			-- fetch where no account_id was observed. An antigravity inspection has no ChatGPT
+			-- account_id, so a provider switch to antigravity clears the stale Codex identity.
+			account_id = CASE
+				WHEN excluded.provider = 'antigravity' THEN NULL
+				ELSE COALESCE(excluded.account_id, codex_keeper_auth_states.account_id)
+			END,
 			email = excluded.email,
 			auth_index = excluded.auth_index,
 			account_type = excluded.account_type,
@@ -4389,6 +4393,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			--      writes NULL rather than inheriting the previous account's count/schedule).
 			--   3. same/undeterminable account → COALESCE: write a fresh fetch, else preserve.
 			reset_credit_count = CASE
+				WHEN excluded.provider = 'antigravity' THEN NULL
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credit_count
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
 					AND codex_keeper_auth_states.account_id <> excluded.account_id
@@ -4396,6 +4401,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 				ELSE COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
 			END,
 			reset_credits = CASE
+				WHEN excluded.provider = 'antigravity' THEN NULL
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credits
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
 					AND codex_keeper_auth_states.account_id <> excluded.account_id
@@ -4412,6 +4418,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			--      incoming value so the new account never inherits the old renewal date.
 			--   4. otherwise (same/undeterminable account) → preserve on an unknown claim.
 			subscription_active_until = CASE
+				WHEN excluded.provider = 'antigravity' THEN NULL
 				WHEN ? AND excluded.auth_index IS NOT NULL THEN excluded.subscription_active_until
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.subscription_active_until
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
@@ -4423,7 +4430,10 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			-- leaves it nil); antigravity_quota: preserve on a failed/skipped fetch (nil) like
 			-- reset_credits, otherwise write the fresh snapshot.
 			provider = COALESCE(excluded.provider, codex_keeper_auth_states.provider),
-			antigravity_quota = COALESCE(excluded.antigravity_quota, codex_keeper_auth_states.antigravity_quota),
+			antigravity_quota = CASE
+				WHEN excluded.provider = 'codex' THEN NULL
+				ELSE COALESCE(excluded.antigravity_quota, codex_keeper_auth_states.antigravity_quota)
+			END,
 			last_checked_at = excluded.last_checked_at,
 			last_healthy_at = COALESCE(excluded.last_healthy_at, codex_keeper_auth_states.last_healthy_at),
 			updated_at = excluded.updated_at

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 // antigravityGoldenBody is the real retrieveUserQuotaSummary response captured from a production
@@ -264,6 +265,79 @@ func TestKeeperInspectAntigravityAccount(t *testing.T) {
 	if found == nil || found.Provider == nil || *found.Provider != "antigravity" || len(found.AntigravityQuota) != 2 {
 		t.Fatalf("antigravity account not visible with quota in list: %+v", found)
 	}
+}
+
+// TestKeeperUpsertProviderSwitchClearsStaleFields proves the upsert enforces the provider
+// invariant: switching a row codex→antigravity clears the stale Codex-only columns (account_id,
+// reset credits, subscription, usage), and switching back antigravity→codex clears the stale
+// antigravity_quota. So a filename reused for a different provider never shows mixed data.
+func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	const authName = "switcher.json"
+
+	// Seed a fully-populated Codex row.
+	codex := keeperProviderCodex
+	idx, used, count, acct := "idx-1", 40, 3, "acct-A"
+	sub := timeMust(t, "2026-10-01T00:00:00Z")
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: timeMust(t, "2026-09-09T00:00:00Z"), Provider: &codex,
+		AuthIndex: &idx, PrimaryUsedPercent: &used, ResetCreditCount: &count, ResetCredits: stringPtr(resetCreditSnapshotJSON),
+		SubscriptionActiveUntil: &sub, SubscriptionKnown: true, AccountID: &acct,
+	}); err != nil {
+		t.Fatalf("seed codex: %v", err)
+	}
+
+	// Same filename now inspected as antigravity.
+	antigravity := keeperProviderAntigravity
+	quota, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+	encoded, _ := json.Marshal(quota)
+	blob := string(encoded)
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: timeMust(t, "2026-09-09T01:00:00Z"), Provider: &antigravity,
+		AuthIndex: &idx, AntigravityQuota: &blob,
+	}); err != nil {
+		t.Fatalf("upsert antigravity: %v", err)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.Provider == nil || *st.Provider != "antigravity" || len(st.AntigravityQuota) != 2 {
+		t.Fatalf("switch to antigravity: provider/quota = %v/%d", st.Provider, len(st.AntigravityQuota))
+	}
+	if st.PrimaryUsedPercent != nil || st.ResetCreditCount != nil || st.ResetCredits != nil || st.SubscriptionActiveUntil != nil || st.AccountID != nil {
+		t.Fatalf("codex-only fields not cleared on provider switch: %+v", st.keeperAccount)
+	}
+
+	// Switch back to codex → the antigravity quota must be cleared.
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: timeMust(t, "2026-09-09T02:00:00Z"), Provider: &codex,
+		AuthIndex: &idx, PrimaryUsedPercent: &used,
+	}); err != nil {
+		t.Fatalf("upsert codex again: %v", err)
+	}
+	st, err = app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get2: %v", err)
+	}
+	if st.Provider == nil || *st.Provider != "codex" || len(st.AntigravityQuota) != 0 {
+		t.Fatalf("switch back to codex: provider=%v antigravity_quota len=%d (want cleared)", st.Provider, len(st.AntigravityQuota))
+	}
+}
+
+func timeMust(t *testing.T, s string) time.Time {
+	t.Helper()
+	parsed, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		t.Fatalf("parse time %q: %v", s, err)
+	}
+	return parsed
 }
 
 // TestFetchAntigravityQuotaNoProject proves a missing project id fails closed with no remote call.
