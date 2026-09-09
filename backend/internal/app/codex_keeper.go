@@ -202,28 +202,30 @@ type keeperResetCreditResponse struct {
 }
 
 type keeperAccountResponse struct {
-	Name                    string                          `json:"name"`
-	Email                   *string                         `json:"email"`
-	AccountType             *string                         `json:"account_type"`
-	Disabled                bool                            `json:"disabled"`
-	Priority                *int                            `json:"priority"`
-	PrimaryUsedPercent      *int                            `json:"primary_used_percent"`
-	SecondaryUsedPercent    *int                            `json:"secondary_used_percent"`
-	PrimaryResetAt          *string                         `json:"primary_reset_at"`
-	SecondaryResetAt        *string                         `json:"secondary_reset_at"`
-	PrimaryWindowSeconds    *int                            `json:"primary_window_seconds"`
-	SecondaryWindowSeconds  *int                            `json:"secondary_window_seconds"`
-	PrimaryWindowUsage      *keeperQuotaWindowUsageResponse `json:"primary_window_usage"`
-	SecondaryWindowUsage    *keeperQuotaWindowUsageResponse `json:"secondary_window_usage"`
-	QuotaThreshold          *int                            `json:"quota_threshold"`
-	LastStatusCode          *int                            `json:"last_status_code"`
-	LastError               *string                         `json:"last_error"`
-	LatestAction            *string                         `json:"latest_action"`
-	LastCheckedAt           *string                         `json:"last_checked_at"`
-	LastHealthyAt           *string                         `json:"last_healthy_at"`
-	ResetCreditCount        *int                            `json:"reset_credit_count"`
-	ResetCredits            []keeperResetCreditResponse     `json:"reset_credits"`
-	SubscriptionActiveUntil *string                         `json:"subscription_active_until"`
+	Name                    string                           `json:"name"`
+	Email                   *string                          `json:"email"`
+	AccountType             *string                          `json:"account_type"`
+	Provider                *string                          `json:"provider"`
+	AntigravityQuota        []keeperAntigravityGroupResponse `json:"antigravity_quota"`
+	Disabled                bool                             `json:"disabled"`
+	Priority                *int                             `json:"priority"`
+	PrimaryUsedPercent      *int                             `json:"primary_used_percent"`
+	SecondaryUsedPercent    *int                             `json:"secondary_used_percent"`
+	PrimaryResetAt          *string                          `json:"primary_reset_at"`
+	SecondaryResetAt        *string                          `json:"secondary_reset_at"`
+	PrimaryWindowSeconds    *int                             `json:"primary_window_seconds"`
+	SecondaryWindowSeconds  *int                             `json:"secondary_window_seconds"`
+	PrimaryWindowUsage      *keeperQuotaWindowUsageResponse  `json:"primary_window_usage"`
+	SecondaryWindowUsage    *keeperQuotaWindowUsageResponse  `json:"secondary_window_usage"`
+	QuotaThreshold          *int                             `json:"quota_threshold"`
+	LastStatusCode          *int                             `json:"last_status_code"`
+	LastError               *string                          `json:"last_error"`
+	LatestAction            *string                          `json:"latest_action"`
+	LastCheckedAt           *string                          `json:"last_checked_at"`
+	LastHealthyAt           *string                          `json:"last_healthy_at"`
+	ResetCreditCount        *int                             `json:"reset_credit_count"`
+	ResetCredits            []keeperResetCreditResponse      `json:"reset_credits"`
+	SubscriptionActiveUntil *string                          `json:"subscription_active_until"`
 }
 
 type keeperQuotaWindowUsageResponse struct {
@@ -1331,6 +1333,8 @@ func keeperAccountResponses(accounts []keeperAccount, windowUsages map[string]ke
 			Name:                    account.Name,
 			Email:                   account.Email,
 			AccountType:             account.AccountType,
+			Provider:                account.Provider,
+			AntigravityQuota:        keeperAntigravityQuotaResponses(account.AntigravityQuota),
 			Disabled:                account.Disabled,
 			Priority:                keeperDisplayPriority(account.Priority),
 			PrimaryUsedPercent:      account.PrimaryUsedPercent,
@@ -2210,10 +2214,14 @@ func (a *App) reconcileKeeperConditionalRemoteAuthStates(ctx context.Context, cf
 	if err != nil {
 		return err
 	}
+	// remoteNames is the EXISTENCE full-set used for prune protection — it must include every
+	// inspectable provider (codex + antigravity), otherwise a conditional tick would prune a
+	// still-present Antigravity row that a full inspection just wrote. refreshableRemoteNames is
+	// the set of enabled accounts eligible for a conditional refresh.
 	remoteNames := map[string]bool{}
 	refreshableRemoteNames := map[string]bool{}
 	for _, item := range authFiles {
-		if keeperString(item["type"]) != "codex" {
+		if !keeperIsInspectableProvider(keeperString(item["type"])) {
 			continue
 		}
 		name := keeperString(item["name"])

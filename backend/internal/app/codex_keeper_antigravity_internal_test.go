@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -177,8 +178,7 @@ func TestFetchAntigravityQuota(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	detail := map[string]any{"auth_index": "idx-ag", "type": "antigravity", "project_id": "aicode-consumers", "access_token": "tok"}
-	groups, ok := app.fetchAntigravityQuota(ctx, cfg, detail)
+	groups, ok := app.fetchAntigravityQuota(ctx, cfg, "idx-ag", "aicode-consumers")
 	if !ok || len(groups) != 2 {
 		t.Fatalf("fetch = (%v, %d groups), want ok with 2 groups", ok, len(groups))
 	}
@@ -265,6 +265,115 @@ func TestKeeperInspectAntigravityAccount(t *testing.T) {
 	if found == nil || found.Provider == nil || *found.Provider != "antigravity" || len(found.AntigravityQuota) != 2 {
 		t.Fatalf("antigravity account not visible with quota in list: %+v", found)
 	}
+	// The API projection (the exact path the /accounts handler serializes) must carry both
+	// fields — otherwise the frontend never sees the provider or quota.
+	raw, err := json.Marshal(keeperAccountResponses(accounts, nil))
+	if err != nil {
+		t.Fatalf("marshal responses: %v", err)
+	}
+	js := string(raw)
+	if !strings.Contains(js, `"provider":"antigravity"`) {
+		t.Fatalf("API response drops provider: %s", js)
+	}
+	if !strings.Contains(js, `"antigravity_quota":[`) || !strings.Contains(js, `"remaining_fraction"`) || !strings.Contains(js, `"reset_at"`) {
+		t.Fatalf("API response drops antigravity_quota buckets: %s", js)
+	}
+}
+
+// TestKeeperInspectAntigravityIdentityConflictFailsClosed reproduces the reverse probes: when the
+// download detail disagrees with the list entry on name/index, has drifted to type=codex, or when
+// neither source carries an explicit auth_index, the inspection must fail closed — NO quota
+// api-call, identity_error, and the prior quota snapshot preserved.
+func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
+	const authName = "antigravity-x.json"
+	cases := []struct {
+		name      string
+		listEntry map[string]any
+		download  map[string]any
+	}{
+		{"different-name-and-index",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
+			map[string]any{"name": "other.json", "type": "antigravity", "auth_index": "idx-other", "project_id": "p", "access_token": "t"}},
+		{"type-drift-to-codex",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
+			map[string]any{"name": authName, "type": "codex", "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},
+		{"no-explicit-auth-index",
+			map[string]any{"name": authName, "type": "antigravity"},
+			map[string]any{"name": authName, "type": "antigravity", "project_id": "p", "access_token": "t"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+			var mu sync.Mutex
+			quotaCalls := 0
+			cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+					_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{tc.listEntry}})
+				case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+					_ = json.NewEncoder(w).Encode(tc.download)
+				case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+					var p struct {
+						URL string `json:"url"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&p)
+					if strings.Contains(p.URL, "retrieveUserQuotaSummary") {
+						mu.Lock()
+						quotaCalls++
+						mu.Unlock()
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 200, "body": antigravityGoldenMap(t)})
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer cpa.Close()
+
+			app, err := New()
+			if err != nil {
+				t.Fatalf("New(): %v", err)
+			}
+			defer app.Close()
+			configureKeeperTestCPA(t, app, cpa.URL, nil)
+			ctx := context.Background()
+
+			// Seed a prior good antigravity snapshot to prove it is preserved on the conflict.
+			seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+			encoded, _ := json.Marshal(seed)
+			blob := string(encoded)
+			ag, idx := keeperProviderAntigravity, "idx-ag"
+			if err := app.upsertKeeperState(ctx, keeperAccountResult{
+				Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx, AntigravityQuota: &blob,
+			}); err != nil {
+				t.Fatalf("seed: %v", err)
+			}
+
+			stats, err := app.keeper.InspectAccountsLocked([]string{authName})
+			if err != nil {
+				t.Fatalf("InspectAccountsLocked: %v", err)
+			}
+			if stats.IdentityError != 1 || stats.Healthy != 0 {
+				t.Fatalf("stats = %+v, want IdentityError=1, Healthy=0", stats)
+			}
+			mu.Lock()
+			calls := quotaCalls
+			mu.Unlock()
+			if calls != 0 {
+				t.Fatalf("identity conflict made %d quota api-calls; must be 0", calls)
+			}
+			st, err := app.getKeeperState(ctx, authName)
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if len(st.AntigravityQuota) != 2 {
+				t.Fatalf("prior snapshot not preserved on conflict: %+v", st.AntigravityQuota)
+			}
+			if st.LastError == nil {
+				t.Fatal("identity conflict did not record an error")
+			}
+		})
+	}
 }
 
 // TestKeeperUpsertProviderSwitchClearsStaleFields proves the upsert enforces the provider
@@ -331,6 +440,48 @@ func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 	}
 }
 
+// TestKeeperConditionalReconcilePreservesAntigravity proves the conditional reconcile's prune
+// existence-set includes Antigravity: a stored Antigravity row that the remote list still
+// returns must NOT be pruned (the bug deleted it because the set was codex-only).
+func TestKeeperConditionalReconcilePreservesAntigravity(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "antigravity-keep.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files" {
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
+			}})
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	ag, idx := keeperProviderAntigravity, "idx-ag"
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	cfg, err := app.loadConfig(ctx)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	if err := app.reconcileKeeperConditionalRemoteAuthStates(ctx, cfg, func(string) {}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if _, err := app.getKeeperState(ctx, authName); err != nil {
+		t.Fatalf("conditional reconcile pruned a still-present antigravity row: %v", err)
+	}
+}
+
 func timeMust(t *testing.T, s string) time.Time {
 	t.Helper()
 	parsed, err := time.Parse(time.RFC3339, s)
@@ -362,7 +513,7 @@ func TestFetchAntigravityQuotaNoProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if _, ok := app.fetchAntigravityQuota(context.Background(), cfg, map[string]any{"auth_index": "idx"}); ok {
+	if _, ok := app.fetchAntigravityQuota(context.Background(), cfg, "idx", ""); ok {
 		t.Fatal("missing project_id must fail closed")
 	}
 	mu.Lock()

@@ -1095,6 +1095,19 @@ function quotaWindowResetText(item: QuotaWindowItem): string {
   return resetTime ? t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`) : t('未记录刷新时间', 'No refresh time recorded')
 }
 
+// antigravityCardResetText renders the reset time + countdown hint for an
+// antigravity quota bucket inside the account card quota block. Null-safe.
+function antigravityCardResetText(resetAt: string | null): string {
+  const resetTime = formatQuotaResetTime(resetAt)
+  if (!resetTime) {
+    return t('未记录刷新时间', 'No refresh time recorded')
+  }
+  const countdown = formatQuotaResetCountdown(resetAt)
+  return countdown
+    ? t(`刷新 ${resetTime}（${countdown}）`, `Refreshes ${resetTime} (${countdown})`)
+    : t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`)
+}
+
 function quotaWindowUsageTitle(item: QuotaWindowItem): string {
   const usage = item.usage
   if (!item.resetAt || usage?.stale === true) {
@@ -2628,7 +2641,79 @@ onBeforeUnmount(() => {
                 <strong>{{ disabledCardErrorText(account) }}</strong>
               </div>
               <div v-else-if="shouldShowQuotaWindow(account)" class="account-card-quota">
-                <template v-if="quotaWindowItems(account).length > 0">
+                <template v-if="isAntigravityAccount(account)">
+                  <template v-if="antigravityQuotaGroups(account).length > 0">
+                    <template v-if="isBarCardView">
+                      <div
+                        v-for="group in antigravityQuotaGroups(account)"
+                        :key="group.display_name"
+                        class="card-quota-antigravity-group"
+                      >
+                        <div
+                          class="quota-antigravity-group-title"
+                          :title="group.description ?? group.display_name"
+                        >
+                          {{ group.display_name }}
+                        </div>
+                        <div
+                          v-for="bucket in group.buckets"
+                          :key="bucket.bucket_id"
+                          class="card-quota-bar"
+                        >
+                          <div class="card-quota-head">
+                            <span>{{ antigravityWindowLabel(bucket) }}</span>
+                            <strong>{{ t(`剩余 ${antigravityRemainingPercent(bucket)}%`, `${antigravityRemainingPercent(bucket)}% remaining`) }}</strong>
+                          </div>
+                          <div class="card-quota-track">
+                            <div
+                              class="card-quota-fill"
+                              :class="quotaBarTone(antigravityRemainingPercent(bucket))"
+                              :style="{ width: `${antigravityRemainingPercent(bucket)}%` }"
+                            />
+                          </div>
+                          <span class="card-quota-reset">
+                            {{ antigravityCardResetText(bucket.reset_at) }}
+                          </span>
+                        </div>
+                      </div>
+                    </template>
+                    <div v-else class="card-quota-rings">
+                      <div
+                        v-for="group in antigravityQuotaGroups(account)"
+                        :key="group.display_name"
+                        class="card-quota-antigravity-group"
+                      >
+                        <div
+                          class="quota-antigravity-group-title"
+                          :title="group.description ?? group.display_name"
+                        >
+                          {{ group.display_name }}
+                        </div>
+                        <div
+                          v-for="bucket in group.buckets"
+                          :key="bucket.bucket_id"
+                          class="card-quota-ring-item"
+                        >
+                          <div class="card-quota-ring-head">
+                            <div
+                              class="quota-ring"
+                              :class="quotaBarTone(antigravityRemainingPercent(bucket))"
+                              :style="{ '--quota-deg': `${antigravityRemainingPercent(bucket) * 3.6}deg` }"
+                            >
+                              <span>{{ antigravityRemainingPercent(bucket) }}%</span>
+                            </div>
+                            <div class="quota-ring-caption">
+                              <strong>{{ antigravityWindowLabel(bucket) }}</strong>
+                              <span>{{ antigravityCardResetText(bucket.reset_at) }}</span>
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </template>
+                  <div v-else class="card-quota-empty">{{ t('暂无额度窗口', 'No quota windows') }}</div>
+                </template>
+                <template v-else-if="quotaWindowItems(account).length > 0">
                   <template v-if="isBarCardView">
                     <div
                       v-for="item in quotaWindowItems(account)"
@@ -3475,6 +3560,25 @@ onBeforeUnmount(() => {
   gap: 10px;
   min-width: 0;
   padding-top: 2px;
+}
+
+.card-quota-antigravity-group {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--account-card-inner-border);
+}
+
+.card-quota-antigravity-group:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.card-quota-antigravity-group .card-quota-bar,
+.card-quota-antigravity-group .card-quota-bar:first-child {
+  padding-top: 0;
+  border-top: 0;
 }
 
 .card-quota-bar {

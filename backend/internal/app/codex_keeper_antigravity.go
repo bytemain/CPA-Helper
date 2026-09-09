@@ -64,6 +64,46 @@ func keeperIsInspectableProvider(authType string) bool {
 	}
 }
 
+// keeperAntigravityBucketResponse / keeperAntigravityGroupResponse are the API projection of the
+// stored quota, with reset times formatted the same way as every other keeper API timestamp.
+type keeperAntigravityBucketResponse struct {
+	BucketID          string  `json:"bucket_id"`
+	DisplayName       string  `json:"display_name"`
+	Window            string  `json:"window"`
+	RemainingFraction float64 `json:"remaining_fraction"`
+	ResetAt           *string `json:"reset_at"`
+	Description       string  `json:"description,omitempty"`
+}
+
+type keeperAntigravityGroupResponse struct {
+	DisplayName string                            `json:"display_name"`
+	Description string                            `json:"description,omitempty"`
+	Buckets     []keeperAntigravityBucketResponse `json:"buckets"`
+}
+
+// keeperAntigravityQuotaResponses projects stored quota groups for the /accounts API response.
+func keeperAntigravityQuotaResponses(groups []keeperAntigravityGroup) []keeperAntigravityGroupResponse {
+	if len(groups) == 0 {
+		return nil
+	}
+	out := make([]keeperAntigravityGroupResponse, 0, len(groups))
+	for _, g := range groups {
+		buckets := make([]keeperAntigravityBucketResponse, 0, len(g.Buckets))
+		for _, b := range g.Buckets {
+			buckets = append(buckets, keeperAntigravityBucketResponse{
+				BucketID:          b.BucketID,
+				DisplayName:       b.DisplayName,
+				Window:            b.Window,
+				RemainingFraction: b.RemainingFraction,
+				ResetAt:           apiDateTimePtr(b.ResetAt),
+				Description:       b.Description,
+			})
+		}
+		out = append(out, keeperAntigravityGroupResponse{DisplayName: g.DisplayName, Description: g.Description, Buckets: buckets})
+	}
+	return out
+}
+
 // keeperProviderOrCodex normalizes a stored provider value to a non-nil pointer, defaulting a
 // NULL/empty value to "codex" (rows written before multi-provider support).
 func keeperProviderOrCodex(value *string) *string {
@@ -214,6 +254,43 @@ func parseAntigravityQuotaGroups(body map[string]any) ([]keeperAntigravityGroup,
 	return groups, true
 }
 
+// antigravityIdentity is the reconciled routing identity for an Antigravity inspection.
+type antigravityIdentity struct {
+	authIndex string
+	projectID string
+}
+
+// keeperReconcileAntigravityIdentity validates that the list entry and download detail describe
+// the SAME Antigravity account before any quota call: the list type is antigravity, the detail
+// (when it states them) agrees on type and name, the auth_index is explicit on each source (never
+// the auth NAME), reconciles across them, and is non-empty, and a project_id is resolvable from
+// the detail. ok=false on any conflict/missing field so the caller fails closed.
+func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name string) (antigravityIdentity, bool) {
+	if keeperString(authInfo["type"]) != keeperProviderAntigravity {
+		return antigravityIdentity{}, false
+	}
+	if dt := keeperString(detail["type"]); dt != "" && dt != keeperProviderAntigravity {
+		return antigravityIdentity{}, false
+	}
+	if dn := keeperString(detail["name"]); dn != "" && dn != name {
+		return antigravityIdentity{}, false
+	}
+	listIdx, lerr := keeperExplicitAuthIndex(authInfo)
+	detailIdx, derr := keeperExplicitAuthIndex(detail)
+	if lerr != nil || derr != nil {
+		return antigravityIdentity{}, false
+	}
+	idx, ierr := keeperReconcileIdentityField(listIdx, detailIdx)
+	if ierr != nil || strings.TrimSpace(idx) == "" {
+		return antigravityIdentity{}, false
+	}
+	projectID := keeperAntigravityProjectID(detail)
+	if projectID == "" {
+		return antigravityIdentity{}, false
+	}
+	return antigravityIdentity{authIndex: idx, projectID: projectID}, true
+}
+
 // processKeeperAntigravityAuth inspects one Antigravity account: it reads the download detail,
 // records the identity/health fields, and (unless disabled) fetches the quota summary. It is a
 // SEPARATE path from the Codex inspection — no ChatGPT usage/reset-credit/subscription/priority
@@ -248,9 +325,28 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 		logFn(name + ": " + message)
 		return result
 	}
+	// Bind identity FIRST (mirror the Codex rigor): the download must be for THIS account name,
+	// still be an Antigravity account, and carry an explicit auth_index consistent with the list
+	// entry (no filename fallback). Any mismatch mixes accounts, so fail closed as identity_error,
+	// preserve the prior snapshot, and make NO quota call.
+	identity, ok := keeperReconcileAntigravityIdentity(authInfo, detail, name)
+	if !ok {
+		message := "账号身份冲突：Antigravity 列表与详情的 name/type/auth_index 不一致，已保留原快照"
+		result.Result = "identity_error"
+		result.LastError = &message
+		result.LatestAction = &message
+		if err := a.markKeeperIdentityError(ctx, name, &message, result.CheckedAt); err != nil {
+			logFn(name + "：状态写回失败（state_write_error）")
+			log.Printf("codex keeper antigravity identity-error write-back failed for %s: %v", name, err)
+			result.StateWriteFailed = true
+		}
+		logFn(name + "：" + message)
+		return result
+	}
 	merged := mergeKeeperObjects(authInfo, detail)
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
-	result.AuthIndex = keeperRemoteAuthIndex(merged)
+	idx := identity.authIndex
+	result.AuthIndex = &idx
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
 	result.Disabled = &disabled
@@ -259,7 +355,7 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 		result = persist(result)
 		return result
 	}
-	if groups, ok := a.fetchAntigravityQuota(ctx, cfg, merged); ok {
+	if groups, ok := a.fetchAntigravityQuota(ctx, cfg, identity.authIndex, identity.projectID); ok {
 		if encoded, err := json.Marshal(groups); err == nil {
 			payload := string(encoded)
 			result.AntigravityQuota = &payload
@@ -282,12 +378,10 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 // project id; a transport error, non-2xx outer/inner status, or unparseable body on every
 // candidate host leaves both return values empty (ok=false) so the caller preserves the prior
 // snapshot instead of wiping it.
-func (a *App) fetchAntigravityQuota(ctx context.Context, cfg AppConfig, detail map[string]any) ([]keeperAntigravityGroup, bool) {
-	projectID := keeperAntigravityProjectID(detail)
-	if projectID == "" {
+func (a *App) fetchAntigravityQuota(ctx context.Context, cfg AppConfig, authIndex, projectID string) ([]keeperAntigravityGroup, bool) {
+	if strings.TrimSpace(authIndex) == "" || strings.TrimSpace(projectID) == "" {
 		return nil, false
 	}
-	authIndex := keeperAuthIndex(detail)
 	dataBytes, err := json.Marshal(map[string]string{"project": projectID})
 	if err != nil {
 		return nil, false
