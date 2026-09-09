@@ -253,6 +253,18 @@ func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name st
 	if detailType != "" && detailType != keeperProviderAntigravity {
 		return antigravityIdentity{}, false
 	}
+	// CPA emits `provider` as an authoritative alias of `type` (buildAuthFileEntry sets both from
+	// the same auth.Provider), so a present provider MUST agree with the antigravity type on each
+	// source. A present-but-conflicting provider (e.g. provider=codex on a type=antigravity entry)
+	// is a corrupt/deceptive entry — fail closed rather than dispatch a quota call on `type` alone.
+	listProvider, lpverr := keeperExplicitStringField(authInfo, "provider")
+	if lpverr != nil || (listProvider != "" && listProvider != keeperProviderAntigravity) {
+		return antigravityIdentity{}, false
+	}
+	detailProvider, dpverr := keeperExplicitStringField(detail, "provider")
+	if dpverr != nil || (detailProvider != "" && detailProvider != keeperProviderAntigravity) {
+		return antigravityIdentity{}, false
+	}
 	detailName, dnerr := keeperExplicitStringField(detail, "name")
 	if dnerr != nil {
 		return antigravityIdentity{}, false

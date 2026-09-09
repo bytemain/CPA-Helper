@@ -231,12 +231,14 @@ func TestKeeperInspectAntigravityAccount(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			// Real CPA emits both `type` and `provider` (same auth.Provider); include the matching
+			// provider so this happy path also proves a present-and-agreeing provider is accepted.
 			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
-				{"name": authName, "type": "antigravity", "auth_index": "idx-ag"},
+				{"name": authName, "type": "antigravity", "provider": "antigravity", "auth_index": "idx-ag"},
 			}})
 		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"name": authName, "type": "antigravity", "auth_index": "idx-ag",
+				"name": authName, "type": "antigravity", "provider": "antigravity", "auth_index": "idx-ag",
 				"project_id": "aicode-consumers", "email": "eyo@example.com", "disabled": false,
 				"priority": 1, "access_token": "tok",
 			})
@@ -362,6 +364,19 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 		{"detail-email-wrong-type",
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": float64(9), "access_token": "t"}},
+		// CPA emits `provider` as an authoritative alias of `type` (both from auth.Provider). A
+		// present provider that disagrees with the antigravity type — on either source — is a
+		// corrupt/deceptive entry and must fail closed. Everything else here is consistent, so the
+		// provider conflict is the SOLE reason these fail (without the check they'd make a quota call).
+		{"list-provider-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "provider": "codex", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com", "access_token": "t"}},
+		{"detail-provider-conflict",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com"},
+			map[string]any{"name": authName, "type": "antigravity", "provider": "codex", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com", "access_token": "t"}},
+		{"detail-provider-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com"},
+			map[string]any{"name": authName, "type": "antigravity", "provider": float64(3), "auth_index": "idx-ag", "project_id": "p", "email": "a@x.com", "access_token": "t"}},
 		// Missing email on BOTH sides: the resource key is provider+project+email and a project can be
 		// shared, so an unbound (email-less) identity is unprovable and must fail closed — not degrade
 		// to a project-only digest that a second email-less credential could inherit. Everything else
