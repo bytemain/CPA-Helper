@@ -49,6 +49,7 @@ import {
   updateCodexKeeperPriority,
 } from '@/features/codex-keeper/api/codexKeeperApi'
 import type { CodexKeeperResetResult } from '@/features/codex-keeper/api/codexKeeperApi'
+import { formatAntigravityResetCountdown } from '@/features/codex-keeper/antigravityCountdown'
 import type {
   AntigravityQuotaBucket,
   AntigravityQuotaGroup,
@@ -878,6 +879,20 @@ function antigravityGroupLabel(group: AntigravityQuotaGroup): string {
   return group.display_name
 }
 
+// antigravityDescriptionText localizes the known upstream group description
+// prefix ("Models within this group: ..."), falling back to the raw free-text
+// description for any unknown wording.
+function antigravityDescriptionText(description: string | undefined): string {
+  const raw = (description ?? '').trim()
+  if (!raw) return ''
+  const prefix = 'Models within this group:'
+  if (raw.startsWith(prefix)) {
+    const models = raw.slice(prefix.length).trim()
+    return t(`此分组包含：${models}`, `Models in this group: ${models}`)
+  }
+  return raw // unknown free-text description → raw fallback
+}
+
 // antigravityRemainingPercent clamps remaining_fraction (0..1) to a 0..100 integer
 // percentage for the remaining-quota bar.
 function antigravityRemainingPercent(bucket: AntigravityQuotaBucket): number {
@@ -1118,7 +1133,7 @@ function antigravityCardResetText(resetAt: string | null): string {
   if (!resetTime) {
     return t('未记录刷新时间', 'No refresh time recorded')
   }
-  const countdown = formatQuotaResetCountdown(resetAt)
+  const countdown = formatAntigravityResetCountdown(resetAt, nowMs.value, currentLanguage.value)
   return countdown
     ? t(`刷新 ${resetTime}（${countdown}）`, `Refreshes ${resetTime} (${countdown})`)
     : t(`刷新 ${resetTime}`, `Refreshes ${resetTime}`)
@@ -1187,12 +1202,12 @@ function renderAntigravityQuotaCell(account: CodexKeeperAccount) {
     { class: 'quota-window-cell' },
     groups.map((group) =>
       h('div', { class: 'quota-antigravity-group' }, [
-        h('div', { class: 'quota-antigravity-group-title', title: group.description ?? group.display_name }, antigravityGroupLabel(group)),
+        h('div', { class: 'quota-antigravity-group-title', title: antigravityDescriptionText(group.description) || group.display_name }, antigravityGroupLabel(group)),
         ...group.buckets.map((bucket) => {
           const remainingPercent = antigravityRemainingPercent(bucket)
           const label = antigravityWindowLabel(bucket)
           const resetTime = formatQuotaResetTime(bucket.reset_at)
-          const countdown = formatQuotaResetCountdown(bucket.reset_at)
+          const countdown = formatAntigravityResetCountdown(bucket.reset_at, nowMs.value, currentLanguage.value)
           return h(
             'div',
             {
@@ -2243,7 +2258,7 @@ onBeforeUnmount(() => {
             </NButton>
           </div>
         </div>
-        <p class="page-subtitle">{{ t('查看 Codex auth file 的健康、额度和优先级维护结果', 'View Codex auth file health, quota, and priority maintenance results') }}</p>
+        <p class="page-subtitle">{{ t('查看 Keeper 账号的健康、额度和优先级维护结果', 'View Keeper account health, quota, and priority maintenance results') }}</p>
       </div>
     </div>
 
@@ -2663,7 +2678,7 @@ onBeforeUnmount(() => {
                       >
                         <div
                           class="quota-antigravity-group-title"
-                          :title="group.description ?? group.display_name"
+                          :title="antigravityDescriptionText(group.description) || group.display_name"
                         >
                           {{ antigravityGroupLabel(group) }}
                         </div>
@@ -2697,7 +2712,7 @@ onBeforeUnmount(() => {
                       >
                         <div
                           class="quota-antigravity-group-title"
-                          :title="group.description ?? group.display_name"
+                          :title="antigravityDescriptionText(group.description) || group.display_name"
                         >
                           {{ antigravityGroupLabel(group) }}
                         </div>

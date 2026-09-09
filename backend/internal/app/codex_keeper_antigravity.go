@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -258,6 +260,7 @@ func parseAntigravityQuotaGroups(body map[string]any) ([]keeperAntigravityGroup,
 type antigravityIdentity struct {
 	authIndex string
 	projectID string
+	email     string
 }
 
 // keeperReconcileAntigravityIdentity validates that the list entry and download detail describe
@@ -266,18 +269,30 @@ type antigravityIdentity struct {
 // the auth NAME), reconciles across them, and is non-empty, and a project_id is resolvable from
 // the detail. ok=false on any conflict/missing field so the caller fails closed.
 func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name string) (antigravityIdentity, bool) {
-	if keeperString(authInfo["type"]) != keeperProviderAntigravity {
+	// Every identity field distinguishes absent/null from present-but-wrong-type: a present field
+	// that is not the expected type is illegal (a malformed/deceptive detail) and fails closed,
+	// rather than being treated as "missing" and silently backfilled from the list.
+	listType, lterr := keeperExplicitStringField(authInfo, "type")
+	if lterr != nil || listType != keeperProviderAntigravity {
 		return antigravityIdentity{}, false
 	}
-	if dt := keeperString(detail["type"]); dt != "" && dt != keeperProviderAntigravity {
+	detailType, dterr := keeperExplicitStringField(detail, "type")
+	if dterr != nil {
 		return antigravityIdentity{}, false
 	}
-	if dn := keeperString(detail["name"]); dn != "" && dn != name {
+	if detailType != "" && detailType != keeperProviderAntigravity {
 		return antigravityIdentity{}, false
 	}
-	listIdx, lerr := keeperExplicitAuthIndex(authInfo)
-	detailIdx, derr := keeperExplicitAuthIndex(detail)
-	if lerr != nil || derr != nil {
+	detailName, dnerr := keeperExplicitStringField(detail, "name")
+	if dnerr != nil {
+		return antigravityIdentity{}, false
+	}
+	if detailName != "" && detailName != name {
+		return antigravityIdentity{}, false
+	}
+	listIdx, lierr := keeperExplicitAuthIndex(authInfo)
+	detailIdx, dierr := keeperExplicitAuthIndex(detail)
+	if lierr != nil || dierr != nil {
 		return antigravityIdentity{}, false
 	}
 	idx, ierr := keeperReconcileIdentityField(listIdx, detailIdx)
@@ -287,13 +302,65 @@ func keeperReconcileAntigravityIdentity(authInfo, detail map[string]any, name st
 	// The CPA list entry also exposes project_id; when BOTH sources carry one they must agree
 	// (a same-name file swap / memory-vs-disk drift would otherwise let the detail's project run a
 	// quota call for a different account). A non-empty project must be resolvable.
-	listProject := keeperAntigravityProjectID(authInfo)
-	detailProject := keeperAntigravityProjectID(detail)
+	listProject, lperr := keeperExplicitAntigravityProjectID(authInfo)
+	detailProject, dperr := keeperExplicitAntigravityProjectID(detail)
+	if lperr != nil || dperr != nil {
+		return antigravityIdentity{}, false
+	}
 	project, perr := keeperReconcileIdentityField(listProject, detailProject)
 	if perr != nil || strings.TrimSpace(project) == "" {
 		return antigravityIdentity{}, false
 	}
-	return antigravityIdentity{authIndex: idx, projectID: project}, true
+	// A Google project can be shared across accounts, so the project alone does not identify the
+	// account. Reconcile the account email across list+detail (present must be a string; both
+	// present must agree) and fold it into the stored identity digest, so a credential swap to a
+	// different email under the same project is detected as an identity change.
+	listEmail, leerr := keeperExplicitStringField(authInfo, "email")
+	detailEmail, deerr := keeperExplicitStringField(detail, "email")
+	if leerr != nil || deerr != nil {
+		return antigravityIdentity{}, false
+	}
+	email, eerr := keeperReconcileIdentityField(listEmail, detailEmail)
+	if eerr != nil {
+		return antigravityIdentity{}, false
+	}
+	return antigravityIdentity{authIndex: idx, projectID: project, email: email}, true
+}
+
+// keeperProjectDigest returns a stable, versioned one-way digest of a project id. Only this digest
+// is persisted (never the raw project id), so the DB can detect a project swap without storing or
+// exposing the project identifier. The "v1:" prefix allows changing the scheme later.
+// keeperAntigravityIdentityDigest returns a stable, versioned one-way digest of the Antigravity
+// account identity (provider + project id + normalized email). Only this digest is persisted —
+// never the raw project id or email — so the DB can detect an identity swap (project OR email
+// changed) and clear the stale quota without storing or exposing the identifiers. A change to any
+// confirmed component yields a different digest.
+func keeperAntigravityIdentityDigest(projectID, email string) string {
+	normEmail := strings.ToLower(strings.TrimSpace(email))
+	sum := sha256.Sum256([]byte(keeperProviderAntigravity + "\x00" + projectID + "\x00" + normEmail))
+	return "v1:" + hex.EncodeToString(sum[:])
+}
+
+// keeperExplicitAntigravityProjectID resolves the project id with present-invalid detection: the
+// top-level project_id / projectId must be a string when present (a present-but-wrong-type value
+// fails closed). When the top level is absent it falls back to the lenient nested resolution
+// (metadata / attributes / installed / web).
+func keeperExplicitAntigravityProjectID(o map[string]any) (string, error) {
+	pid, err := keeperExplicitStringField(o, "project_id")
+	if err != nil {
+		return "", err
+	}
+	if pid != "" {
+		return pid, nil
+	}
+	pidCamel, err := keeperExplicitStringField(o, "projectId")
+	if err != nil {
+		return "", err
+	}
+	if pidCamel != "" {
+		return pidCamel, nil
+	}
+	return keeperAntigravityProjectID(o), nil
 }
 
 // processKeeperAntigravityAuth inspects one Antigravity account: it reads the download detail,
@@ -352,6 +419,12 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 	result.Email = keeperStringPtr(merged["email"], merged["account_email"], merged["user_email"])
 	idx := identity.authIndex
 	result.AuthIndex = &idx
+	// Bind a one-way DIGEST of the resolved account identity (provider + project + email; never the
+	// raw values) regardless of the fetch outcome, so a later inspection can detect an identity swap
+	// (project OR email changed) and clear the stale quota even when the fresh quota fetch fails —
+	// without persisting the project or email.
+	digest := keeperAntigravityIdentityDigest(identity.projectID, identity.email)
+	result.AntigravityIdentityDigest = &digest
 	result.Priority = keeperIntPtr(merged["priority"])
 	disabled := keeperBool(merged["disabled"])
 	result.Disabled = &disabled

@@ -306,6 +306,16 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 		{"project-id-conflict",
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-A"},
 			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "access_token": "t"}},
+		// present-but-wrong-type detail fields must fail closed (not be treated as absent + backfilled).
+		{"detail-name-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": float64(123), "type": "antigravity", "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},
+		{"detail-type-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": float64(1), "auth_index": "idx-ag", "project_id": "p", "access_token": "t"}},
+		{"detail-project-wrong-type",
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "p"},
+			map[string]any{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": float64(7), "access_token": "t"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -555,6 +565,132 @@ func TestKeeperWebsocketFailureClearsStaleAntigravityProvider(t *testing.T) {
 	}
 	if len(st.AntigravityQuota) != 0 {
 		t.Fatalf("stale antigravity_quota not cleared on provider switch: %+v", st.AntigravityQuota)
+	}
+}
+
+// TestKeeperInspectAntigravityProjectSwapClearsStaleQuotaOnFailure reproduces the cross-inspection
+// project-swap probe: a row stored for project-A whose list+detail now consistently say project-B
+// (name/index unchanged) and whose project-B quota fetch FAILS must clear A's quota (a confirmed
+// project swap), not keep showing A's quota against B.
+func TestKeeperInspectAntigravityProjectSwapClearsStaleQuotaOnFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "proj-swap.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "project-B", "access_token": "t",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			http.Error(w, "quota boom", http.StatusBadGateway) // project-B quota fetch fails
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed project-A with its quota bound to project-A.
+	seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+	encoded, _ := json.Marshal(seed)
+	blob := string(encoded)
+	ag, idx, projectADigest := keeperProviderAntigravity, "idx-ag", keeperAntigravityIdentityDigest("project-A", "")
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx,
+		AntigravityQuota: &blob, AntigravityIdentityDigest: &projectADigest,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("project-B", "") {
+		t.Fatalf("project digest not rebound to project-B: %v", st.AntigravityIdentityDigest)
+	}
+	// The stored digest must NOT be the raw project id (privacy contract).
+	if st.AntigravityIdentityDigest != nil && *st.AntigravityIdentityDigest == "project-B" {
+		t.Fatalf("raw project id leaked into storage: %v", st.AntigravityIdentityDigest)
+	}
+	if len(st.AntigravityQuota) != 0 {
+		t.Fatalf("stale project-A quota not cleared on project swap + failed fetch: %+v", st.AntigravityQuota)
+	}
+}
+
+// TestKeeperInspectAntigravityEmailSwapClearsStaleQuotaOnFailure proves the identity binding also
+// covers the account email: a shared Google project reused by a different email (name/index/project
+// unchanged) whose new fetch fails must clear the old account's quota, not label it under the new
+// email.
+func TestKeeperInspectAntigravityEmailSwapClearsStaleQuotaOnFailure(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "email-swap.json"
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "shared-proj", "email": "b@example.com"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "shared-proj", "email": "b@example.com", "access_token": "t",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			http.Error(w, "quota boom", http.StatusBadGateway) // new account's fetch fails
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	// Seed the SAME project but a DIFFERENT email (a@example.com) with its quota.
+	seed, _ := parseAntigravityQuotaGroups(antigravityGoldenMap(t))
+	encoded, _ := json.Marshal(seed)
+	blob := string(encoded)
+	ag, idx, digestA := keeperProviderAntigravity, "idx-ag", keeperAntigravityIdentityDigest("shared-proj", "a@example.com")
+	if err := app.upsertKeeperState(ctx, keeperAccountResult{
+		Name: authName, Result: "healthy", CheckedAt: time.Now(), Provider: &ag, AuthIndex: &idx,
+		AntigravityQuota: &blob, AntigravityIdentityDigest: &digestA,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+		t.Fatalf("InspectAccountsLocked: %v", err)
+	}
+	st, err := app.getKeeperState(ctx, authName)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != keeperAntigravityIdentityDigest("shared-proj", "b@example.com") {
+		t.Fatalf("identity digest not rebound to the new email: %v", st.AntigravityIdentityDigest)
+	}
+	if len(st.AntigravityQuota) != 0 {
+		t.Fatalf("stale quota kept under a different email (shared project): %+v", st.AntigravityQuota)
 	}
 }
 
