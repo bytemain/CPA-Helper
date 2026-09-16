@@ -44,6 +44,8 @@ const exactServerMessages: MessagePair[] = [
   ['账号身份冲突：列表与详情的 account_id/auth_index 不一致，已保留原快照', 'Account identity conflict: the list and detail disagree on account_id/auth_index; the previous snapshot was preserved.'],
   ['账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id/email 不一致，已保留原快照', 'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id/email; the previous snapshot was preserved.'],
   ['Antigravity 配额读取失败', 'Failed to read Antigravity quota'],
+  ['api_key_prefix 超出最大长度 32', 'api_key_prefix exceeds the maximum length of 32'],
+  ['api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾', 'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -'],
   ['无法确认可用重置额度（快照未知），请刷新后重试', 'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.'],
   ['核销主动重置额度失败：网络异常，未确认是否已核销', 'Failed to redeem the reset credit: network error; redemption is unconfirmed.'],
   ['核销主动重置额度失败：管理接口异常', 'Failed to redeem the reset credit: management API error.'],

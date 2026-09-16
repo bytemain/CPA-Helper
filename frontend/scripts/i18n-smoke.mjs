@@ -172,6 +172,14 @@ try {
     'Failed to read Antigravity quota',
   )
   assert.equal(
+    localizedServerMessage('api_key_prefix 超出最大长度 32'),
+    'api_key_prefix exceeds the maximum length of 32',
+  )
+  assert.equal(
+    localizedServerMessage('api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾'),
+    'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -',
+  )
+  assert.equal(
     localizedServerMessage('antigravity@example.com.json：Antigravity 配额刷新成功（2 组）'),
     'antigravity@example.com.json: Antigravity quota refreshed (2 groups)',
   )

@@ -39,6 +39,7 @@ export interface SettingsResponse {
   retry_interval_seconds: number
   product_name: string
   product_logo: string
+  api_key_prefix: string
 }
 
 export interface SettingsUpdatePayload {
@@ -52,6 +53,7 @@ export interface SettingsUpdatePayload {
   retry_interval_seconds?: number
   product_name?: string
   product_logo?: string
+  api_key_prefix?: string
 }
 
 export interface ModelRequestGuide {
