@@ -10,6 +10,8 @@ RUN --mount=type=cache,id=cpa-helper-npm,target=/root/.npm,sharing=locked \
 
 COPY VERSION ../VERSION
 COPY frontend/ ./
+# Frontend gates (lint + all smoke scripts) run before the build so a regression fails the image.
+RUN npm run lint && npm run test:smoke
 RUN npm run build
 
 
