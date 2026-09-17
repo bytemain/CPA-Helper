@@ -142,6 +142,15 @@ jobs:
         working-directory: frontend
         run: npm ci --prefer-offline
 
+      # Frontend gates: lint plus every smoke script (i18n, Antigravity countdown/window/
+      # quota-format, quota-exhaustion, API-key masking). These used to be run by hand only;
+      # a failure here now blocks the release build.
+      - name: Frontend gates (lint + smoke tests)
+        working-directory: frontend
+        run: |
+          npm run lint
+          npm run test:smoke
+
       - name: Build frontend
         working-directory: frontend
         run: npm run build
