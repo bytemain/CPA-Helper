@@ -179,6 +179,52 @@ try {
     localizedServerMessage('api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾'),
     'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -',
   )
+  // Model price mapping rule rejections: every field/index must survive translation, and must not
+  // fall through to the generic `…不能为空` / `…超出最大长度` families.
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #1 的 source_model 不能为空'),
+    'Model price mapping rule #1: source_model is required',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #2 的 target_provider 不能为空'),
+    'Model price mapping rule #2: target_provider is required',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #3 的 target_model 不能为空'),
+    'Model price mapping rule #3: target_model is required',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #1 的 source_model 最多只能包含一个 *'),
+    'Model price mapping rule #1: source_model may contain at most one *',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #4 的 target_model 最多只能包含一个 *'),
+    'Model price mapping rule #4: target_model may contain at most one *',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #5 的 target_model 含有 *，但 source_model 没有 *'),
+    'Model price mapping rule #5: target_model contains * but source_model does not',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #6 的 source_provider 不能包含 *'),
+    'Model price mapping rule #6: source_provider must not contain *',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #7 的 target_provider 不能包含 *'),
+    'Model price mapping rule #7: target_provider must not contain *',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #8 与前面的规则重复（source_provider + source_model 相同）'),
+    'Model price mapping rule #8 duplicates an earlier rule (same source_provider + source_model)',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则 #9 的 source_model 超出最大长度 180'),
+    'Model price mapping rule #9: source_model exceeds the maximum length of 180',
+  )
+  assert.equal(
+    localizedServerMessage('模型价格映射规则最多 50 条'),
+    'At most 50 model price mapping rules are allowed',
+  )
   assert.equal(
     localizedServerMessage('antigravity@example.com.json：Antigravity 配额刷新成功（2 组）'),
     'antigravity@example.com.json: Antigravity quota refreshed (2 groups)',

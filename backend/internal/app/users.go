@@ -931,7 +931,7 @@ func emptyUserUsageSummary() userUsageSummary {
 }
 
 func (a *App) userUsageSummaries(ctx context.Context) (map[string]userUsageSummary, error) {
-	prices, err := a.priceMap(ctx)
+	prices, err := a.loadPriceBook(ctx)
 	if err != nil {
 		return nil, err
 	}

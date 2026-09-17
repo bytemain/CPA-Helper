@@ -1530,7 +1530,7 @@ func (a *App) computeKeeperQuotaWindowUsages(ctx context.Context, accounts []kee
 	if err != nil {
 		return nil, err
 	}
-	prices, err := a.priceMap(ctx)
+	prices, err := a.loadPriceBook(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1726,7 +1726,7 @@ func keeperRecordInQuotaWindow(record UsageRecord, usage *keeperQuotaWindowUsage
 	return !record.Timestamp.Before(usage.WindowStart) && record.Timestamp.Before(usage.WindowEnd)
 }
 
-func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices map[[2]string]ModelPrice) {
+func addRecordToKeeperQuotaWindowUsage(usage *keeperQuotaWindowUsage, record UsageRecord, prices priceBook) {
 	if usage == nil {
 		return
 	}

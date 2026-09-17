@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+// testPriceBook wraps a bare price table for helpers that now take a priceBook (the price
+// dictionary plus mapping rules). With no rules configured the behaviour is the pre-mapping one.
+func testPriceBook(prices map[[2]string]ModelPrice) priceBook {
+	return priceBook{prices: prices}
+}
+
 func TestRecordCostUsesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	provider := "claude"
 	model := "claude-sonnet-test"
@@ -36,7 +42,7 @@ func TestRecordCostUsesClaudeCacheReadAndCreationTokens(t *testing.T) {
 		},
 	}
 
-	amount, unpriced := recordCost(record, prices)
+	amount, unpriced := recordCost(record, testPriceBook(prices))
 	if unpriced {
 		t.Fatal("record should be priced")
 	}
@@ -67,7 +73,7 @@ func TestRecordCostTruncatesGenericCachedTokens(t *testing.T) {
 		},
 	}
 
-	amount, unpriced := recordCost(record, prices)
+	amount, unpriced := recordCost(record, testPriceBook(prices))
 	if unpriced {
 		t.Fatal("record should be priced")
 	}
@@ -96,7 +102,7 @@ func TestRecordCostUsesRequestPriceForImageModels(t *testing.T) {
 		InputTokens:  1_000_000,
 		OutputTokens: 1_000_000,
 		TotalTokens:  2_000_000,
-	}, prices)
+	}, testPriceBook(prices))
 	if unpriced || amount != 1.25 {
 		t.Fatalf("image cost = %v unpriced=%v, want 1.25 false", amount, unpriced)
 	}
@@ -105,7 +111,7 @@ func TestRecordCostUsesRequestPriceForImageModels(t *testing.T) {
 		Provider: &provider,
 		Model:    &model,
 		Failed:   true,
-	}, prices)
+	}, testPriceBook(prices))
 	if unpriced || amount != 0 {
 		t.Fatalf("failed image cost = %v unpriced=%v, want 0 false", amount, unpriced)
 	}
@@ -127,7 +133,7 @@ func TestRecordCostTreatsImageWithoutRequestPriceAsUnpriced(t *testing.T) {
 	amount, unpriced := recordCost(UsageRecord{
 		Provider: &provider,
 		Model:    &model,
-	}, prices)
+	}, testPriceBook(prices))
 	if amount != 0 || !unpriced {
 		t.Fatalf("image without request price cost = %v unpriced=%v, want 0 true", amount, unpriced)
 	}
@@ -208,23 +214,23 @@ func TestUsageAggregatesClaudeCacheReadAndCreationTokens(t *testing.T) {
 	filters.Start = &start
 	filters.End = &end
 
-	summary := usageSummaryFromRecords(filters, []UsageRecord{record}, prices)
+	summary := usageSummaryFromRecords(filters, []UsageRecord{record}, testPriceBook(prices))
 	if summary["input_tokens"].(int) != 60 {
 		t.Fatalf("summary input = %v, want 60", summary["input_tokens"])
 	}
 	if summary["total_tokens"].(int) != 72 {
 		t.Fatalf("summary total = %v, want 72", summary["total_tokens"])
 	}
-	trends := trendPointsFromRecords(filters, []UsageRecord{record}, prices)
+	trends := trendPointsFromRecords(filters, []UsageRecord{record}, testPriceBook(prices))
 	if len(trends) != 1 || trends[0]["total_tokens"].(int) != 72 {
 		t.Fatalf("trend totals = %#v, want one item with total 72", trends)
 	}
-	ranking := rankingFromRecords([]UsageRecord{record}, prices, "model", nil)
+	ranking := rankingFromRecords([]UsageRecord{record}, testPriceBook(prices), "model", nil)
 	items := ranking["items"].([]map[string]any)
 	if len(items) != 1 || items[0]["total_tokens"].(int) != 72 {
 		t.Fatalf("ranking totals = %#v, want one item with total 72", items)
 	}
-	distributions := distributionsFromRecords([]UsageRecord{record}, prices)
+	distributions := distributionsFromRecords([]UsageRecord{record}, testPriceBook(prices))
 	models := distributions["models"].([]map[string]any)
 	if len(models) != 1 || models[0]["total_tokens"].(int) != 72 {
 		t.Fatalf("distribution totals = %#v, want one item with total 72", models)
