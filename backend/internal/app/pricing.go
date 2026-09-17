@@ -769,16 +769,17 @@ func findMatchingPrice(prices map[[2]string]ModelPrice, provider, model *string)
 	if providerKey == "" || modelKey == "" {
 		return nil
 	}
-	candidates := []string{providerKey}
-	if providerKey == "codex" {
-		candidates = append(candidates, "openai")
-	}
-	if providerKey == "claude" {
-		candidates = append(candidates, "anthropic")
-	}
-	for _, candidate := range candidates {
-		if price, ok := prices[[2]string{candidate, modelKey}]; ok {
-			return &price
+	// An exact (provider, model) price always wins; the association fallbacks below only apply
+	// when nothing matches exactly, so a manually created exact price can always override them.
+	for _, modelCandidate := range priceModelCandidates(modelKey) {
+		for _, providerCandidate := range priceProviderCandidates(providerKey, modelCandidate) {
+			if price, ok := prices[[2]string{providerCandidate, modelCandidate}]; ok {
+				return &price
+			}
+			// LiteLLM keys many models as "<provider>/<model>" (e.g. gemini/gemini-3.8-flash).
+			if price, ok := prices[[2]string{providerCandidate, providerCandidate + "/" + modelCandidate}]; ok {
+				return &price
+			}
 		}
 	}
 	return nil
