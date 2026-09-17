@@ -171,7 +171,7 @@ func (a *App) applyQuotaCharge(ctx context.Context, record UsageRecord) error {
 		return err
 	}
 
-	prices, err := a.priceMap(ctx)
+	prices, err := a.loadPriceBook(ctx)
 	if err != nil {
 		return err
 	}

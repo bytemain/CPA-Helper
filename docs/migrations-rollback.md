@@ -6,7 +6,7 @@ version is newer than the binary** (goose reports
 `database migration version is newer than this application`). A binary rollback
 therefore always requires migrating the schema **down first**.
 
-## Rolling back the keeper releases (migrations 202609060001–202609160001)
+## Rolling back the keeper releases (migrations 202609060001–202609170001)
 
 This release added, on top of `202609040002`:
 
@@ -16,6 +16,7 @@ This release added, on top of `202609040002`:
 - `202609060004` — `codex_keeper_auth_states.account_id` column (subscription identity scope).
 - `202609060005` — `codex_keeper_auth_states.provider` + `antigravity_quota` + `antigravity_identity_digest` columns (multi-provider inspection: Antigravity accounts; the identity column stores a one-way digest, never the raw project/email). Its Down drops all three columns; no data beyond the Antigravity quota snapshot / provider tag / identity digest is lost.
 - `202609160001` — `app_settings.api_key_prefix` column (configurable prefix for NEWLY generated API keys, e.g. `sk-cortex`; empty = default `sk`). Its Down drops the column; the only thing lost is the configured prefix — existing API keys are never rewritten and keep working.
+- `202609170001` — `app_settings.model_price_mapping_rules` column (ordered JSON list of model price mapping rules; empty = no mapping, which is the shipped default). Its Down drops the column; the only thing lost is the configured rule list — no price row, usage record or charge is touched, and pricing simply returns to exact/association matching only.
 
 The previous binary (`a996697`, target version `202609040002`) both refuses to start
 against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
@@ -45,8 +46,8 @@ against a newer version **and** still `SELECT`s `codex_keeper_quota_resets` in
    cpa-helper migrate down-to 202609040002 --allow-pending
    ```
 
-   This runs the Down migrations for `202609160001`, `202609060005`, `202609060004`, `202609060003`,
-   `202609060002`, and `202609060001`: it drops the `api_key_prefix` column, drops the `provider` + `antigravity_quota` + `antigravity_identity_digest` columns,
+   This runs the Down migrations for `202609170001`, `202609160001`, `202609060005`, `202609060004`, `202609060003`,
+   `202609060002`, and `202609060001`: it drops the `model_price_mapping_rules` column, drops the `api_key_prefix` column, drops the `provider` + `antigravity_quota` + `antigravity_identity_digest` columns,
    drops the `account_id` column, drops `codex_keeper_reset_redeems`,
    drops the `subscription_active_until` column, and **recreates an empty
    `codex_keeper_quota_resets`** so the old binary's `/accounts` query works.

@@ -252,16 +252,18 @@ func (a *App) listPrices(ctx context.Context) ([]ModelPrice, error) {
 	return scanPrices(rows)
 }
 
-func (a *App) priceMap(ctx context.Context) (map[[2]string]ModelPrice, error) {
+// loadPriceBook reads the price dictionary together with the configured mapping rules, so every
+// caller prices a record the same way.
+func (a *App) loadPriceBook(ctx context.Context) (priceBook, error) {
 	prices, err := a.listPrices(ctx)
 	if err != nil {
-		return nil, err
+		return priceBook{}, err
 	}
-	result := make(map[[2]string]ModelPrice, len(prices))
-	for _, price := range prices {
-		result[priceKey(price.Provider, price.Model)] = price
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return priceBook{}, err
 	}
-	return result, nil
+	return newPriceBook(prices, cfg.ModelPriceMappingRules), nil
 }
 
 func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse, error) {
@@ -293,7 +295,7 @@ func (a *App) modelPriceCatalog(ctx context.Context) (ModelPriceCatalogResponse,
 	if err != nil {
 		return ModelPriceCatalogResponse{}, err
 	}
-	priceLookup := pricesByKey(prices)
+	priceLookup := newPriceBook(prices, cfg.ModelPriceMappingRules)
 	modelsByID := map[string]AvailableModelItem{}
 	for _, binding := range queryable {
 		source := catalogAvailableModelSource(binding)
@@ -423,7 +425,7 @@ func suggestedPriceProvider(model AvailableModelItem) string {
 	return ""
 }
 
-func findCatalogPrice(prices map[[2]string]ModelPrice, allPrices []ModelPrice, suggestedProvider string, owner *string, modelID string) *ModelPrice {
+func findCatalogPrice(prices priceBook, allPrices []ModelPrice, suggestedProvider string, owner *string, modelID string) *ModelPrice {
 	providers := []string{}
 	if owner != nil {
 		providers = append(providers, *owner)
@@ -434,7 +436,7 @@ func findCatalogPrice(prices map[[2]string]ModelPrice, allPrices []ModelPrice, s
 	modelCandidates := catalogModelCandidates(modelID)
 	for _, provider := range providers {
 		for _, candidate := range modelCandidates {
-			if price := findMatchingPrice(prices, &provider, &candidate); price != nil {
+			if price := prices.find(&provider, &candidate); price != nil {
 				return price
 			}
 		}
@@ -756,6 +758,45 @@ func pricesEqual(item ModelPrice, payload modelPricePayload) bool {
 		floatPtrEqual(item.RequestUSD, payload.RequestUSD)
 }
 
+// priceBook is the price dictionary plus the operator-configured mapping rules. Every pricing
+// lookup goes through priceBook.find, so a rule applies identically to billing, usage views and
+// the model catalog.
+type priceBook struct {
+	prices map[[2]string]ModelPrice
+	rules  []ModelPriceMappingRule
+}
+
+func newPriceBook(prices []ModelPrice, rules []ModelPriceMappingRule) priceBook {
+	return priceBook{prices: pricesByKey(prices), rules: sanitizeModelPriceMappingRules(rules)}
+}
+
+// find resolves a reported (provider, model) to a price:
+//  1. an exact (provider, model) price always wins, so a manually created price row can override
+//     any mapping rule;
+//  2. otherwise at most ONE mapping hop is applied — the mapped target is looked up through the
+//     same findMatchingPrice path (so the provider/model association fallbacks still apply to it)
+//     and is NEVER fed back into the mapping engine, so rules cannot chain or loop;
+//  3. if the mapped target has no price the record stays UNPRICED (nil) — a rule never turns an
+//     unpriced record into a silent $0;
+//  4. with no matching rule the behaviour is byte-for-byte the pre-mapping behaviour.
+func (b priceBook) find(provider, model *string) *ModelPrice {
+	if provider == nil || model == nil {
+		return nil
+	}
+	providerKey := strings.ToLower(strings.TrimSpace(*provider))
+	modelKey := strings.ToLower(strings.TrimSpace(*model))
+	if providerKey == "" || modelKey == "" {
+		return nil
+	}
+	if price, ok := b.prices[[2]string{providerKey, modelKey}]; ok {
+		return &price
+	}
+	if targetProvider, targetModel, ok := matchModelPriceMappingRule(b.rules, providerKey, modelKey); ok {
+		return findMatchingPrice(b.prices, &targetProvider, &targetModel)
+	}
+	return findMatchingPrice(b.prices, provider, model)
+}
+
 func priceKey(provider, model string) [2]string {
 	return [2]string{strings.ToLower(strings.TrimSpace(provider)), strings.ToLower(strings.TrimSpace(model))}
 }
@@ -785,8 +826,8 @@ func findMatchingPrice(prices map[[2]string]ModelPrice, provider, model *string)
 	return nil
 }
 
-func recordCost(record UsageRecord, prices map[[2]string]ModelPrice) (float64, bool) {
-	price := findMatchingPrice(prices, record.Provider, record.Model)
+func recordCost(record UsageRecord, prices priceBook) (float64, bool) {
+	price := prices.find(record.Provider, record.Model)
 	if billingUnitForModelPtr(record.Model) == modelBillingUnitRequest {
 		if record.Failed {
 			return 0, false

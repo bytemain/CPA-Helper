@@ -45,6 +45,7 @@ const exactServerMessages: MessagePair[] = [
   ['账号身份冲突：Antigravity 列表与详情的 name/type/auth_index/project_id/email 不一致，已保留原快照', 'Account identity conflict: the Antigravity list and detail disagree on name/type/auth_index/project_id/email; the previous snapshot was preserved.'],
   ['Antigravity 配额读取失败', 'Failed to read Antigravity quota'],
   ['api_key_prefix 超出最大长度 32', 'api_key_prefix exceeds the maximum length of 32'],
+  ['模型价格映射规则最多 50 条', 'At most 50 model price mapping rules are allowed'],
   ['api_key_prefix 只能包含字母、数字、- 和 _，且不能以 - 开头或结尾', 'api_key_prefix may only contain letters, digits, - and _, and must not start or end with -'],
   ['无法确认可用重置额度（快照未知），请刷新后重试', 'Cannot confirm available reset credits (snapshot unknown). Refresh and try again.'],
   ['核销主动重置额度失败：网络异常，未确认是否已核销', 'Failed to redeem the reset credit: network error; redemption is unconfirmed.'],
@@ -229,6 +230,14 @@ const serverTermTranslations: MessagePair[] = [
 ]
 
 const serverMessagePatterns: ServerMessagePattern[] = [
+  // Model price mapping rule rejections carry the 1-based rule index and the offending field, so
+  // they must be matched BEFORE the generic `…不能为空` / `…超出…` families below.
+  [/^模型价格映射规则 #(\d+) 的 (source_provider|source_model|target_provider|target_model) 不能为空$/, ([, index, field]) => `Model price mapping rule #${index}: ${field} is required`],
+  [/^模型价格映射规则 #(\d+) 的 (source_model|target_model) 最多只能包含一个 \*$/, ([, index, field]) => `Model price mapping rule #${index}: ${field} may contain at most one *`],
+  [/^模型价格映射规则 #(\d+) 的 target_model 含有 \*，但 source_model 没有 \*$/, ([, index]) => `Model price mapping rule #${index}: target_model contains * but source_model does not`],
+  [/^模型价格映射规则 #(\d+) 的 (source_provider|target_provider) 不能包含 \*$/, ([, index, field]) => `Model price mapping rule #${index}: ${field} must not contain *`],
+  [/^模型价格映射规则 #(\d+) 与前面的规则重复（source_provider \+ source_model 相同）$/, ([, index]) => `Model price mapping rule #${index} duplicates an earlier rule (same source_provider + source_model)`],
+  [/^模型价格映射规则 #(\d+) 的 (source_provider|source_model|target_provider|target_model) 超出最大长度 (\d+)$/, ([, index, field, max]) => `Model price mapping rule #${index}: ${field} exceeds the maximum length of ${max}`],
   // Antigravity quota log lines must be matched BEFORE the generic `…失败` family below, or the
   // name-prefixed failure line falls through to `(.+)失败` and renders half-translated.
   [/^(.+?)：Antigravity 配额刷新成功（(\d+) 组）$/, ([, name, count]) => `${name}: Antigravity quota refreshed (${count} groups)`],

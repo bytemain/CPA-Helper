@@ -27,6 +27,13 @@ export interface FirstAdminSetupPayload {
   nickname: string
 }
 
+export interface ModelPriceMappingRule {
+  source_provider: string
+  source_model: string
+  target_provider: string
+  target_model: string
+}
+
 export interface SettingsResponse {
   cliaproxy_url: string
   model_request_url: string
@@ -40,6 +47,7 @@ export interface SettingsResponse {
   product_name: string
   product_logo: string
   api_key_prefix: string
+  model_price_mapping_rules: ModelPriceMappingRule[]
 }
 
 export interface SettingsUpdatePayload {
@@ -54,6 +62,7 @@ export interface SettingsUpdatePayload {
   product_name?: string
   product_logo?: string
   api_key_prefix?: string
+  model_price_mapping_rules?: ModelPriceMappingRule[]
 }
 
 export interface ModelRequestGuide {

@@ -49,8 +49,8 @@ func TestMigrateDownToRollsBackToTarget(t *testing.T) {
 	if !strings.Contains(out, "current_version=202609040002") {
 		t.Fatalf("rollback did not reach 202609040002: %s", out)
 	}
-	if !strings.Contains(out, "previous_version=202609160001") {
-		t.Fatalf("rollback did not start from head 202609160001: %s", out)
+	if !strings.Contains(out, "previous_version=202609170001") {
+		t.Fatalf("rollback did not start from head 202609170001: %s", out)
 	}
 
 	// A non-allowlisted target is refused.
@@ -101,7 +101,7 @@ func TestMigrateDownToRefusesPendingRedeems(t *testing.T) {
 	if err := run(ctx, []string{"migrate", "down-to", "202609040002"}, &bytes.Buffer{}); err == nil {
 		t.Fatal("rollback should be refused while a pending redeem exists")
 	}
-	if v := currentVersionForTest(t, dbPath); v != 202609160001 {
+	if v := currentVersionForTest(t, dbPath); v != 202609170001 {
 		t.Fatalf("refused rollback still changed version to %d", v)
 	}
 
