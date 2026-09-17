@@ -267,6 +267,7 @@ type settingsUpdateRequest struct {
 	RetryIntervalSeconds *float64 `json:"retry_interval_seconds"`
 	ProductName          *string  `json:"product_name"`
 	ProductLogo          *string  `json:"product_logo"`
+	APIKeyPrefix         *string  `json:"api_key_prefix"`
 }
 
 type modelRequestTestPayload struct {
@@ -365,6 +366,12 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 			}
 			cfg.ProductLogo = logo
 		}
+		if payload.APIKeyPrefix != nil {
+			if err := validateAPIKeyPrefix(*payload.APIKeyPrefix); err != nil {
+				return err
+			}
+			cfg.APIKeyPrefix = normalizeAPIKeyPrefix(*payload.APIKeyPrefix)
+		}
 		if err := a.saveConfig(r.Context(), cfg); err != nil {
 			return err
 		}
@@ -389,6 +396,7 @@ func settingsResponse(cfg AppConfig) map[string]any {
 		"retry_interval_seconds": collector.RetryIntervalSeconds,
 		"product_name":           cfg.ProductName,
 		"product_logo":           cfg.ProductLogo,
+		"api_key_prefix":         normalizeAPIKeyPrefix(cfg.APIKeyPrefix),
 	}
 }
 

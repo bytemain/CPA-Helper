@@ -42,7 +42,10 @@ const settingsForm = reactive({
   retry_interval_seconds: 10,
   product_name: '',
   product_logo: '',
+  api_key_prefix: 'sk',
 })
+
+const apiKeyPrefixPreview = computed(() => `${(settingsForm.api_key_prefix || 'sk').trim() || 'sk'}-xxxxxxxx…`)
 
 const logoPreview = computed(() => settingsForm.product_logo || null)
 
@@ -108,6 +111,7 @@ async function refresh() {
     settingsForm.retry_interval_seconds = settings.retry_interval_seconds
     settingsForm.product_name = settings.product_name ?? ''
     settingsForm.product_logo = settings.product_logo ?? ''
+    settingsForm.api_key_prefix = settings.api_key_prefix || 'sk'
     collectorStatus.value = status
   } catch (error) {
     message.error(errorText(error, '加载设置失败', 'Failed to load settings'))
@@ -129,9 +133,11 @@ async function saveSettings() {
       retry_interval_seconds: settingsForm.retry_interval_seconds,
       product_name: settingsForm.product_name,
       product_logo: settingsForm.product_logo,
+      api_key_prefix: settingsForm.api_key_prefix,
     }
     const saved = await updateSettings(payload)
     settingsForm.management_key = saved.management_key
+    settingsForm.api_key_prefix = saved.api_key_prefix || 'sk'
     setProductInfo(saved.product_name ?? '', saved.product_logo ?? '')
     message.success(t('设置已保存', 'Settings saved'))
     await refresh()
@@ -277,6 +283,28 @@ onMounted(refresh)
         </div>
       </section>
     </div>
+
+    <section class="panel">
+      <div class="panel-inner">
+        <h2 class="section-title">{{ t('API KEY 设置', 'API Key Settings') }}</h2>
+        <NForm :model="settingsForm" label-placement="top">
+          <div class="form-grid">
+            <div class="field-stack">
+              <div class="field-label">{{ t('API KEY 前缀', 'API key prefix') }}</div>
+              <NInput
+                v-model:value="settingsForm.api_key_prefix"
+                :placeholder="t('留空使用默认前缀 sk', 'Leave blank to use the default prefix sk')"
+                :maxlength="32"
+                show-count
+              />
+              <div class="form-help">
+                {{ t(`新生成的 API KEY 形如 ${apiKeyPrefixPreview}。只允许字母、数字、- 和 _，不能以 - 开头或结尾；只影响之后新建的 KEY，已有 KEY 不变。`, `New API keys look like ${apiKeyPrefixPreview}. Letters, digits, - and _ only; must not start or end with -. Only affects keys created from now on; existing keys are unchanged.`) }}
+              </div>
+            </div>
+          </div>
+        </NForm>
+      </div>
+    </section>
 
     <section class="panel">
       <div class="panel-inner">

@@ -460,6 +460,9 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 	if testTableExists(t, db, "codex_keeper_quota_resets") {
 		t.Fatal("head should have dropped codex_keeper_quota_resets")
 	}
+	if !testColumnExists(t, db, "app_settings", "api_key_prefix") {
+		t.Fatal("head is missing app_settings.api_key_prefix (migration 202609160001)")
+	}
 
 	// Rollback: Down to the version the previous binary targets.
 	const preConsumeVersion int64 = 202609040002
@@ -491,6 +494,9 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 			t.Fatalf("rollback left codex_keeper_auth_states.%s behind", col)
 		}
 	}
+	if testColumnExists(t, db, "app_settings", "api_key_prefix") {
+		t.Fatal("rollback left app_settings.api_key_prefix behind")
+	}
 
 	// Replay: from the prod baseline (202609040002) migrate Up to head again — the whole
 	// release must be re-runnable after a rollback (040002 → head → 040002 → head).
@@ -508,6 +514,7 @@ func TestRollbackToPreConsumeRestoresCompatSchema(t *testing.T) {
 		!testColumnExists(t, db, "codex_keeper_auth_states", "provider") ||
 		!testColumnExists(t, db, "codex_keeper_auth_states", "antigravity_quota") ||
 		!testColumnExists(t, db, "codex_keeper_auth_states", "antigravity_identity_digest") ||
+		!testColumnExists(t, db, "app_settings", "api_key_prefix") ||
 		!testTableExists(t, db, "codex_keeper_reset_redeems") ||
 		testTableExists(t, db, "codex_keeper_quota_resets") {
 		t.Fatal("replay to head did not restore the full head schema")
