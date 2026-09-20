@@ -12,6 +12,7 @@ import (
 
 	backendApp "cpa-helper/backend/internal/app"
 	"cpa-helper/backend/internal/httpserver"
+	"cpa-helper/backend/internal/usagecost"
 )
 
 func main() {
@@ -87,6 +88,10 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		}
 		fmt.Fprintf(stdout, "ready: db=%s current_version=%d target_version=%d\n", report.DBPath, report.CurrentVersion, report.TargetVersion)
 		return nil
+	case "usage-cost":
+		// Read-only cost report over the same database the service writes to;
+		// --db only overrides where it reads, never what it records.
+		return usagecost.Run(ctx, args[1:], stdout)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
@@ -150,5 +155,8 @@ func printUsage(w io.Writer) {
                         Roll the schema DOWN to an allowlisted version (destructive)
   cpa-helper serve      Start only after read-only startup checks pass
   cpa-helper doctor     Run read-only startup checks and exit
+  cpa-helper usage-cost [--db path] --group-by model|provider|endpoint|source-account
+                        --since <days> [--json]
+                        Report usage cost over recorded usage (read-only)
 `)
 }
