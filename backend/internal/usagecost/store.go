@@ -20,7 +20,7 @@ import (
 // drop `mode=ro`, and without the assertion the first write would succeed
 // instead of failing.
 func OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)", path))
+	db, err := sql.Open("sqlite", fmt.Sprintf("file:%s?mode=ro&_pragma=query_only(1)&_pragma=busy_timeout(5000)", path))
 	if err != nil {
 		return nil, err
 	}

@@ -15,7 +15,7 @@ func TestRunHelpListsOperationalSubcommands(t *testing.T) {
 		t.Fatalf("run help failed: %v", err)
 	}
 	text := output.String()
-	for _, want := range []string{"migrate", "serve", "doctor"} {
+	for _, want := range []string{"migrate", "serve", "doctor", "account-runway", "usage-cost"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("help output missing %q: %s", want, text)
 		}

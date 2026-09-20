@@ -30,3 +30,7 @@ func UsageDBPath() (string, error) {
 	}
 	return paths.DBPath, nil
 }
+
+// UsageParseDBTime parses stored timestamps the same way production does
+// (parseDBTime); *_reset_at columns on disk use the same layouts.
+func UsageParseDBTime(value string) (time.Time, bool) { return parseDBTime(value) }
