@@ -1,0 +1,338 @@
+{
+  "_README": [
+    "Golden cost vectors: the numbers CPA-Helper's own recordCost produced for these inputs.",
+    "Whatever pricing implementation this repo wires in MUST reproduce them exactly.",
+    "",
+    "BOUNDARY: these freeze CPA-Helper's behaviour AT THE COMMIT BELOW. They are not a",
+    "statement about what the cost SHOULD be -- if CPA-Helper deliberately changes its",
+    "pricing rules, this file is stale and must be regenerated, not worked around.",
+    "A stale vector file and a correct one look identical until someone checks the commit.",
+    "",
+    "Regenerate: add the generator test to CPA-Helper backend/internal/app (it must live",
+    "there because recordCost is unexported and under internal/), then:",
+    "  GOLDEN_OUT=<this file> go test ./internal/app/ -run TestZZGenerateGoldenVectors -count=1"
+  ],
+  "generated_from": {
+    "repo": "CPA-Helper",
+    "commit": "994254cdd3d60ee6be03d62ecf478a0afa3bf2f4",
+    "function": "backend/internal/app/pricing.go recordCost"
+  },
+  "cases": [
+    {
+      "name": "token/non-claude/cached-bounded",
+      "why": "non-claude splits cached out of input_tokens",
+      "prices": [
+        {
+          "provider": "xai",
+          "model": "grok-4.6",
+          "input_usd_per_million": 3,
+          "output_usd_per_million": 15,
+          "cache_read_usd_per_million": 0.3,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "xai",
+        "model": "grok-4.6",
+        "failed": false,
+        "input_tokens": 1000,
+        "output_tokens": 500,
+        "cached_tokens": 400,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 1500
+      },
+      "want_usd": 0.00942,
+      "want_unpriced": false
+    },
+    {
+      "name": "token/non-claude/cached-exceeds-input",
+      "why": "cached is clamped to input_tokens, never negative input",
+      "prices": [
+        {
+          "provider": "xai",
+          "model": "grok-4.6",
+          "input_usd_per_million": 3,
+          "output_usd_per_million": 15,
+          "cache_read_usd_per_million": 0.3,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "xai",
+        "model": "grok-4.6",
+        "failed": false,
+        "input_tokens": 100,
+        "output_tokens": 10,
+        "cached_tokens": 5000,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 110
+      },
+      "want_usd": 0.00018,
+      "want_unpriced": false
+    },
+    {
+      "name": "token/claude/cache-creation",
+      "why": "claude path adds cache_creation and uses cache_read, not cached",
+      "prices": [
+        {
+          "provider": "anthropic",
+          "model": "claude-sonnet-5",
+          "input_usd_per_million": 3,
+          "output_usd_per_million": 15,
+          "cache_read_usd_per_million": 0.3,
+          "cache_creation_usd_per_million": 3.75,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5",
+        "failed": false,
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cached_tokens": 900,
+        "cache_read_tokens": 300,
+        "cache_creation_tokens": 50,
+        "total_tokens": 1200
+      },
+      "want_usd": 0.0062775,
+      "want_unpriced": false
+    },
+    {
+      "name": "token/no-price/tokens-used",
+      "why": "billable usage with no price is UNPRICED, not free",
+      "prices": null,
+      "record": {
+        "provider": "nobody",
+        "model": "nothing",
+        "failed": false,
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 10
+      },
+      "want_usd": 0,
+      "want_unpriced": true
+    },
+    {
+      "name": "token/no-price/no-tokens",
+      "why": "zero usage with no price is genuinely zero, not unpriced",
+      "prices": null,
+      "record": {
+        "provider": "nobody",
+        "model": "nothing",
+        "failed": false,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 0
+      },
+      "want_usd": 0,
+      "want_unpriced": false
+    },
+    {
+      "name": "token/nil-provider-and-model",
+      "why": "nil identity can never match a price",
+      "prices": [
+        {
+          "provider": "xai",
+          "model": "grok-4.6",
+          "input_usd_per_million": 3,
+          "output_usd_per_million": 15,
+          "cache_read_usd_per_million": 0.3,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": null,
+        "model": null,
+        "failed": false,
+        "input_tokens": 10,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 10
+      },
+      "want_usd": 0,
+      "want_unpriced": true
+    },
+    {
+      "name": "alias/antigravity-to-gemini-family",
+      "why": "reverse proxy provider + variant suffix both resolve",
+      "prices": [
+        {
+          "provider": "gemini",
+          "model": "gemini-3.8-flash",
+          "input_usd_per_million": 0.3,
+          "output_usd_per_million": 2.5,
+          "cache_read_usd_per_million": 0.075,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "antigravity",
+        "model": "gemini-3.8-flash-high",
+        "failed": false,
+        "input_tokens": 2000,
+        "output_tokens": 1000,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 3000
+      },
+      "want_usd": 0.0031,
+      "want_unpriced": false
+    },
+    {
+      "name": "alias/litellm-slash-key",
+      "why": "LiteLLM keys models as <provider>/<model>",
+      "prices": [
+        {
+          "provider": "gemini",
+          "model": "gemini/gemini-3.8-flash",
+          "input_usd_per_million": 0.4,
+          "output_usd_per_million": 2.6,
+          "cache_read_usd_per_million": 0,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "gemini",
+        "model": "gemini-3.8-flash",
+        "failed": false,
+        "input_tokens": 1000,
+        "output_tokens": 100,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 1100
+      },
+      "want_usd": 0.00066,
+      "want_unpriced": false
+    },
+    {
+      "name": "request/image-success",
+      "why": "image models bill per request, not per token",
+      "prices": [
+        {
+          "provider": "openai",
+          "model": "gpt-image-1",
+          "input_usd_per_million": 0,
+          "output_usd_per_million": 0,
+          "cache_read_usd_per_million": 0,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": 0.011
+        }
+      ],
+      "record": {
+        "provider": "openai",
+        "model": "gpt-image-1",
+        "failed": false,
+        "input_tokens": 9999,
+        "output_tokens": 9999,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 19998
+      },
+      "want_usd": 0.011,
+      "want_unpriced": false
+    },
+    {
+      "name": "request/image-failed",
+      "why": "a failed per-request call costs nothing and is NOT unpriced",
+      "prices": [
+        {
+          "provider": "openai",
+          "model": "gpt-image-1",
+          "input_usd_per_million": 0,
+          "output_usd_per_million": 0,
+          "cache_read_usd_per_million": 0,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": 0.011
+        }
+      ],
+      "record": {
+        "provider": "openai",
+        "model": "gpt-image-1",
+        "failed": true,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 0
+      },
+      "want_usd": 0,
+      "want_unpriced": false
+    },
+    {
+      "name": "request/image-no-request-price",
+      "why": "per-request model without request_usd is UNPRICED",
+      "prices": [
+        {
+          "provider": "openai",
+          "model": "gpt-image-2",
+          "input_usd_per_million": 5,
+          "output_usd_per_million": 0,
+          "cache_read_usd_per_million": 0,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "openai",
+        "model": "gpt-image-2",
+        "failed": false,
+        "input_tokens": 100,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 100
+      },
+      "want_usd": 0,
+      "want_unpriced": true
+    },
+    {
+      "name": "token/rounding-to-8dp",
+      "why": "pins the rounding, which silently shifts every total",
+      "prices": [
+        {
+          "provider": "xai",
+          "model": "tiny",
+          "input_usd_per_million": 0.3333333333333333,
+          "output_usd_per_million": 0,
+          "cache_read_usd_per_million": 0,
+          "cache_creation_usd_per_million": 0,
+          "request_usd": null
+        }
+      ],
+      "record": {
+        "provider": "xai",
+        "model": "tiny",
+        "failed": false,
+        "input_tokens": 7,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "total_tokens": 7
+      },
+      "want_usd": 2.33e-06,
+      "want_unpriced": false
+    }
+  ]
+}
