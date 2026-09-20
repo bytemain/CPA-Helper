@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"time"
 
+	backendApp "cpa-helper/backend/internal/app"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -77,7 +79,12 @@ func LoadPrices(ctx context.Context, db *sql.DB) (map[PriceKey]ModelPrice, error
 	return prices, rows.Err()
 }
 
-// LoadRecords reads every usage row at or after `since`.
+// LoadRecords reads every usage row at or after `since`. The bound is the
+// dbTime() byte shape production writes to the TEXT `timestamp` column -- a
+// time.Time bound would be serialised by the driver as "2006-01-02 15:04:05
+// +0000 UTC" (space separator), and ' ' < 'T' makes the lexicographic >= let
+// older same-date rows through. Binding the same layout production writes is
+// the only way the comparison means what it says.
 func LoadRecords(ctx context.Context, db *sql.DB, since time.Time) ([]Record, error) {
 	rows, err := db.QueryContext(ctx, `
 		SELECT provider, model, endpoint, source_account, failed,
@@ -85,7 +92,7 @@ func LoadRecords(ctx context.Context, db *sql.DB, since time.Time) ([]Record, er
 		       cache_read_tokens, cache_creation_tokens, reasoning_tokens, total_tokens
 		FROM usage_records
 		WHERE timestamp >= ?
-		ORDER BY id`, since.UTC())
+		ORDER BY id`, backendApp.UsageDBTime(since))
 	if err != nil {
 		return nil, err
 	}

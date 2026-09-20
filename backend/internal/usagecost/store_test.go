@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	backendApp "cpa-helper/backend/internal/app"
 )
 
 // newFixtureDB writes a database with the columns this tool reads, using the
@@ -80,9 +82,14 @@ func TestLoadRecordsHonoursTheWindowAndNullDimensions(t *testing.T) {
 	}
 	now := time.Date(2026, 9, 20, 4, 0, 0, 0, time.UTC)
 	insert := func(key string, ts time.Time, provider, model, endpoint any, total int) {
+		// Write timestamps via the SAME serialisation production uses. Binding
+		// time.Time here would reproduce the reader's own byte shape, not the
+		// database's -- which is exactly how the space-separator bound bug was
+		// invisible to this test.
+		dbTs := backendApp.UsageDBTime(ts)
 		if _, err := db.Exec(`INSERT INTO usage_records
 			(created_at, timestamp, provider, model, endpoint, source_account, failed, total_tokens, dedupe_key, raw_json)
-			VALUES (?,?,?,?,?,?,0,?,?,'{}')`, ts, ts, provider, model, endpoint, "acct-"+key, total, key); err != nil {
+			VALUES (?,?,?,?,?,?,0,?,?,'{}')`, dbTs, dbTs, provider, model, endpoint, "acct-"+key, total, key); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -116,6 +123,46 @@ func TestLoadRecordsHonoursTheWindowAndNullDimensions(t *testing.T) {
 	}
 	if !sawNulls {
 		t.Fatal("a row with NULL provider/model/endpoint must survive the load, not be dropped")
+	}
+}
+
+// A record older than `since` in real time must be excluded even when its
+// stored dbTime() string starts with the same UTC calendar date as the bound.
+// This is the exact escape the space-separator bound allowed: the driver writes
+// `since` as "2026-09-19 20:00:00 +0000 UTC" while production writes the record
+// as "2026-09-20T13:00:00+08:00", and ' ' < 'T' keeps it in the window.
+func TestLoadRecordsExcludesPreSinceRowStoredInDbTimeShape(t *testing.T) {
+	path := newFixtureDB(t)
+	db, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 2026-09-20 20:00 +08:00 -- stored as "2026-09-20T20:00:00+08:00".
+	since := time.Date(2026, 9, 20, 20, 0, 0, 0, time.FixedZone("Asia/Shanghai", 8*60*60))
+	// 7h earlier in real time, same UTC calendar date as the buggy UTC bound.
+	old := since.Add(-7 * time.Hour)
+	for key, ts := range map[string]time.Time{"old": old, "new": since.Add(1 * time.Hour)} {
+		dbTs := backendApp.UsageDBTime(ts)
+		if _, err := db.Exec(`INSERT INTO usage_records
+			(created_at, timestamp, provider, model, endpoint, failed, total_tokens, dedupe_key, raw_json)
+			VALUES (?,?,?,?,?,0,1,?,'{}')`, dbTs, dbTs, "p", "m", "e", key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.Close()
+
+	ctx := context.Background()
+	ro, err := OpenReadOnly(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ro.Close()
+	records, err := LoadRecords(ctx, ro, since)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1 -- the pre-since row leaked through the bound", len(records))
 	}
 }
 
@@ -196,12 +243,13 @@ func TestLoadRecordsCarriesSourceAccountForAttribution(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 9, 20, 4, 0, 0, 0, time.UTC)
+	dbNow := backendApp.UsageDBTime(now)
 	if _, err := db.Exec(`INSERT INTO usage_records
 		(created_at, timestamp, provider, model, endpoint, source_account, failed, total_tokens, dedupe_key, raw_json)
 		VALUES (?,?,'antigravity','gemini','/v1/chat','acct-a',0,10,'a','{}'),
 		       (?,?,'antigravity','gemini','/v1/chat','acct-b',0,20,'b','{}'),
 		       (?,?,'antigravity','gemini','/v1/chat',NULL,0,30,'c','{}')`,
-		now, now, now, now, now, now); err != nil {
+		dbNow, dbNow, dbNow, dbNow, dbNow, dbNow); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
