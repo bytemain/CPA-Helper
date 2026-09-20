@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"cpa-helper/backend/internal/accountrunway"
 	backendApp "cpa-helper/backend/internal/app"
 	"cpa-helper/backend/internal/httpserver"
 	"cpa-helper/backend/internal/usagecost"
@@ -92,6 +93,10 @@ func run(ctx context.Context, args []string, stdout io.Writer) error {
 		// Read-only cost report over the same database the service writes to;
 		// --db only overrides where it reads, never what it records.
 		return usagecost.Run(ctx, args[1:], stdout)
+	case "account-runway":
+		// Read-only runway report over the same database the service writes to;
+		// --db only overrides where it reads, never what it records.
+		return accountrunway.Run(ctx, args[1:], stdout)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
@@ -158,5 +163,7 @@ func printUsage(w io.Writer) {
   cpa-helper usage-cost [--db path] --group-by model|provider|endpoint|source-account
                         --since <days> [--json]
                         Report usage cost over recorded usage (read-only)
+  cpa-helper account-runway [--db path] [--since days] [--provider antigravity|codex|all] [--json]
+                        Estimate per-account quota runway until next reset (read-only)
 `)
 }
