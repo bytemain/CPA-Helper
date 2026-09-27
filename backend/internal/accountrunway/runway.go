@@ -282,7 +282,9 @@ func attributeBurn(accounts []Account, rows []UsageRow) burnAttribution {
 }
 
 func bucketsForAccount(account Account, burnTokens int64, burnWindowSeconds float64, now time.Time) []BucketReport {
-	if account.Provider == "antigravity" {
+	// Every non-codex provider stores its quota as the generic []antigravityGroup blob
+	// (the column kept its legacy name); codex keeps using its richer dedicated columns.
+	if account.Provider != "codex" {
 		return antigravityBuckets(account, burnTokens, burnWindowSeconds, now)
 	}
 	return codexBuckets(account, burnTokens, burnWindowSeconds, now)

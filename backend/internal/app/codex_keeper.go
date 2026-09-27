@@ -1939,11 +1939,12 @@ func (a *App) executeKeeperRunWithOptions(ctx context.Context, options keeperRun
 	}
 	stats.Total = len(filtered)
 	if cfg.CodexKeeper.EnableCredentialWebsockets && !cfg.CodexKeeper.DryRun {
-		// The credential-websocket transport is Codex-specific; keep non-Codex (Antigravity)
-		// items out of it and recombine afterward so they are still inspected.
+		// The credential-websocket transport is Codex-specific; keep non-Codex items
+		// (Antigravity and the generic quota providers) out of it and recombine afterward
+		// so they are still inspected.
 		var codexItems, otherItems []map[string]any
 		for _, item := range filtered {
-			if keeperString(item["type"]) == keeperProviderAntigravity {
+			if keeperString(item["type"]) != keeperProviderCodex {
 				otherItems = append(otherItems, item)
 			} else {
 				codexItems = append(codexItems, item)
@@ -2673,10 +2674,13 @@ func (a *App) ensureKeeperAuthWebsockets(
 }
 
 func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map[string]any, logFn func(string), manualRefresh bool) keeperAccountResult {
-	// Dispatch by provider: an Antigravity account takes a separate quota path with none of the
+	// Dispatch by provider: a non-Codex account takes a separate quota path with none of the
 	// ChatGPT-specific usage/reset/subscription logic below.
-	if keeperString(authInfo["type"]) == keeperProviderAntigravity {
+	switch provider := keeperString(authInfo["type"]); {
+	case provider == keeperProviderAntigravity:
 		return a.processKeeperAntigravityAuth(ctx, cfg, authInfo, logFn, manualRefresh)
+	case keeperIsQuotaProvider(provider):
+		return a.processKeeperQuotaAuth(ctx, cfg, authInfo, provider, logFn, manualRefresh)
 	}
 	now := time.Now().In(appTimeLocation)
 	name := keeperString(authInfo["name"])
@@ -2921,6 +2925,25 @@ func (a *App) processKeeperAuth(ctx context.Context, cfg AppConfig, authInfo map
 		// credits were NOT refreshed — flag it so a post-reset refresh is audited as
 		// partial rather than falsely reported ok.
 		result.ResetCreditsUnavailable = true
+	}
+	// Persist a codex quota blob in the generic antigravity_quota column too, so the runway
+	// path reads every provider's quota from one shape. Bound to the reconciled account
+	// identity (account_id + email) via the same digest CASE — only when account_id is
+	// known, matching the reset-credit attribution gate above. On a failed parse both
+	// fields stay nil and the upsert preserves the prior snapshot.
+	if accountIDKnown {
+		if groups, ok := parseCodexQuotaGroups(usageResult.JSONData); ok {
+			if encoded, err := json.Marshal(groups); err == nil {
+				payload := string(encoded)
+				result.AntigravityQuota = &payload
+			}
+		}
+		email := ""
+		if result.Email != nil {
+			email = *result.Email
+		}
+		digest := keeperQuotaIdentityDigest(keeperProviderCodex, acct, email)
+		result.AntigravityIdentityDigest = &digest
 	}
 	result.Result = "healthy"
 
@@ -4384,10 +4407,10 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(auth_name) DO UPDATE SET
 			-- Track the current account identity, keeping the old value only on a
-			-- fetch where no account_id was observed. An antigravity inspection has no ChatGPT
-			-- account_id, so a provider switch to antigravity clears the stale Codex identity.
+			-- fetch where no account_id was observed. A non-codex inspection has no ChatGPT
+			-- account_id, so a provider switch clears the stale Codex identity.
 			account_id = CASE
-				WHEN excluded.provider = 'antigravity' THEN NULL
+				WHEN excluded.provider <> 'codex' THEN NULL
 				ELSE COALESCE(excluded.account_id, codex_keeper_auth_states.account_id)
 			END,
 			email = excluded.email,
@@ -4396,7 +4419,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			disabled = excluded.disabled,
 			priority = excluded.priority,
 			restore_priority = CASE
-				WHEN excluded.provider = 'antigravity' THEN NULL
+				WHEN excluded.provider <> 'codex' THEN NULL
 				WHEN ? THEN NULL
 				WHEN excluded.restore_priority IS NOT NULL THEN excluded.restore_priority
 				ELSE codex_keeper_auth_states.restore_priority
@@ -4420,7 +4443,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			--      writes NULL rather than inheriting the previous account's count/schedule).
 			--   3. same/undeterminable account → COALESCE: write a fresh fetch, else preserve.
 			reset_credit_count = CASE
-				WHEN excluded.provider = 'antigravity' THEN NULL
+				WHEN excluded.provider <> 'codex' THEN NULL
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credit_count
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
 					AND codex_keeper_auth_states.account_id <> excluded.account_id
@@ -4428,7 +4451,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 				ELSE COALESCE(excluded.reset_credit_count, codex_keeper_auth_states.reset_credit_count)
 			END,
 			reset_credits = CASE
-				WHEN excluded.provider = 'antigravity' THEN NULL
+				WHEN excluded.provider <> 'codex' THEN NULL
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.reset_credits
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
 					AND codex_keeper_auth_states.account_id <> excluded.account_id
@@ -4445,7 +4468,7 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			--      incoming value so the new account never inherits the old renewal date.
 			--   4. otherwise (same/undeterminable account) → preserve on an unknown claim.
 			subscription_active_until = CASE
-				WHEN excluded.provider = 'antigravity' THEN NULL
+				WHEN excluded.provider <> 'codex' THEN NULL
 				WHEN ? AND excluded.auth_index IS NOT NULL THEN excluded.subscription_active_until
 				WHEN excluded.auth_index IS NULL THEN codex_keeper_auth_states.subscription_active_until
 				WHEN codex_keeper_auth_states.account_id IS NOT NULL AND excluded.account_id IS NOT NULL
@@ -4457,18 +4480,16 @@ func (a *App) upsertKeeperState(ctx context.Context, result keeperAccountResult)
 			-- leaves it nil); antigravity_quota: preserve on a failed/skipped fetch (nil) like
 			-- reset_credits, otherwise write the fresh snapshot.
 			provider = COALESCE(excluded.provider, codex_keeper_auth_states.provider),
-			-- The antigravity identity digest is the resource identity. A codex inspection clears it
-			-- (not a codex column). An antigravity inspection with a RESOLVED identity writes the
-			-- fresh digest; when the identity is UNKNOWN this inspection (excluded digest NULL, e.g.
-			-- the detail read failed) it must PRESERVE the stored digest — wiping it would erase the
-			-- swap-detection anchor and let the next inspection's COALESCE keep a different account's
-			-- quota. So COALESCE(fresh, stored) rather than force-writing the (possibly NULL) fresh.
-			antigravity_identity_digest = CASE
-				WHEN excluded.provider = 'codex' THEN NULL
-				ELSE COALESCE(excluded.antigravity_identity_digest, codex_keeper_auth_states.antigravity_identity_digest)
-			END,
+			-- The identity digest is the resource identity for the generic quota snapshot
+			-- (antigravity and the other blob providers all store it here; codex now also binds
+			-- its own quota blob to account_id + email). An inspection with a RESOLVED identity
+			-- writes the fresh digest; when the identity is UNKNOWN this inspection (excluded
+			-- digest NULL, e.g. the detail read failed) it must PRESERVE the stored digest —
+			-- wiping it would erase the swap-detection anchor and let the next inspection's
+			-- COALESCE keep a different account's quota. So COALESCE(fresh, stored) rather than
+			-- force-writing the (possibly NULL) fresh.
+			antigravity_identity_digest = COALESCE(excluded.antigravity_identity_digest, codex_keeper_auth_states.antigravity_identity_digest),
 			antigravity_quota = CASE
-				WHEN excluded.provider = 'codex' THEN NULL
 				-- Incoming identity is KNOWN and the stored quota is NOT proven to belong to it —
 				-- either the stored digest is NULL (legacy/unbound snapshot: no identity binding, so
 				-- it cannot be shown to be this account's) OR the stored digest DIFFERS (confirmed
