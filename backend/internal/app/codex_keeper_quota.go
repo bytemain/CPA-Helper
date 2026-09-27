@@ -9,6 +9,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -327,6 +328,28 @@ func quotaFlexibleResetAt(values ...any) (*time.Time, bool) {
 		if v == nil {
 			continue
 		}
+		if s, ok := v.(string); ok {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
+				parsed = parsed.In(appTimeLocation)
+				return &parsed, true
+			}
+			if ts, ok := keeperFloatValue(s); ok {
+				seconds := int64(ts)
+				if seconds > 10_000_000_000 {
+					seconds /= 1000
+				}
+				if seconds <= 0 {
+					continue
+				}
+				parsed := time.Unix(seconds, 0).In(appTimeLocation)
+				return &parsed, true
+			}
+			return nil, false
+		}
 		if ts, ok := keeperFloatValue(v); ok {
 			seconds := int64(ts)
 			if seconds > 10_000_000_000 {
@@ -337,17 +360,6 @@ func quotaFlexibleResetAt(values ...any) (*time.Time, bool) {
 			}
 			parsed := time.Unix(seconds, 0).In(appTimeLocation)
 			return &parsed, true
-		}
-		if s, ok := v.(string); ok {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
-			}
-			if parsed, err := time.Parse(time.RFC3339Nano, s); err == nil {
-				parsed = parsed.In(appTimeLocation)
-				return &parsed, true
-			}
-			return nil, false
 		}
 		return nil, false
 	}
@@ -378,24 +390,72 @@ func quotaWindowLabel(raw string) string {
 // --- parsers ---------------------------------------------------------------
 
 // parseKimiQuotaGroups projects the Kimi coding usages body into one "Kimi" group. The
-// response shape is not pinned: it carries a `usages` array (possibly under `data`) whose
-// entries map limit_* / remaining / used fields to rolling windows. ok=false when no usable
+// response shape is not pinned: `usages` may be an array (possibly under `data`) whose
+// entries map limit_* / remaining / used fields to rolling windows, or a map keyed by
+// limit_* names whose entries carry used_ratio / reset_time. ok=false when no usable
 // bucket is found.
 func parseKimiQuotaGroups(body map[string]any) ([]keeperAntigravityGroup, bool) {
 	if body == nil {
 		return nil, false
 	}
-	rawUsages, ok := body["usages"].([]any)
-	if !ok {
+	usagesNode, present := body["usages"]
+	if !present {
 		if data, _ := body["data"].(map[string]any); data != nil {
-			rawUsages, ok = data["usages"].([]any)
+			usagesNode = data["usages"]
 		}
 	}
-	if !ok {
+	if usagesNode == nil {
 		return nil, false
 	}
 	buckets := []keeperAntigravityBucket{}
 	seen := map[string]bool{}
+	// Map form: {"limit_5h": {"used_ratio": 0.02, "reset_time": "..."}, ...}. Keys are
+	// sorted for deterministic output; entries sharing a window label keep the first.
+	if usageMap, ok := usagesNode.(map[string]any); ok {
+		names := make([]string, 0, len(usageMap))
+		for name := range usageMap {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			entry, ok := usageMap[name].(map[string]any)
+			if !ok || !strings.HasPrefix(name, "limit_") {
+				continue
+			}
+			suffix := strings.TrimPrefix(name, "limit_")
+			label := quotaWindowLabel(suffix)
+			if label == "" || seen[label] {
+				continue
+			}
+			fraction, has := kimiRatioFraction(entry)
+			if !has {
+				fraction, has = kimiEntryFraction(entry, suffix, 0)
+			}
+			if !has {
+				continue
+			}
+			var resetAt *time.Time
+			if ts, ok := quotaFlexibleResetAt(entry["reset_time"], entry["resetTime"], entry["reset_at"], entry["resetAt"]); ok {
+				resetAt = ts
+			}
+			seen[label] = true
+			buckets = append(buckets, keeperAntigravityBucket{
+				BucketID:          label,
+				DisplayName:       label,
+				Window:            label,
+				RemainingFraction: fraction,
+				ResetAt:           resetAt,
+			})
+		}
+		if len(buckets) > 0 {
+			return []keeperAntigravityGroup{{DisplayName: "Kimi", Buckets: buckets}}, true
+		}
+	}
+	rawUsages, ok := usagesNode.([]any)
+	if !ok {
+		return nil, false
+	}
+	seen = map[string]bool{}
 	for _, u := range rawUsages {
 		entry, ok := u.(map[string]any)
 		if !ok {
@@ -449,6 +509,33 @@ func parseKimiQuotaGroups(body map[string]any) ([]keeperAntigravityGroup, bool) 
 		return nil, false
 	}
 	return []keeperAntigravityGroup{{DisplayName: "Kimi", Buckets: buckets}}, true
+}
+
+// kimiRatioFraction resolves a remaining fraction from ratio-style fields: used_ratio /
+// usedRatio mean "fraction used" (remaining = 1 - ratio); remaining_ratio / remainingRatio
+// are already the remaining fraction. Ratios > 1 are treated as percents.
+func kimiRatioFraction(entry map[string]any) (float64, bool) {
+	for _, k := range []string{"remaining_ratio", "remainingRatio"} {
+		if raw, present := entry[k]; present && raw != nil {
+			if v, ok := keeperFloatValue(raw); ok {
+				if v > 1 {
+					v = v / 100
+				}
+				return keeperClamp01(v), true
+			}
+		}
+	}
+	for _, k := range []string{"used_ratio", "usedRatio"} {
+		if raw, present := entry[k]; present && raw != nil {
+			if v, ok := keeperFloatValue(raw); ok {
+				if v > 1 {
+					v = v / 100
+				}
+				return keeperClamp01(1 - v), true
+			}
+		}
+	}
+	return 0, false
 }
 
 // kimiEntryFraction resolves a remaining fraction for one usage entry. It prefers an explicit
@@ -516,7 +603,12 @@ func parseXAIQuotaGroups(body map[string]any) ([]keeperAntigravityGroup, bool) {
 	}
 	var resetAt *time.Time
 	window := "weekly"
-	if period, _ := body["currentPeriod"].(map[string]any); period != nil {
+	period, _ := body["currentPeriod"].(map[string]any)
+	if period == nil {
+		// Live responses nest the period inside "config".
+		period, _ = cfgMap["currentPeriod"].(map[string]any)
+	}
+	if period != nil {
 		if ts, ok := quotaFlexibleResetAt(period["end"], period["end_at"], period["endAt"], period["reset_at"], period["resetAt"]); ok {
 			resetAt = ts
 		}

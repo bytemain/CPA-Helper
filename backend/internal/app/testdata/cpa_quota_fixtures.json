@@ -1,0 +1,689 @@
+[
+ {
+  "type": "codex",
+  "file": "<email>-pro.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "user_id": "<redacted>",
+   "account_id": "",
+   "email": "<redacted>",
+   "plan_type": "pro",
+   "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+     "used_percent": 0,
+     "limit_window_seconds": 604800,
+     "reset_after_seconds": 598509,
+     "reset_at": 1791122537
+    },
+    "secondary_window": null
+   },
+   "code_review_rate_limit": null,
+   "additional_rate_limits": null,
+   "model_usage": {
+    "gpt-6-astra": {
+     "available": true,
+     "available_at": null,
+     "credits_would_enable": false
+    }
+   },
+   "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+     0,
+     0
+    ],
+    "approx_cloud_messages": [
+     0,
+     0
+    ]
+   },
+   "spend_control": {
+    "reached": false,
+    "individual_limit": null
+   },
+   "rate_limit_reached_type": null,
+   "promo": null,
+   "rate_limit_reset_credits": {
+    "available_count": 3,
+    "applicable_available_count": 0
+   }
+  }
+ },
+ {
+  "type": "codex",
+  "file": "<email>-pro.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "user_id": "<redacted>",
+   "account_id": "",
+   "email": "<redacted>",
+   "plan_type": "pro",
+   "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+     "used_percent": 0,
+     "limit_window_seconds": 604800,
+     "reset_after_seconds": 604800,
+     "reset_at": 1791128830
+    },
+    "secondary_window": null
+   },
+   "code_review_rate_limit": null,
+   "additional_rate_limits": null,
+   "model_usage": {
+    "gpt-6-astra": {
+     "available": true,
+     "available_at": null,
+     "credits_would_enable": false
+    }
+   },
+   "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+     0,
+     0
+    ],
+    "approx_cloud_messages": [
+     0,
+     0
+    ]
+   },
+   "spend_control": {
+    "reached": false,
+    "individual_limit": null
+   },
+   "rate_limit_reached_type": null,
+   "promo": null,
+   "rate_limit_reset_credits": {
+    "available_count": 2,
+    "applicable_available_count": 0
+   }
+  }
+ },
+ {
+  "type": "codex",
+  "file": "<email>-pro.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "user_id": "<redacted>",
+   "account_id": "",
+   "email": "<redacted>",
+   "plan_type": "pro",
+   "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+     "used_percent": 0,
+     "limit_window_seconds": 604800,
+     "reset_after_seconds": 532279,
+     "reset_at": 1791056309
+    },
+    "secondary_window": null
+   },
+   "code_review_rate_limit": null,
+   "additional_rate_limits": null,
+   "model_usage": {
+    "gpt-6-astra": {
+     "available": true,
+     "available_at": null,
+     "credits_would_enable": false
+    }
+   },
+   "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+     0,
+     0
+    ],
+    "approx_cloud_messages": [
+     0,
+     0
+    ]
+   },
+   "spend_control": {
+    "reached": false,
+    "individual_limit": null
+   },
+   "rate_limit_reached_type": null,
+   "promo": null,
+   "rate_limit_reset_credits": {
+    "available_count": 3,
+    "applicable_available_count": 0
+   }
+  }
+ },
+ {
+  "type": "codex",
+  "file": "<email>-pro.json",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "user_id": "<redacted>",
+   "account_id": "",
+   "email": "<redacted>",
+   "plan_type": "pro",
+   "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+     "used_percent": 0,
+     "limit_window_seconds": 604800,
+     "reset_after_seconds": 601733,
+     "reset_at": 1791125764
+    },
+    "secondary_window": null
+   },
+   "code_review_rate_limit": null,
+   "additional_rate_limits": null,
+   "model_usage": {
+    "gpt-6-astra": {
+     "available": true,
+     "available_at": null,
+     "credits_would_enable": false
+    }
+   },
+   "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+     0,
+     0
+    ],
+    "approx_cloud_messages": [
+     0,
+     0
+    ]
+   },
+   "spend_control": {
+    "reached": false,
+    "individual_limit": null
+   },
+   "rate_limit_reached_type": null,
+   "promo": null,
+   "rate_limit_reset_credits": {
+    "available_count": 1,
+    "applicable_available_count": 0
+   }
+  }
+ },
+ {
+  "type": "codex",
+  "file": "<email>-pro.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "user_id": "<redacted>",
+   "account_id": "",
+   "email": "<redacted>",
+   "plan_type": "pro",
+   "rate_limit": {
+    "allowed": true,
+    "limit_reached": false,
+    "primary_window": {
+     "used_percent": 0,
+     "limit_window_seconds": 604800,
+     "reset_after_seconds": 604800,
+     "reset_at": 1791128833
+    },
+    "secondary_window": null
+   },
+   "code_review_rate_limit": null,
+   "additional_rate_limits": null,
+   "model_usage": {
+    "gpt-6-astra": {
+     "available": true,
+     "available_at": null,
+     "credits_would_enable": false
+    }
+   },
+   "credits": {
+    "has_credits": false,
+    "unlimited": false,
+    "overage_limit_reached": false,
+    "balance": "0",
+    "approx_local_messages": [
+     0,
+     0
+    ],
+    "approx_cloud_messages": [
+     0,
+     0
+    ]
+   },
+   "spend_control": {
+    "reached": false,
+    "individual_limit": null
+   },
+   "rate_limit_reached_type": null,
+   "promo": null,
+   "rate_limit_reset_credits": {
+    "available_count": 2,
+    "applicable_available_count": 0
+   }
+  }
+ },
+ {
+  "type": "devin",
+  "file": "devin-user-8250b3544ccc9cd2-max.json",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "userStatus": {
+    "planStatus": {
+     "planInfo": {
+      "teamsTier": "TEAMS_TIER_DEVIN_MAX",
+      "planName": "Max",
+      "hasAutocompleteFastMode": true,
+      "allowStickyPremiumModels": true,
+      "hasForgeAccess": true,
+      "allowPremiumCommandModels": true,
+      "hasTabToJump": true,
+      "maxNumChatInputTokens": "16384",
+      "maxCustomChatInstructionCharacters": "600",
+      "maxNumPinnedContextItems": "-1",
+      "maxLocalIndexSize": "-1",
+      "monthlyPromptCredits": -1,
+      "hasPaidFeatures": true,
+      "cascadeWebSearchEnabled": true,
+      "canCustomizeAppIcon": true,
+      "canGenerateCommitMessages": true,
+      "knowledgeBaseEnabled": true,
+      "defaultTeamConfig": {
+       "allowMcpServers": true,
+       "maxUnclaimedSites": 5,
+       "allowAppDeployments": true,
+       "allowSandboxAppDeployments": true,
+       "allowTeamsAppDeployments": true,
+       "maxNewSitesPerDay": 5,
+       "allowBrowserExperimentalFeatures": true,
+       "allowCodemapSharing": "enabled",
+       "maxCascadeAutoExecutionLevel": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+       "cascadeWebSearchEnabled": true,
+       "allowArenaMode": true,
+       "allowBundlingDevinCli": true,
+       "devinTerminalAcpEnabled": true,
+       "devinCloudAcpEnabled": true,
+       "customAcpEnabled": true
+      },
+      "canShareConversations": true,
+      "canAllowCascadeInBackground": true,
+      "browserEnabled": true,
+      "devinInfo": {
+       "canUseCascade": true,
+       "canUseCli": true,
+       "isAdmin": true,
+       "orgId": "<redacted>",
+       "webappHost": "app.devin.ai",
+       "devinReviewEnabled": true,
+       "apiUrl": "https://api.devin.ai",
+       "accountDisplayName": "<redacted>",
+       "requestUsageAction": {
+        "kind": "KIND_TEXT_ONLY",
+        "label": "Ask your account admin to raise it"
+       }
+      },
+      "isDevin": true,
+      "billingStrategy": "BILLING_STRATEGY_QUOTA",
+      "hideDailyQuota": true
+     },
+     "planStart": "2026-09-25T14:54:09Z",
+     "planEnd": "2026-10-25T14:54:09Z",
+     "availablePromptCredits": -1,
+     "dailyQuotaRemainingPercent": 100,
+     "weeklyQuotaRemainingPercent": 67,
+     "dailyQuotaResetAtUnix": "1790582400",
+     "weeklyQuotaResetAtUnix": "1791100800"
+    }
+   }
+  }
+ },
+ {
+  "type": "devin",
+  "file": "devin-user-8250b3544ccc9cd2.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "userStatus": {
+    "planStatus": {
+     "planInfo": {
+      "teamsTier": "TEAMS_TIER_DEVIN_PRO",
+      "planName": "Pro",
+      "hasAutocompleteFastMode": true,
+      "allowStickyPremiumModels": true,
+      "hasForgeAccess": true,
+      "allowPremiumCommandModels": true,
+      "hasTabToJump": true,
+      "maxNumChatInputTokens": "16384",
+      "maxCustomChatInstructionCharacters": "600",
+      "maxNumPinnedContextItems": "-1",
+      "maxLocalIndexSize": "-1",
+      "monthlyPromptCredits": -1,
+      "hasPaidFeatures": true,
+      "cascadeWebSearchEnabled": true,
+      "canCustomizeAppIcon": true,
+      "canGenerateCommitMessages": true,
+      "knowledgeBaseEnabled": true,
+      "defaultTeamConfig": {
+       "allowMcpServers": true,
+       "maxUnclaimedSites": 5,
+       "allowAppDeployments": true,
+       "allowSandboxAppDeployments": true,
+       "allowTeamsAppDeployments": true,
+       "maxNewSitesPerDay": 5,
+       "allowBrowserExperimentalFeatures": true,
+       "allowCodemapSharing": "enabled",
+       "maxCascadeAutoExecutionLevel": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+       "cascadeWebSearchEnabled": true,
+       "allowArenaMode": true,
+       "allowBundlingDevinCli": true,
+       "devinTerminalAcpEnabled": true,
+       "devinCloudAcpEnabled": true,
+       "customAcpEnabled": true
+      },
+      "canShareConversations": true,
+      "canAllowCascadeInBackground": true,
+      "browserEnabled": true,
+      "devinInfo": {
+       "canUseCascade": true,
+       "canUseCli": true,
+       "isAdmin": true,
+       "orgId": "<redacted>",
+       "webappHost": "app.devin.ai",
+       "devinReviewEnabled": true,
+       "apiUrl": "https://api.devin.ai",
+       "accountDisplayName": "<redacted>",
+       "requestUsageAction": {
+        "kind": "KIND_TEXT_ONLY",
+        "label": "Ask your account admin to raise it"
+       }
+      },
+      "isDevin": true,
+      "billingStrategy": "BILLING_STRATEGY_QUOTA"
+     },
+     "planStart": "2026-09-23T06:00:23Z",
+     "planEnd": "2026-10-23T06:00:23Z",
+     "availablePromptCredits": -1,
+     "weeklyQuotaRemainingPercent": 49,
+     "dailyQuotaResetAtUnix": "1790582400",
+     "weeklyQuotaResetAtUnix": "1791100800"
+    }
+   }
+  }
+ },
+ {
+  "type": "devin",
+  "file": "devin-user-fa03e24b343aafa1.json",
+  "disabled": true,
+  "status": 200,
+  "body": {
+   "userStatus": {
+    "planStatus": {
+     "planInfo": {
+      "teamsTier": "TEAMS_TIER_DEVIN_PRO",
+      "planName": "Pro",
+      "hasAutocompleteFastMode": true,
+      "allowStickyPremiumModels": true,
+      "hasForgeAccess": true,
+      "allowPremiumCommandModels": true,
+      "hasTabToJump": true,
+      "maxNumChatInputTokens": "16384",
+      "maxCustomChatInstructionCharacters": "600",
+      "maxNumPinnedContextItems": "-1",
+      "maxLocalIndexSize": "-1",
+      "monthlyPromptCredits": -1,
+      "hasPaidFeatures": true,
+      "cascadeWebSearchEnabled": true,
+      "canCustomizeAppIcon": true,
+      "canGenerateCommitMessages": true,
+      "knowledgeBaseEnabled": true,
+      "defaultTeamConfig": {
+       "allowMcpServers": true,
+       "maxUnclaimedSites": 5,
+       "allowAppDeployments": true,
+       "allowSandboxAppDeployments": true,
+       "allowTeamsAppDeployments": true,
+       "maxNewSitesPerDay": 5,
+       "allowBrowserExperimentalFeatures": true,
+       "allowCodemapSharing": "enabled",
+       "maxCascadeAutoExecutionLevel": "CASCADE_COMMANDS_AUTO_EXECUTION_EAGER",
+       "cascadeWebSearchEnabled": true,
+       "allowArenaMode": true,
+       "allowBundlingDevinCli": true,
+       "devinTerminalAcpEnabled": true,
+       "devinCloudAcpEnabled": true,
+       "customAcpEnabled": true
+      },
+      "canShareConversations": true,
+      "canAllowCascadeInBackground": true,
+      "browserEnabled": true,
+      "devinInfo": {
+       "canUseCascade": true,
+       "canUseCli": true,
+       "isAdmin": true,
+       "orgId": "<redacted>",
+       "webappHost": "app.devin.ai",
+       "devinReviewEnabled": true,
+       "apiUrl": "https://api.devin.ai",
+       "accountDisplayName": "<redacted>",
+       "requestUsageAction": {
+        "kind": "KIND_TEXT_ONLY",
+        "label": "Ask your account admin to raise it"
+       }
+      },
+      "isDevin": true,
+      "billingStrategy": "BILLING_STRATEGY_QUOTA"
+     },
+     "planStart": "2026-09-17T16:48:39Z",
+     "planEnd": "2026-10-17T16:48:39Z",
+     "availablePromptCredits": -1,
+     "weeklyQuotaRemainingPercent": 50,
+     "dailyQuotaResetAtUnix": "1790582400",
+     "weeklyQuotaResetAtUnix": "1791100800"
+    }
+   }
+  }
+ },
+ {
+  "type": "kimi",
+  "file": "kimi-1784293697497.json",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "usage": {
+    "limit": "100",
+    "used": "17",
+    "remaining": "83",
+    "resetTime": "2026-10-02T13:07:35.341283Z"
+   },
+   "limits": [
+    {
+     "window": {
+      "duration": 300,
+      "timeUnit": "TIME_UNIT_MINUTE"
+     },
+     "detail": {
+      "limit": "100",
+      "used": "3",
+      "remaining": "97",
+      "resetTime": "2026-09-27T20:07:35.341283Z"
+     }
+    }
+   ],
+   "booster_wallet": {
+    "id": "<redacted>",
+    "userId": "<redacted>",
+    "balance": {
+     "id": "<redacted>",
+     "feature": "FEATURE_OMNI",
+     "type": "BOOSTER",
+     "unit": "UNIT_CURRENCY",
+     "periodStart": "2026-08-04T09:45:51.287960Z",
+     "periodEnd": "2126-08-04T09:45:52.287960Z",
+     "subscriptionId": "00000000-0000-0000-0000-000000000000",
+     "userId": "<redacted>",
+     "createTime": "2026-08-04T09:45:52.287960Z",
+     "updateTime": "2026-08-04T09:45:52.287960Z",
+     "domain": "DOMAIN_NEXUS"
+    },
+    "status": "STATUS_ACTIVE",
+    "allowTopup": true,
+    "topupLimit": {
+     "currency": "CNY",
+     "priceInCents": "300000"
+    },
+    "autoRefillCharge": {
+     "currency": "CNY",
+     "priceInCents": "0"
+    },
+    "autoRefillThreshold": {
+     "currency": "CNY",
+     "priceInCents": "0"
+    },
+    "monthlyChargeLimit": {
+     "currency": "CNY",
+     "priceInCents": "10000"
+    },
+    "monthlyUsed": {
+     "currency": "CNY",
+     "priceInCents": "0"
+    },
+    "createdAt": "2026-08-04T09:45:52.287960Z",
+    "updatedAt": "2026-08-04T09:45:52.287960Z"
+   },
+   "usages": {
+    "limit_5h": {
+     "used_ratio": 0.025275,
+     "reset_time": "2026-09-27T20:07:34Z"
+    },
+    "limit_7d": {
+     "used_ratio": 0.169572,
+     "reset_time": "2026-10-02T13:07:34Z"
+    }
+   }
+  }
+ },
+ {
+  "type": "kimi",
+  "file": "kimi-1789629164905.json",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "limits": [
+    {
+     "window": {
+      "duration": 300,
+      "timeUnit": "TIME_UNIT_MINUTE"
+     },
+     "detail": {
+      "limit": "100",
+      "used": "13",
+      "remaining": "87",
+      "resetTime": "2026-09-27T17:08:47.070757Z"
+     }
+    }
+   ],
+   "usages": {
+    "limit_5h": {
+     "used_ratio": 0.126721,
+     "reset_time": "2026-09-27T17:08:47Z"
+    },
+    "limit_month_total": {
+     "used_ratio": 0.2364,
+     "reset_time": "2026-10-18T00:00:00Z"
+    },
+    "limit_month_code": {
+     "used_ratio": 0.2364,
+     "reset_time": "2026-10-18T00:00:00Z"
+    }
+   }
+  }
+ },
+ {
+  "type": "kimi",
+  "file": "kimi-1789640825364.json",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "limits": [
+    {
+     "window": {
+      "duration": 300,
+      "timeUnit": "TIME_UNIT_MINUTE"
+     },
+     "detail": {
+      "limit": "100",
+      "used": "2",
+      "remaining": "98",
+      "resetTime": "2026-09-27T20:24:26.903588Z"
+     }
+    }
+   ],
+   "usages": {
+    "limit_5h": {
+     "used_ratio": 0.015025,
+     "reset_time": "2026-09-27T20:24:26Z"
+    },
+    "limit_month_total": {
+     "used_ratio": 0.323,
+     "reset_time": "2026-10-18T00:00:00Z"
+    },
+    "limit_month_code": {
+     "used_ratio": 0.3092,
+     "reset_time": "2026-10-18T00:00:00Z"
+    }
+   }
+  }
+ },
+ {
+  "type": "xai",
+  "file": "<email>",
+  "disabled": false,
+  "status": 200,
+  "body": {
+   "config": {
+    "currentPeriod": {
+     "type": "USAGE_PERIOD_TYPE_WEEKLY",
+     "start": "2026-09-25T19:33:06.769040+00:00",
+     "end": "2026-10-02T19:33:06.769040+00:00"
+    },
+    "creditUsagePercent": 3.0,
+    "onDemandCap": {
+     "val": 0
+    },
+    "onDemandUsed": {
+     "val": 0
+    },
+    "productUsage": [
+     {
+      "product": "GrokBuild",
+      "usagePercent": 3.0
+     }
+    ],
+    "isUnifiedBillingUser": true,
+    "prepaidBalance": {
+     "val": 0
+    },
+    "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+    "billingPeriodStart": "2026-09-25T19:33:06.769040+00:00",
+    "billingPeriodEnd": "2026-10-02T19:33:06.769040+00:00"
+   }
+  }
+ }
+]
