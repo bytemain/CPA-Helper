@@ -29,7 +29,7 @@ func ParseArgs(args []string, now time.Time) (Options, error) {
 	fs := flag.NewFlagSet("account-runway", flag.ContinueOnError)
 	fs.StringVar(&opts.DBPath, "db", opts.DBPath, "SQLite database path")
 	fs.IntVar(&opts.Since, "since", opts.Since, "burn-rate window in days")
-	fs.StringVar(&opts.Provider, "provider", opts.Provider, "antigravity|codex|all")
+	fs.StringVar(&opts.Provider, "provider", opts.Provider, "antigravity|codex|kimi|xai|devin|all")
 	fs.BoolVar(&opts.JSON, "json", false, "emit JSON")
 	if err := fs.Parse(args); err != nil {
 		return Options{}, err
@@ -38,9 +38,9 @@ func ParseArgs(args []string, now time.Time) (Options, error) {
 		return Options{}, fmt.Errorf("--since must be a positive number of days, got %d", opts.Since)
 	}
 	switch opts.Provider {
-	case "antigravity", "codex", "all":
+	case "antigravity", "codex", "kimi", "xai", "devin", "all":
 	default:
-		return Options{}, fmt.Errorf("--provider must be antigravity, codex or all, got %q", opts.Provider)
+		return Options{}, fmt.Errorf("--provider must be antigravity, codex, kimi, xai, devin or all, got %q", opts.Provider)
 	}
 	if opts.DBPath == "" {
 		// Same resolution the service uses (CPA_HELPER_DATA_DIR, else

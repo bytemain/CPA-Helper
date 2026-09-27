@@ -15,8 +15,9 @@ import (
 )
 
 // Provider identifiers for a keeper account. The keeper started as a Codex-only feature; it now
-// dispatches per provider so non-Codex accounts (Antigravity) are inspected with their own quota
-// source instead of being silently skipped.
+// dispatches per provider so non-Codex accounts (Antigravity, and the generic quota providers
+// kimi/xai/devin declared in codex_keeper_quota.go) are inspected with their own quota source
+// instead of being silently skipped.
 const (
 	keeperProviderCodex       = "codex"
 	keeperProviderAntigravity = "antigravity"
@@ -55,11 +56,13 @@ type keeperAntigravityGroup struct {
 }
 
 // keeperIsInspectableProvider reports whether an auth-file `type` is one the keeper inspects.
-// Codex has always been inspected; Antigravity is now included so its accounts appear and get
-// their quota refreshed. Other providers are still skipped.
+// Codex has always been inspected; Antigravity and the generic quota providers (kimi, xai,
+// devin) are included so their accounts appear and get their quota refreshed. Other providers
+// are still skipped.
 func keeperIsInspectableProvider(authType string) bool {
 	switch authType {
-	case keeperProviderCodex, keeperProviderAntigravity:
+	case keeperProviderCodex, keeperProviderAntigravity,
+		keeperProviderKimi, keeperProviderXAI, keeperProviderDevin:
 		return true
 	default:
 		return false

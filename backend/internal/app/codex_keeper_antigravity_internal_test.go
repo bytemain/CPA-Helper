@@ -462,8 +462,9 @@ func TestKeeperInspectAntigravityIdentityConflictFailsClosed(t *testing.T) {
 
 // TestKeeperUpsertProviderSwitchClearsStaleFields proves the upsert enforces the provider
 // invariant: switching a row codex→antigravity clears the stale Codex-only columns (account_id,
-// reset credits, subscription, usage), and switching back antigravity→codex clears the stale
-// antigravity_quota. So a filename reused for a different provider never shows mixed data.
+// reset credits, subscription, usage), and switching back antigravity→codex replaces the stale
+// antigravity_quota with the Codex group's generic snapshot (codex now also writes a quota blob
+// + identity digest). So a filename reused for a different provider never shows mixed data.
 func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	app, err := New()
@@ -514,10 +515,19 @@ func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 		t.Fatalf("codex restore_priority not cleared on provider switch: %v", st.RestorePriority)
 	}
 
-	// Switch back to codex → the antigravity quota must be cleared.
+	// Switch back to codex → the codex healthy path now also writes its own generic quota
+	// blob + identity digest, so the stale antigravity groups are REPLACED by a "Codex"
+	// group bound to the codex digest (not merely cleared).
+	codexGroups, _ := parseCodexQuotaGroups(map[string]any{
+		"rate_limit": map[string]any{"primary_window": map[string]any{"used_percent": float64(25)}},
+	})
+	codexBlobBytes, _ := json.Marshal(codexGroups)
+	codexBlob := string(codexBlobBytes)
+	codexDigest := keeperQuotaIdentityDigest("codex", acct, "c@x.com")
 	if err := app.upsertKeeperState(ctx, keeperAccountResult{
 		Name: authName, Result: "healthy", CheckedAt: timeMust(t, "2026-09-09T02:00:00Z"), Provider: &codex,
-		AuthIndex: &idx, PrimaryUsedPercent: &used,
+		AuthIndex: &idx, PrimaryUsedPercent: &used, AccountID: &acct,
+		AntigravityQuota: &codexBlob, AntigravityIdentityDigest: &codexDigest,
 	}); err != nil {
 		t.Fatalf("upsert codex again: %v", err)
 	}
@@ -525,8 +535,14 @@ func TestKeeperUpsertProviderSwitchClearsStaleFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get2: %v", err)
 	}
-	if st.Provider == nil || *st.Provider != "codex" || len(st.AntigravityQuota) != 0 {
-		t.Fatalf("switch back to codex: provider=%v antigravity_quota len=%d (want cleared)", st.Provider, len(st.AntigravityQuota))
+	if st.Provider == nil || *st.Provider != "codex" {
+		t.Fatalf("switch back to codex: provider=%v", st.Provider)
+	}
+	if len(st.AntigravityQuota) != 1 || st.AntigravityQuota[0].DisplayName != "Codex" {
+		t.Fatalf("switch back to codex: antigravity_quota = %+v (want the Codex group, stale antigravity replaced)", st.AntigravityQuota)
+	}
+	if st.AntigravityIdentityDigest == nil || *st.AntigravityIdentityDigest != codexDigest {
+		t.Fatalf("switch back to codex: identity digest = %v, want %q", st.AntigravityIdentityDigest, codexDigest)
 	}
 }
 
@@ -574,8 +590,9 @@ func TestKeeperConditionalReconcilePreservesAntigravity(t *testing.T) {
 
 // TestKeeperWebsocketFailureClearsStaleAntigravityProvider reproduces the provider-switch probe on
 // the credential-websocket failure path: a row stored as Antigravity whose remote file is now Codex
-// and whose websocket-enable PATCH fails must still be re-tagged provider=codex (clearing the stale
-// antigravity_quota), not left showing as Antigravity.
+// and whose websocket-enable PATCH fails must still be re-tagged provider=codex. The stored quota
+// snapshot is preserved (the inspection failed before resolving a new identity, so the generic
+// snapshot column's COALESCE keeps it); it is NOT left showing provider=antigravity.
 func TestKeeperWebsocketFailureClearsStaleAntigravityProvider(t *testing.T) {
 	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
 	const authName = "switched.json"
@@ -631,8 +648,12 @@ func TestKeeperWebsocketFailureClearsStaleAntigravityProvider(t *testing.T) {
 	if st.Provider == nil || *st.Provider != "codex" {
 		t.Fatalf("stale provider not switched to codex on websocket-failure path: %v", st.Provider)
 	}
-	if len(st.AntigravityQuota) != 0 {
-		t.Fatalf("stale antigravity_quota not cleared on provider switch: %+v", st.AntigravityQuota)
+	// The websocket-enable failure happens BEFORE the detail/quota read, so the incoming
+	// identity is unresolved this inspection: the stored antigravity quota is PRESERVED
+	// under the generic-snapshot contract (COALESCE), not wiped — only provider switches to
+	// codex; a later successful codex inspection replaces the blob with the Codex group.
+	if len(st.AntigravityQuota) == 0 {
+		t.Fatalf("stored quota should be preserved across the unresolved-identity failure: %+v", st.AntigravityQuota)
 	}
 }
 
