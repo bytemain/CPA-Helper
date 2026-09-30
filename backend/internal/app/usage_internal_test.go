@@ -161,7 +161,7 @@ func TestWarmPriceMap(t *testing.T) {
 	records := []UsageRecord{
 		{Provider: &provider, Model: &model},
 	}
-	warmPriceMap(prices, records)
+	warmPriceMap(testPriceBook(prices), records)
 	key := priceKey(provider, model)
 	cached, ok := prices[key]
 	if !ok {

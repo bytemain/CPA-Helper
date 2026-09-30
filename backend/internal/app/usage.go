@@ -260,8 +260,8 @@ func hasUsageSubFilters(filters UsageFilters) bool {
 		filters.RequestID != nil
 }
 
-func warmPriceMap(prices map[[2]string]ModelPrice, records []UsageRecord) {
-	if len(prices) == 0 || len(records) == 0 {
+func warmPriceMap(book priceBook, records []UsageRecord) {
+	if len(book.prices) == 0 || len(records) == 0 {
 		return
 	}
 	seen := make(map[[2]string]struct{}, 16)
@@ -274,9 +274,9 @@ func warmPriceMap(prices map[[2]string]ModelPrice, records []UsageRecord) {
 			continue
 		}
 		seen[k] = struct{}{}
-		if _, ok := prices[k]; !ok {
-			if matched := findMatchingPrice(prices, r.Provider, r.Model); matched != nil {
-				prices[k] = *matched
+		if _, ok := book.prices[k]; !ok {
+			if matched := book.find(r.Provider, r.Model); matched != nil {
+				book.prices[k] = *matched
 			}
 		}
 	}

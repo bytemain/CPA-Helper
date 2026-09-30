@@ -8,7 +8,7 @@ import "time"
 // implementation would drift silently. The seam is narrow on purpose: only
 // the record->cost question is exported, not the matching internals.
 func UsageRecordCost(record UsageRecord, prices map[[2]string]ModelPrice) (usd float64, unpriced bool) {
-	return recordCost(record, prices)
+	return recordCost(record, priceBook{prices: prices})
 }
 
 // UsageDBTime formats a timestamp the way production writes it to TEXT columns
