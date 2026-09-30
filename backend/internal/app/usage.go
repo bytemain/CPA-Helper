@@ -409,7 +409,7 @@ func (a *App) usageSummary(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -427,7 +427,7 @@ func (a *App) usageTrends(w http.ResponseWriter, r *http.Request, filters UsageF
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -456,7 +456,7 @@ func (a *App) usageRankings(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -478,7 +478,7 @@ func (a *App) usageDistributions(w http.ResponseWriter, r *http.Request, filters
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -496,7 +496,7 @@ func (a *App) usageOverview(w http.ResponseWriter, r *http.Request, filters Usag
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -555,7 +555,7 @@ func (a *App) usageRecords(w http.ResponseWriter, r *http.Request, filters Usage
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -588,7 +588,7 @@ func (a *App) usageRecordDetail(w http.ResponseWriter, r *http.Request, recordID
 	if err != nil {
 		return err
 	}
-	prices, err := a.priceMap(r.Context())
+	prices, err := a.loadPriceBook(r.Context())
 	if err != nil {
 		return err
 	}
@@ -962,7 +962,7 @@ func (a *App) userLookup(ctx context.Context, scope usageAccessScope) (map[strin
 	return lookup, nil
 }
 
-func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices map[[2]string]ModelPrice, redaction usageRedactionOptions) map[string]any {
+func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices priceBook, redaction usageRedactionOptions) map[string]any {
 	amount, unpriced := recordCost(record, prices)
 	userID := (*int)(nil)
 	userLabel := "未绑定"
@@ -1010,7 +1010,7 @@ func listItemFromRecord(record UsageRecord, users map[string]userInfo, prices ma
 	}
 }
 
-func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
+func usageSummaryFromRecords(filters UsageFilters, records []UsageRecord, prices priceBook) map[string]any {
 	failed := 0
 	input, output, cached, reasoning, total := 0, 0, 0, 0, 0
 	cacheHit := 0
@@ -1069,7 +1069,7 @@ func averageTTFTMS(total float64, count int) *float64 {
 	return &average
 }
 
-func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices map[[2]string]ModelPrice) []map[string]any {
+func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices priceBook) []map[string]any {
 	buckets := map[string][]UsageRecord{}
 	duration := 24 * time.Hour
 	if filters.Start != nil && filters.End != nil {
@@ -1111,7 +1111,7 @@ func trendPointsFromRecords(filters UsageFilters, records []UsageRecord, prices 
 	return points
 }
 
-func rankingFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice, groupBy string, users map[string]userInfo) map[string]any {
+func rankingFromRecords(records []UsageRecord, prices priceBook, groupBy string, users map[string]userInfo) map[string]any {
 	grouped := map[string][]UsageRecord{}
 	labels := map[string]string{}
 	userIDs := map[string]*int{}
@@ -1197,7 +1197,7 @@ func rankingItem(key, label string, records, failed, tokens int, cost float64, u
 	}
 }
 
-func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelPrice) map[string]any {
+func distributionsFromRecords(records []UsageRecord, prices priceBook) map[string]any {
 	return map[string]any{
 		"providers": distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Provider, "unknown") }),
 		"models":    distributionItems(records, prices, func(record UsageRecord) string { return valueOr(record.Model, "unknown") }),
@@ -1205,7 +1205,7 @@ func distributionsFromRecords(records []UsageRecord, prices map[[2]string]ModelP
 	}
 }
 
-func distributionItems(records []UsageRecord, prices map[[2]string]ModelPrice, keyFn func(UsageRecord) string) []map[string]any {
+func distributionItems(records []UsageRecord, prices priceBook, keyFn func(UsageRecord) string) []map[string]any {
 	grouped := map[string][]UsageRecord{}
 	for _, record := range records {
 		key := keyFn(record)

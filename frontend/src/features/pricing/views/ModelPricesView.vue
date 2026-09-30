@@ -31,10 +31,12 @@ import {
   updateLiteLLMProxySettings,
   updateModelPrice,
 } from '@/features/pricing/api/pricingApi'
+import { getSettings, updateSettings } from '@/features/settings/api/settingsApi'
 import type {
   LiteLLMProxySettingsPayload,
   ModelPrice,
   ModelPriceCatalogResponse,
+  ModelPriceMappingRule,
   ModelPricePayload,
 } from '@/shared/types/api'
 import { formatDateTime, formatInteger } from '@/shared/utils/format'
@@ -72,6 +74,7 @@ interface PriceDisplayRow {
 const PRICE_TABLE_FALLBACK_MAX_HEIGHT = 'max(240px, calc(100dvh - 360px))'
 const priceModalStyle: CSSProperties = { width: 'min(640px, calc(100vw - 32px))' }
 const proxyModalStyle: CSSProperties = { width: 'min(460px, calc(100vw - 32px))' }
+const mappingModalStyle: CSSProperties = { width: 'min(820px, calc(100vw - 32px))' }
 const proxyModalContentStyle: CSSProperties = { padding: '16px 22px 4px' }
 const proxyModalFooterStyle: CSSProperties = { padding: '12px 22px 18px' }
 const desktopPriceLayoutQuery = window.matchMedia('(min-width: 861px)')
@@ -84,6 +87,10 @@ const modalOpen = ref(false)
 const proxyModalOpen = ref(false)
 const isProxyLoading = ref(false)
 const isProxySaving = ref(false)
+const mappingModalOpen = ref(false)
+const isMappingLoading = ref(false)
+const isMappingSaving = ref(false)
+const mappingRules = ref<ModelPriceMappingRule[]>([])
 const editingId = ref<number | null>(null)
 const prices = ref<ModelPrice[]>([])
 const catalog = ref<ModelPriceCatalogResponse | null>(null)
@@ -513,6 +520,59 @@ async function saveProxySettings() {
   }
 }
 
+async function openMappingSettings() {
+  mappingModalOpen.value = true
+  isMappingLoading.value = true
+  try {
+    const settings = await getSettings()
+    mappingRules.value = (settings.model_price_mapping_rules ?? []).map((rule) => ({ ...rule }))
+  } catch (error) {
+    message.error(errorText(error, '加载价格映射规则失败', 'Failed to load price mapping rules'))
+  } finally {
+    isMappingLoading.value = false
+  }
+}
+
+function addMappingRule() {
+  mappingRules.value.push({
+    source_provider: '',
+    source_model: '',
+    target_provider: '',
+    target_model: '',
+  })
+}
+
+function removeMappingRule(rule: ModelPriceMappingRule) {
+  const index = mappingRules.value.indexOf(rule)
+  if (index >= 0) {
+    mappingRules.value.splice(index, 1)
+  }
+}
+
+// The backend owns validation (it is the money path); the editor only trims and lets a rejected
+// save surface the localized message naming the offending rule index and field.
+async function saveMappingRules() {
+  isMappingSaving.value = true
+  try {
+    const saved = await updateSettings({
+      model_price_mapping_rules: mappingRules.value.map((rule) => ({
+        source_provider: rule.source_provider.trim(),
+        source_model: rule.source_model.trim(),
+        target_provider: rule.target_provider.trim(),
+        target_model: rule.target_model.trim(),
+      })),
+    })
+    mappingRules.value = (saved.model_price_mapping_rules ?? []).map((rule) => ({ ...rule }))
+    mappingModalOpen.value = false
+    message.success(t('价格映射规则已保存', 'Price mapping rules saved'))
+    await refresh()
+  } catch (error) {
+    message.error(errorText(error, '保存价格映射规则失败', 'Failed to save price mapping rules'))
+  } finally {
+    isMappingSaving.value = false
+  }
+}
+
 function confirmDelete(row: ModelPrice) {
   dialog.warning({
     title: t('删除价格', 'Delete price'),
@@ -717,6 +777,76 @@ const columns = computed<DataTableColumns<PriceDisplayRow>>(() => [
   },
 ])
 
+const mappingColumns = computed<DataTableColumns<ModelPriceMappingRule>>(() => [
+  {
+    title: t('来源服务商', 'Source provider'),
+    key: 'source_provider',
+    minWidth: 150,
+    render: (row) =>
+      h(NInput, {
+        size: 'small',
+        value: row.source_provider,
+        placeholder: t('留空匹配全部', 'Blank matches any'),
+        onUpdateValue: (value: string) => {
+          row.source_provider = value
+        },
+      }),
+  },
+  {
+    title: t('来源模型', 'Source model'),
+    key: 'source_model',
+    minWidth: 170,
+    render: (row) =>
+      h(NInput, {
+        size: 'small',
+        value: row.source_model,
+        placeholder: t('填库里的完整模型名，例如 devin/swe-2 或 devin/swe-*', 'The full stored model name, e.g. devin/swe-2 or devin/swe-*'),
+        onUpdateValue: (value: string) => {
+          row.source_model = value
+        },
+      }),
+  },
+  {
+    title: t('目标服务商', 'Target provider'),
+    key: 'target_provider',
+    minWidth: 150,
+    render: (row) =>
+      h(NInput, {
+        size: 'small',
+        value: row.target_provider,
+        placeholder: t('例如 moonshot', 'For example moonshot'),
+        onUpdateValue: (value: string) => {
+          row.target_provider = value
+        },
+      }),
+  },
+  {
+    title: t('目标模型', 'Target model'),
+    key: 'target_model',
+    minWidth: 190,
+    render: (row) =>
+      h(NInput, {
+        size: 'small',
+        value: row.target_model,
+        placeholder: t('例如 moonshot/kimi-k3', 'For example moonshot/kimi-k3'),
+        onUpdateValue: (value: string) => {
+          row.target_model = value
+        },
+      }),
+  },
+  {
+    title: '',
+    key: 'actions',
+    width: 64,
+    render: (row) =>
+      h(
+        NButton,
+        { size: 'tiny', quaternary: true, type: 'error', onClick: () => removeMappingRule(row) },
+        { default: () => t('移除', 'Remove') },
+      ),
+  },
+])
+
 onMounted(() => {
   desktopPriceLayoutQuery.addEventListener('change', handleDesktopPriceLayoutChange)
   void refresh()
@@ -748,6 +878,12 @@ onBeforeUnmount(() => {
             <NIcon :component="Settings2" />
           </template>
           {{ t('代理配置', 'Proxy settings') }}
+        </NButton>
+        <NButton secondary @click="openMappingSettings">
+          <template #icon>
+            <NIcon :component="Layers3" />
+          </template>
+          {{ t('价格映射', 'Price mapping') }}
         </NButton>
         <NButton type="primary" @click="() => openCreate()">{{ t('新增价格', 'Add price') }}</NButton>
       </NSpace>
@@ -894,6 +1030,41 @@ onBeforeUnmount(() => {
         </NSpace>
       </template>
     </NModal>
+
+    <NModal
+      v-model:show="mappingModalOpen"
+      preset="card"
+      :title="t('模型价格映射', 'Model price mapping')"
+      :style="mappingModalStyle"
+      class="mapping-modal"
+    >
+      <div class="mapping-form">
+        <p class="mapping-hint">
+          {{ t('价格表里没有的模型，可以按下面的规则借用一个已知模型的价格。精确匹配的价格永远优先；规则只做一次映射，不会连锁；来源模型可用一个 * 匹配任意非空片段，目标模型里的 * 会替换成捕获到的内容。映射后的模型如果也没有价格，记录仍然算作「未计价」，不会变成 0 美元。', 'A model the price list does not know can borrow the price of a known model. An exact price always wins; a rule maps at most once and never chains. The source model may contain one * matching any non-empty text, and a * in the target model is replaced with the captured text. If the mapped target has no price either, the record stays unpriced — it never becomes $0.') }}
+        </p>
+        <div class="mapping-toolbar">
+          <span class="mapping-count">{{ t(`共 ${mappingRules.length} 条规则`, `${mappingRules.length} rules`) }}</span>
+          <NButton size="small" secondary :disabled="isMappingLoading || isMappingSaving" @click="addMappingRule">
+            {{ t('新增规则', 'Add rule') }}
+          </NButton>
+        </div>
+        <NDataTable
+          class="mapping-table"
+          size="small"
+          :loading="isMappingLoading"
+          :columns="mappingColumns"
+          :data="mappingRules"
+          :pagination="false"
+          :scroll-x="760"
+        />
+      </div>
+      <template #footer>
+        <NSpace justify="end">
+          <NButton :disabled="isMappingSaving" @click="mappingModalOpen = false">{{ t('取消', 'Cancel') }}</NButton>
+          <NButton type="primary" :loading="isMappingSaving" @click="saveMappingRules">{{ t('保存', 'Save') }}</NButton>
+        </NSpace>
+      </template>
+    </NModal>
   </section>
 </template>
 
@@ -919,6 +1090,42 @@ onBeforeUnmount(() => {
 .proxy-form {
   display: grid;
   gap: 14px;
+}
+
+.mapping-modal {
+  width: min(820px, calc(100vw - 24px));
+}
+
+.mapping-form {
+  display: grid;
+  gap: 12px;
+}
+
+.mapping-hint {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(8, 145, 178, 0.22);
+  border-radius: var(--cpa-radius);
+  background: rgba(8, 145, 178, 0.08);
+  color: var(--cpa-text-muted);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.mapping-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.mapping-count {
+  color: var(--cpa-text-muted);
+  font-size: 13px;
+}
+
+.mapping-table :deep(.n-input) {
+  width: 100%;
 }
 
 .proxy-hint {

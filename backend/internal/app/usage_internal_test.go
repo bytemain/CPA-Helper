@@ -134,7 +134,7 @@ func TestUsageSummaryCacheHitTokensAcrossProviders(t *testing.T) {
 		// No cache usage at all.
 		{Provider: &codex, InputTokens: 50, OutputTokens: 5, TotalTokens: 55},
 	}
-	summary := usageSummaryFromRecords(UsageFilters{}, records, nil)
+	summary := usageSummaryFromRecords(UsageFilters{}, records, priceBook{})
 	if got := summary["cache_hit_tokens"]; got != 1100 {
 		t.Fatalf("cache_hit_tokens = %v, want 1100 (claude 400 + codex 700)", got)
 	}

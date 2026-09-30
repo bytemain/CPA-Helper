@@ -268,6 +268,10 @@ type settingsUpdateRequest struct {
 	ProductName          *string  `json:"product_name"`
 	ProductLogo          *string  `json:"product_logo"`
 	APIKeyPrefix         *string  `json:"api_key_prefix"`
+
+	// ModelPriceMappingRules replaces the whole ordered rule list when present; an empty list
+	// clears every rule.
+	ModelPriceMappingRules *[]ModelPriceMappingRule `json:"model_price_mapping_rules"`
 }
 
 type modelRequestTestPayload struct {
@@ -372,6 +376,13 @@ func (a *App) handleSettings(w http.ResponseWriter, r *http.Request) error {
 			}
 			cfg.APIKeyPrefix = normalizeAPIKeyPrefix(*payload.APIKeyPrefix)
 		}
+		if payload.ModelPriceMappingRules != nil {
+			rules, err := validateModelPriceMappingRules(*payload.ModelPriceMappingRules)
+			if err != nil {
+				return err
+			}
+			cfg.ModelPriceMappingRules = rules
+		}
 		if err := a.saveConfig(r.Context(), cfg); err != nil {
 			return err
 		}
@@ -397,6 +408,8 @@ func settingsResponse(cfg AppConfig) map[string]any {
 		"product_name":           cfg.ProductName,
 		"product_logo":           cfg.ProductLogo,
 		"api_key_prefix":         normalizeAPIKeyPrefix(cfg.APIKeyPrefix),
+		// Always a list (never null) so the frontend can bind it directly.
+		"model_price_mapping_rules": sanitizeModelPriceMappingRules(cfg.ModelPriceMappingRules),
 	}
 }
 

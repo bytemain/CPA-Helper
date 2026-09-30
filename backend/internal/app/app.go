@@ -590,6 +590,10 @@ type AppConfig struct {
 	// APIKeyPrefix is the prefix for NEWLY generated API keys (`<prefix>-<random>`), without the
 	// joining dash. Empty means the default (`sk`). Existing keys are never rewritten.
 	APIKeyPrefix string `json:"api_key_prefix"`
+	// ModelPriceMappingRules maps models the price dictionary does not know onto models it does,
+	// in configured order. Empty (the default) means pricing behaves exactly as it did before the
+	// feature existed. See pricing_mapping.go for the matching and precedence rules.
+	ModelPriceMappingRules []ModelPriceMappingRule `json:"model_price_mapping_rules"`
 }
 
 func defaultConfig() (AppConfig, error) {
@@ -628,6 +632,9 @@ func defaultConfig() (AppConfig, error) {
 		ModelRequestURL: defaultCPAURL,
 		SessionSecret:   secret,
 		APIKeyPrefix:    defaultAPIKeyPrefix,
+		// No default mapping rules: deploying this release changes nothing until an operator
+		// configures rules.
+		ModelPriceMappingRules: []ModelPriceMappingRule{},
 	}, nil
 }
 
@@ -646,15 +653,16 @@ func (a *App) loadConfig(ctx context.Context) (AppConfig, error) {
 		SELECT collector_enabled, cliaproxy_url, management_key, queue_name, batch_size,
 		       poll_interval_seconds, retry_interval_seconds, codex_keeper_settings,
 		       codex_keeper_priority_rules, litellm_proxy_enabled, litellm_proxy_url,
-		       model_request_url, session_secret, product_name, product_logo, api_key_prefix
+		       model_request_url, session_secret, product_name, product_logo, api_key_prefix,
+		       model_price_mapping_rules
 		FROM app_settings WHERE id = 1
 	`)
 	var collectorEnabled, litellmProxyEnabled bool
 	var cliaproxyURL, managementKey, queueName, keeperJSON, rulesJSON, litellmProxyURL, modelRequestURL, sessionSecret string
-	var productName, productLogo, apiKeyPrefix string
+	var productName, productLogo, apiKeyPrefix, mappingRulesJSON string
 	var batchSize int
 	var pollInterval, retryInterval float64
-	if err := row.Scan(&collectorEnabled, &cliaproxyURL, &managementKey, &queueName, &batchSize, &pollInterval, &retryInterval, &keeperJSON, &rulesJSON, &litellmProxyEnabled, &litellmProxyURL, &modelRequestURL, &sessionSecret, &productName, &productLogo, &apiKeyPrefix); err != nil {
+	if err := row.Scan(&collectorEnabled, &cliaproxyURL, &managementKey, &queueName, &batchSize, &pollInterval, &retryInterval, &keeperJSON, &rulesJSON, &litellmProxyEnabled, &litellmProxyURL, &modelRequestURL, &sessionSecret, &productName, &productLogo, &apiKeyPrefix, &mappingRulesJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return AppConfig{}, fmt.Errorf("%w: app_settings id=1 is missing; run `cpa-helper migrate`", ErrAppSettingsMissing)
 		}
@@ -694,6 +702,13 @@ func (a *App) loadConfig(ctx context.Context) (AppConfig, error) {
 	cfg.ProductName = strings.TrimSpace(productName)
 	cfg.ProductLogo = strings.TrimSpace(productLogo)
 	cfg.APIKeyPrefix = normalizeAPIKeyPrefix(apiKeyPrefix)
+	cfg.ModelPriceMappingRules = []ModelPriceMappingRule{}
+	if strings.TrimSpace(mappingRulesJSON) != "" {
+		var mappingRules []ModelPriceMappingRule
+		if json.Unmarshal([]byte(mappingRulesJSON), &mappingRules) == nil {
+			cfg.ModelPriceMappingRules = sanitizeModelPriceMappingRules(mappingRules)
+		}
+	}
 	return cfg, nil
 }
 
@@ -742,6 +757,10 @@ func (a *App) saveConfig(ctx context.Context, cfg AppConfig) error {
 	if err != nil {
 		return err
 	}
+	mappingRulesBytes, err := json.Marshal(sanitizeModelPriceMappingRules(cfg.ModelPriceMappingRules))
+	if err != nil {
+		return err
+	}
 	_, err = a.db.ExecContext(ctx, `
 		UPDATE app_settings
 		SET collector_enabled = ?, cliaproxy_url = ?, management_key = ?, queue_name = ?,
@@ -749,9 +768,10 @@ func (a *App) saveConfig(ctx context.Context, cfg AppConfig) error {
 		    codex_keeper_settings = ?, codex_keeper_priority_rules = ?,
 		    litellm_proxy_enabled = ?, litellm_proxy_url = ?,
 		    model_request_url = ?, session_secret = ?,
-		    product_name = ?, product_logo = ?, api_key_prefix = ?, updated_at = ?
+		    product_name = ?, product_logo = ?, api_key_prefix = ?,
+		    model_price_mapping_rules = ?, updated_at = ?
 		WHERE id = 1
-	`, cfg.Collector.Enabled, strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/"), strings.TrimSpace(cfg.Collector.ManagementKey), strings.TrimSpace(cfg.Collector.QueueName), cfg.Collector.BatchSize, cfg.Collector.PollIntervalSeconds, cfg.Collector.RetryIntervalSeconds, string(keeperBytes), string(rulesBytes), cfg.LiteLLMProxy.Enabled, strings.TrimSpace(cfg.LiteLLMProxy.ProxyURL), strings.TrimRight(strings.TrimSpace(cfg.ModelRequestURL), "/"), cfg.SessionSecret, cfg.ProductName, cfg.ProductLogo, normalizeAPIKeyPrefix(cfg.APIKeyPrefix), dbTime(time.Now()))
+	`, cfg.Collector.Enabled, strings.TrimRight(strings.TrimSpace(cfg.Collector.CLIProxyURL), "/"), strings.TrimSpace(cfg.Collector.ManagementKey), strings.TrimSpace(cfg.Collector.QueueName), cfg.Collector.BatchSize, cfg.Collector.PollIntervalSeconds, cfg.Collector.RetryIntervalSeconds, string(keeperBytes), string(rulesBytes), cfg.LiteLLMProxy.Enabled, strings.TrimSpace(cfg.LiteLLMProxy.ProxyURL), strings.TrimRight(strings.TrimSpace(cfg.ModelRequestURL), "/"), cfg.SessionSecret, cfg.ProductName, cfg.ProductLogo, normalizeAPIKeyPrefix(cfg.APIKeyPrefix), string(mappingRulesBytes), dbTime(time.Now()))
 	return err
 }
 
