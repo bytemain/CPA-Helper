@@ -9,7 +9,6 @@ import {
   NIcon,
   NSpace,
   NSpin,
-  NTag,
   type DataTableColumns,
 } from 'naive-ui'
 import { Cpu, KeyRound, RefreshCw, ShieldCheck } from 'lucide-vue-next'
@@ -120,6 +119,14 @@ function renderPriceValue(row: AvailableModel, field: PriceField) {
   return formatUsdPerMtok(row.price[field])
 }
 
+function sourceSummary(row: AvailableModel): string {
+  const total = response.value?.queryable_api_key_count ?? 0
+  if (total > 1 && row.sources.length >= total) {
+    return t(`全部 ${total} 个 Key`, `All ${total} keys`)
+  }
+  return row.sources.map((source) => source.description).join(', ') || '-'
+}
+
 function goToApiKeys() {
   void router.push('/account/keys')
 }
@@ -162,21 +169,8 @@ const columns = computed<DataTableColumns<AvailableModel>>(() => [
     title: t('来源 Key', 'Source Key'),
     key: 'sources',
     width: 220,
-    render: (row) =>
-      h(
-        NSpace,
-        { size: 4, wrap: true },
-        {
-          default: () =>
-            row.sources.map((source) =>
-              h(
-                NTag,
-                { key: source.api_key_hash, size: 'small', bordered: false, type: 'info' },
-                { default: () => `${source.description} · ${source.api_key_preview}` },
-              ),
-            ),
-        },
-      ),
+    ellipsis: { tooltip: true },
+    render: sourceSummary,
   },
   {
     title: t('计费方式', 'Billing'),
