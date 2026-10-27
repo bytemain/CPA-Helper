@@ -1016,3 +1016,67 @@ func TestFetchAntigravityQuotaNoProject(t *testing.T) {
 		t.Fatalf("no project_id made %d remote calls; want 0", calls)
 	}
 }
+
+// TestFetchAntigravityQuotaFailureReason: when every host fails, the failure keeps the upstream
+// status and Google's reason token (a 403 TOS_VIOLATION outranks a later host's 404), and the
+// message names the ban instead of the generic "配额读取失败".
+func TestFetchAntigravityQuotaFailureReason(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	var mu sync.Mutex
+	calls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": `{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudcode-pa.googleapis.com"}]}}`})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 404, "body": map[string]any{"error": "not found"}})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	_, failure, ok := app.fetchAntigravityQuotaDetailed(context.Background(), cfg, "idx", "proj")
+	if ok {
+		t.Fatal("all hosts failed, want ok=false")
+	}
+	if failure.statusCode != 403 || failure.reason != "TOS_VIOLATION" {
+		t.Fatalf("failure = %+v, want 403 TOS_VIOLATION", failure)
+	}
+	if got := failure.message(); !strings.Contains(got, "封禁") || !strings.Contains(got, "TOS_VIOLATION") {
+		t.Fatalf("message = %q", got)
+	}
+}
+
+func TestAntigravityErrorReasonToken(t *testing.T) {
+	cases := []struct {
+		body map[string]any
+		want string
+	}{
+		{map[string]any{"error": map[string]any{"status": "PERMISSION_DENIED"}}, "PERMISSION_DENIED"},
+		{map[string]any{"error": map[string]any{"status": "free text <script>"}}, ""},
+		{map[string]any{"error": "not found"}, ""},
+		{nil, ""},
+	}
+	for _, tc := range cases {
+		if got := antigravityErrorReason(tc.body); got != tc.want {
+			t.Fatalf("antigravityErrorReason(%v) = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+	f := antigravityQuotaFailure{kind: "status", statusCode: 429, reason: "RESOURCE_EXHAUSTED"}
+	if got := f.message(); got != "Antigravity 配额读取失败（HTTP 429 RESOURCE_EXHAUSTED）" {
+		t.Fatalf("message = %q", got)
+	}
+}
