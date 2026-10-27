@@ -506,6 +506,7 @@ type antigravityQuotaFailure struct {
 	statusCode int    // inner (upstream) status if seen, else the outer api-call status; 0 = none
 	reason     string // Google ErrorInfo reason or error.status, e.g. TOS_VIOLATION
 	kind       string // "transport" | "status" | "malformed" | "" (no call made)
+	outer      bool   // statusCode came from the CPA management api-call itself, not from Google
 }
 
 func (f antigravityQuotaFailure) message() string {
@@ -514,6 +515,8 @@ func (f antigravityQuotaFailure) message() string {
 		return fmt.Sprintf("Antigravity 账号已被 Google 封禁（%d TOS_VIOLATION），需人工处理", f.statusCode)
 	case f.kind == "status" && f.reason != "":
 		return fmt.Sprintf("Antigravity 配额读取失败（HTTP %d %s）", f.statusCode, f.reason)
+	case f.kind == "status" && f.outer:
+		return fmt.Sprintf("Antigravity 配额读取失败（CPA 管理接口 HTTP %d）", f.statusCode)
 	case f.kind == "status":
 		return fmt.Sprintf("Antigravity 配额读取失败（HTTP %d）", f.statusCode)
 	case f.kind == "malformed":
@@ -600,12 +603,14 @@ func (a *App) fetchAntigravityQuotaDetailed(ctx context.Context, cfg AppConfig, 
 			"data":       string(dataBytes),
 		}
 		response, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/api-call", nil, body, time.Duration(cfg.CodexKeeper.UsageTimeoutSeconds)*time.Second)
-		if err != nil {
-			record(antigravityQuotaFailure{kind: "transport"})
+		// keeperRequest returns the response together with an error for a non-2xx outer status, so
+		// check the response first; only a request with no HTTP response is a transport failure.
+		if response != nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
+			record(antigravityQuotaFailure{kind: "status", statusCode: response.StatusCode, outer: true})
 			continue
 		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			record(antigravityQuotaFailure{kind: "status", statusCode: response.StatusCode})
+		if err != nil || response == nil {
+			record(antigravityQuotaFailure{kind: "transport"})
 			continue
 		}
 		var raw map[string]any
