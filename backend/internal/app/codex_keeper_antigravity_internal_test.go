@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1014,5 +1015,138 @@ func TestFetchAntigravityQuotaNoProject(t *testing.T) {
 	defer mu.Unlock()
 	if calls != 0 {
 		t.Fatalf("no project_id made %d remote calls; want 0", calls)
+	}
+}
+
+// TestFetchAntigravityQuotaFailureReason: when every host fails, the failure keeps the upstream
+// status and Google's reason token (a 403 TOS_VIOLATION outranks a later host's 404), and the
+// message names the ban instead of the generic "配额读取失败".
+func TestFetchAntigravityQuotaFailureReason(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	var mu sync.Mutex
+	calls := 0
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		calls++
+		n := calls
+		mu.Unlock()
+		if n == 1 {
+			_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 403, "body": `{"error":{"code":403,"message":"This service has been disabled in this account for violation of Terms of Service.","status":"PERMISSION_DENIED","details":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","reason":"TOS_VIOLATION","domain":"cloudcode-pa.googleapis.com"}]}}`})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"status_code": 404, "body": map[string]any{"error": "not found"}})
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	cfg, err := app.loadConfig(context.Background())
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	_, failure, ok := app.fetchAntigravityQuotaDetailed(context.Background(), cfg, "idx", "proj")
+	if ok {
+		t.Fatal("all hosts failed, want ok=false")
+	}
+	if failure.statusCode != 403 || failure.reason != "TOS_VIOLATION" {
+		t.Fatalf("failure = %+v, want 403 TOS_VIOLATION", failure)
+	}
+	if got := failure.message(); !strings.Contains(got, "封禁") || !strings.Contains(got, "TOS_VIOLATION") {
+		t.Fatalf("message = %q", got)
+	}
+}
+
+func TestAntigravityErrorReasonToken(t *testing.T) {
+	cases := []struct {
+		body map[string]any
+		want string
+	}{
+		{map[string]any{"error": map[string]any{"status": "PERMISSION_DENIED"}}, "PERMISSION_DENIED"},
+		{map[string]any{"error": map[string]any{"status": "free text <script>"}}, ""},
+		{map[string]any{"error": "not found"}, ""},
+		{nil, ""},
+	}
+	for _, tc := range cases {
+		if got := antigravityErrorReason(tc.body); got != tc.want {
+			t.Fatalf("antigravityErrorReason(%v) = %q, want %q", tc.body, got, tc.want)
+		}
+	}
+	f := antigravityQuotaFailure{kind: "status", statusCode: 429, reason: "RESOURCE_EXHAUSTED"}
+	if got := f.message(); got != "Antigravity 配额读取失败（HTTP 429 RESOURCE_EXHAUSTED）" {
+		t.Fatalf("message = %q", got)
+	}
+}
+
+// TestKeeperInspectAntigravityOuterHTTPStatusPersisted: keeperRequest returns the response together
+// with an error for a non-2xx outer api-call status. The inspection must persist that status (not
+// "网络错误" with a null code), and a management 401 stored as an Antigravity diagnostic must not
+// make cached stats count the still-enabled account as disabled.
+func TestKeeperInspectAntigravityOuterHTTPStatusPersisted(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	const authName = "outer-status.json"
+	var mu sync.Mutex
+	apiCallStatus := http.StatusTooManyRequests
+	cpa := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		mu.Lock()
+		status := apiCallStatus
+		mu.Unlock()
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": []map[string]any{
+				{"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "proj", "email": "a@x.com"},
+			}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v0/management/auth-files/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"name": authName, "type": "antigravity", "auth_index": "idx-ag", "project_id": "proj", "email": "a@x.com", "access_token": "t",
+			})
+		case r.Method == http.MethodPost && r.URL.Path == "/v0/management/api-call":
+			http.Error(w, `{"error":"outer"}`, status)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cpa.Close()
+
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New(): %v", err)
+	}
+	defer app.Close()
+	configureKeeperTestCPA(t, app, cpa.URL, nil)
+	ctx := context.Background()
+
+	for _, want := range []int{http.StatusTooManyRequests, http.StatusUnauthorized, http.StatusBadGateway} {
+		mu.Lock()
+		apiCallStatus = want
+		mu.Unlock()
+		if _, err := app.keeper.InspectAccountsLocked([]string{authName}); err != nil {
+			t.Fatalf("InspectAccountsLocked(%d): %v", want, err)
+		}
+		st, err := app.getKeeperState(ctx, authName)
+		if err != nil {
+			t.Fatalf("getKeeperState(%d): %v", want, err)
+		}
+		if st.LastStatusCode == nil || *st.LastStatusCode != want {
+			t.Fatalf("outer %d: last_status_code = %v, want %d", want, st.LastStatusCode, want)
+		}
+		if st.LastError == nil || !strings.Contains(*st.LastError, fmt.Sprintf("CPA 管理接口 HTTP %d", want)) || strings.Contains(*st.LastError, "网络错误") {
+			t.Fatalf("outer %d: last_error = %v", want, st.LastError)
+		}
+		if st.Disabled {
+			t.Fatalf("outer %d: account was disabled", want)
+		}
+		stats, err := app.keeperCachedAuthStats(ctx, []string{authName})
+		if err != nil {
+			t.Fatalf("keeperCachedAuthStats(%d): %v", want, err)
+		}
+		if stats.StatusDisabled != 0 || stats.NetworkError != 1 {
+			t.Fatalf("outer %d: cached stats = %+v, want StatusDisabled=0 NetworkError=1", want, stats)
+		}
 	}
 }

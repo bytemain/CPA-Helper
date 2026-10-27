@@ -3174,7 +3174,10 @@ func isKeeperCachedBadCredentialState(state keeperAuthState) bool {
 	if isKeeperBadCredentialDisableAction(state.LatestAction) {
 		return true
 	}
-	if state.LastStatusCode != nil && (*state.LastStatusCode == http.StatusUnauthorized || *state.LastStatusCode == http.StatusPaymentRequired) {
+	// An Antigravity status code is a quota-read diagnostic (possibly the CPA management API's own
+	// 401), never a credential verdict: Antigravity accounts are not disabled by status.
+	if state.LastStatusCode != nil && *keeperProviderOrCodex(state.Provider) != keeperProviderAntigravity &&
+		(*state.LastStatusCode == http.StatusUnauthorized || *state.LastStatusCode == http.StatusPaymentRequired) {
 		return true
 	}
 	if state.LatestAction != nil && strings.HasPrefix(strings.TrimSpace(*state.LatestAction), "模拟禁用") {

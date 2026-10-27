@@ -466,7 +466,8 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 		result = persist(result)
 		return result
 	}
-	if groups, ok := a.fetchAntigravityQuota(ctx, cfg, identity.authIndex, identity.projectID); ok {
+	groups, failure, ok := a.fetchAntigravityQuotaDetailed(ctx, cfg, identity.authIndex, identity.projectID)
+	if ok {
 		if encoded, err := json.Marshal(groups); err == nil {
 			payload := string(encoded)
 			result.AntigravityQuota = &payload
@@ -474,8 +475,12 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 		result.Result = "healthy"
 		logFn(fmt.Sprintf("%s：Antigravity 配额刷新成功（%d 组）", name, len(groups)))
 	} else {
-		message := "Antigravity 配额读取失败"
+		message := failure.message()
 		result.Result = "network_error"
+		if failure.statusCode > 0 {
+			code := failure.statusCode
+			result.LastStatusCode = &code
+		}
 		result.LastError = &message
 		result.LatestAction = &message
 		logFn(name + "：" + message)
@@ -490,12 +495,99 @@ func (a *App) processKeeperAntigravityAuth(ctx context.Context, cfg AppConfig, a
 // candidate host leaves both return values empty (ok=false) so the caller preserves the prior
 // snapshot instead of wiping it.
 func (a *App) fetchAntigravityQuota(ctx context.Context, cfg AppConfig, authIndex, projectID string) ([]keeperAntigravityGroup, bool) {
+	groups, _, ok := a.fetchAntigravityQuotaDetailed(ctx, cfg, authIndex, projectID)
+	return groups, ok
+}
+
+// antigravityQuotaFailure summarises why every candidate host failed, so the keeper state shows
+// the upstream status and Google's machine-readable reason instead of a generic message. Only the
+// status code and an allowlisted reason token are kept — never the raw upstream body.
+type antigravityQuotaFailure struct {
+	statusCode int    // inner (upstream) status if seen, else the outer api-call status; 0 = none
+	reason     string // Google ErrorInfo reason or error.status, e.g. TOS_VIOLATION
+	kind       string // "transport" | "status" | "malformed" | "" (no call made)
+	outer      bool   // statusCode came from the CPA management api-call itself, not from Google
+}
+
+func (f antigravityQuotaFailure) message() string {
+	switch {
+	case f.reason == "TOS_VIOLATION":
+		return fmt.Sprintf("Antigravity 账号已被 Google 封禁（%d TOS_VIOLATION），需人工处理", f.statusCode)
+	case f.kind == "status" && f.reason != "":
+		return fmt.Sprintf("Antigravity 配额读取失败（HTTP %d %s）", f.statusCode, f.reason)
+	case f.kind == "status" && f.outer:
+		return fmt.Sprintf("Antigravity 配额读取失败（CPA 管理接口 HTTP %d）", f.statusCode)
+	case f.kind == "status":
+		return fmt.Sprintf("Antigravity 配额读取失败（HTTP %d）", f.statusCode)
+	case f.kind == "malformed":
+		return "Antigravity 配额读取失败（返回内容无法解析）"
+	case f.kind == "transport":
+		return "Antigravity 配额读取失败（网络错误）"
+	default:
+		return "Antigravity 配额读取失败"
+	}
+}
+
+// antigravityErrorReason extracts Google's error reason from an error body:
+// error.details[].reason (ErrorInfo) first, then error.status. The value is reduced to an
+// UPPER_SNAKE token so nothing free-form from upstream reaches the keeper state.
+func antigravityErrorReason(body map[string]any) string {
+	errObj, _ := body["error"].(map[string]any)
+	if errObj == nil {
+		return ""
+	}
+	if details, ok := errObj["details"].([]any); ok {
+		for _, d := range details {
+			if dm, ok := d.(map[string]any); ok {
+				if reason := keeperErrorReasonToken(dm["reason"]); reason != "" {
+					return reason
+				}
+			}
+		}
+	}
+	return keeperErrorReasonToken(errObj["status"])
+}
+
+func keeperErrorReasonToken(value any) string {
+	s, ok := value.(string)
+	if !ok || s == "" || len(s) > 64 {
+		return ""
+	}
+	for _, r := range s {
+		if !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') {
+			return ""
+		}
+	}
+	return s
+}
+
+// fetchAntigravityQuotaDetailed is fetchAntigravityQuota plus a failure summary. A failure that
+// carries an upstream status (and especially a reason) outranks a transport/parse failure on
+// another candidate host, so a 403 TOS_VIOLATION is not masked by a later host's timeout.
+func (a *App) fetchAntigravityQuotaDetailed(ctx context.Context, cfg AppConfig, authIndex, projectID string) ([]keeperAntigravityGroup, antigravityQuotaFailure, bool) {
+	var failure antigravityQuotaFailure
+	record := func(f antigravityQuotaFailure) {
+		rank := func(x antigravityQuotaFailure) int {
+			switch {
+			case x.reason != "":
+				return 3
+			case x.kind == "status":
+				return 2
+			case x.kind != "":
+				return 1
+			}
+			return 0
+		}
+		if rank(f) > rank(failure) {
+			failure = f
+		}
+	}
 	if strings.TrimSpace(authIndex) == "" || strings.TrimSpace(projectID) == "" {
-		return nil, false
+		return nil, failure, false
 	}
 	dataBytes, err := json.Marshal(map[string]string{"project": projectID})
 	if err != nil {
-		return nil, false
+		return nil, failure, false
 	}
 	header := map[string]string{
 		"Authorization": "Bearer $TOKEN$",
@@ -511,22 +603,39 @@ func (a *App) fetchAntigravityQuota(ctx context.Context, cfg AppConfig, authInde
 			"data":       string(dataBytes),
 		}
 		response, payload, err := a.keeperRequest(ctx, cfg, http.MethodPost, "/v0/management/api-call", nil, body, time.Duration(cfg.CodexKeeper.UsageTimeoutSeconds)*time.Second)
-		if err != nil {
+		// keeperRequest returns the response together with an error for a non-2xx outer status, so
+		// check the response first; only a request with no HTTP response is a transport failure.
+		if response != nil && (response.StatusCode < 200 || response.StatusCode >= 300) {
+			record(antigravityQuotaFailure{kind: "status", statusCode: response.StatusCode, outer: true})
 			continue
 		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
+		if err != nil || response == nil {
+			record(antigravityQuotaFailure{kind: "transport"})
 			continue
 		}
 		var raw map[string]any
 		if err := json.Unmarshal(payload, &raw); err != nil {
+			record(antigravityQuotaFailure{kind: "malformed"})
 			continue
 		}
+		innerBody := keeperBodyJSON(raw["body"])
 		if !keeperInnerStatusOK(raw) {
+			inner := raw["status_code"]
+			if inner == nil {
+				inner = raw["statusCode"]
+			}
+			code, ok := keeperStrictNonNegInt(inner)
+			if !ok {
+				record(antigravityQuotaFailure{kind: "malformed"})
+				continue
+			}
+			record(antigravityQuotaFailure{kind: "status", statusCode: code, reason: antigravityErrorReason(innerBody)})
 			continue
 		}
-		if groups, ok := parseAntigravityQuotaGroups(keeperBodyJSON(raw["body"])); ok {
-			return groups, true
+		if groups, ok := parseAntigravityQuotaGroups(innerBody); ok {
+			return groups, antigravityQuotaFailure{}, true
 		}
+		record(antigravityQuotaFailure{kind: "malformed"})
 	}
-	return nil, false
+	return nil, failure, false
 }
