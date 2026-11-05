@@ -56,6 +56,7 @@ type App struct {
 	frontendEnv      bool
 	collector        *CollectorRunner
 	keeper           *KeeperRunner
+	priceSync        *PriceSyncRunner
 	keeperUsageCache keeperWindowUsageCache
 }
 
@@ -153,7 +154,9 @@ func NewWithOptions(ctx context.Context, options NewOptions) (*App, error) {
 func (a *App) startBackground(ctx context.Context) {
 	a.collector = NewCollectorRunner(a)
 	a.keeper = NewKeeperRunner(a)
+	a.priceSync = NewPriceSyncRunner(a)
 	a.collector.Start()
+	a.priceSync.Start()
 	a.keeper.LoadPersistedState(ctx)
 	a.keeper.StartAutoIfConfigured()
 }
@@ -164,6 +167,9 @@ func (a *App) Close() {
 	}
 	if a.keeper != nil {
 		a.keeper.Stop()
+	}
+	if a.priceSync != nil {
+		a.priceSync.Stop()
 	}
 	if a.db != nil {
 		a.db.Close()

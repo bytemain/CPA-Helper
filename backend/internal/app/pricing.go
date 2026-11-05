@@ -595,26 +595,11 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	if err := ensureHTTPSURL(sourceURL); err != nil {
 		return err
 	}
-	cfg, err := a.loadConfig(r.Context())
+	rawData, err := a.fetchLiteLLMPrices(r.Context(), sourceURL)
 	if err != nil {
 		return err
 	}
-	client, err := liteLLMHTTPClient(30*time.Second, cfg.LiteLLMProxy)
-	if err != nil {
-		return err
-	}
-	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, sourceURL, nil, nil)
-	if err != nil {
-		return validationError("下载 LiteLLM 价格数据失败")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
-	}
-	var rawData map[string]any
-	if err := json.Unmarshal(rawPayload, &rawData); err != nil {
-		return validationError("LiteLLM 价格数据不是有效 JSON")
-	}
-	result, err := a.syncLiteLLMPrices(r.Context(), sourceURL, rawData)
+	result, err := a.syncLiteLLMPrices(r.Context(), sourceURL, rawData, 0)
 	if err != nil {
 		return err
 	}
@@ -622,7 +607,34 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	return nil
 }
 
-func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData map[string]any) (map[string]any, error) {
+// fetchLiteLLMPrices downloads the LiteLLM price dictionary through the configured LiteLLM proxy.
+func (a *App) fetchLiteLLMPrices(ctx context.Context, sourceURL string) (map[string]any, error) {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client, err := liteLLMHTTPClient(30*time.Second, cfg.LiteLLMProxy)
+	if err != nil {
+		return nil, err
+	}
+	response, rawPayload, err := doJSON(ctx, client, http.MethodGet, sourceURL, nil, nil)
+	if err != nil {
+		return nil, validationError("下载 LiteLLM 价格数据失败")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
+	}
+	var rawData map[string]any
+	if err := json.Unmarshal(rawPayload, &rawData); err != nil {
+		return nil, validationError("LiteLLM 价格数据不是有效 JSON")
+	}
+	return rawData, nil
+}
+
+// syncLiteLLMPrices replaces the LiteLLM-sourced price rows with rawData; manual rows are kept.
+// When minRows is positive and rawData yields fewer valid rows, nothing is written, so a truncated
+// or broken download cannot wipe the price table.
+func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData map[string]any, minRows int) (map[string]any, error) {
 	now := dbTime(time.Now())
 	type litellmPriceRow struct {
 		modelName string
@@ -641,6 +653,9 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			continue
 		}
 		rows = append(rows, litellmPriceRow{modelName: modelName, payload: payload})
+	}
+	if len(rows) < minRows {
+		return nil, fmt.Errorf("LiteLLM price data has %d valid entries, fewer than the required %d; keeping the current prices", len(rows), minRows)
 	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {

@@ -276,7 +276,7 @@ func TestSyncLiteLLMPricesReplacesLiteLLMSource(t *testing.T) {
 			"input_cost_per_token": 0.000001,
 		},
 	}
-	result, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData)
+	result, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData, 0)
 	if err != nil {
 		t.Fatalf("syncLiteLLMPrices failed: %v", err)
 	}
