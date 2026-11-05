@@ -109,7 +109,7 @@ func TestGoldenVectorsCoverTheBranchesThatMatter(t *testing.T) {
 // without anybody noticing.
 func TestWiredCostFuncMatchesCPAHelper(t *testing.T) {
 	file := loadGolden(t)
-	cost := WiredCostFunc()
+	cost := WiredCostFunc(nil)
 	if cost == nil {
 		t.Skipf("no pricing implementation wired in yet; %d golden vectors from %s@%s are waiting",
 			len(file.Cases), file.GeneratedFrom.Repo, file.GeneratedFrom.Commit[:12])

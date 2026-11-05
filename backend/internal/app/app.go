@@ -703,11 +703,8 @@ func (a *App) loadConfig(ctx context.Context) (AppConfig, error) {
 	cfg.ProductLogo = strings.TrimSpace(productLogo)
 	cfg.APIKeyPrefix = normalizeAPIKeyPrefix(apiKeyPrefix)
 	cfg.ModelPriceMappingRules = []ModelPriceMappingRule{}
-	if strings.TrimSpace(mappingRulesJSON) != "" {
-		var mappingRules []ModelPriceMappingRule
-		if json.Unmarshal([]byte(mappingRulesJSON), &mappingRules) == nil {
-			cfg.ModelPriceMappingRules = sanitizeModelPriceMappingRules(mappingRules)
-		}
+	if rules := ParseModelPriceMappingRules(mappingRulesJSON); rules != nil {
+		cfg.ModelPriceMappingRules = rules
 	}
 	return cfg, nil
 }
