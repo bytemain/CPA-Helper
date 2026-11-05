@@ -24,11 +24,15 @@ func Run(ctx context.Context, args []string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("load prices: %w", err)
 	}
+	rules, err := LoadMappingRules(ctx, db)
+	if err != nil {
+		return fmt.Errorf("load price mapping rules: %w", err)
+	}
 	records, err := LoadRecords(ctx, db, opts.Since)
 	if err != nil {
 		return fmt.Errorf("load usage records: %w", err)
 	}
-	groups, err := Aggregate(records, prices, opts.GroupBy, WiredCostFunc())
+	groups, err := Aggregate(records, prices, opts.GroupBy, WiredCostFunc(rules))
 	if err != nil {
 		return err
 	}

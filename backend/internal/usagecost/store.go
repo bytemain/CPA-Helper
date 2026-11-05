@@ -3,6 +3,7 @@ package usagecost
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
@@ -77,6 +78,22 @@ func LoadPrices(ctx context.Context, db *sql.DB) (map[PriceKey]ModelPrice, error
 		prices[PriceKey{provider, model}] = price
 	}
 	return prices, rows.Err()
+}
+
+// LoadMappingRules reads the operator's price mapping rules from app_settings,
+// decoded the way CPA-Helper decodes them. Without them every model priced
+// through a rule (devin/claude-* -> anthropic, say) would be reported unpriced
+// while production prices it. A database with no settings row has no rules.
+func LoadMappingRules(ctx context.Context, db *sql.DB) ([]MappingRule, error) {
+	var raw sql.NullString
+	err := db.QueryRowContext(ctx, `SELECT model_price_mapping_rules FROM app_settings WHERE id = 1`).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return backendApp.ParseModelPriceMappingRules(raw.String), nil
 }
 
 // LoadRecords reads every usage row at or after `since`. The bound is the

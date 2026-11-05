@@ -11,6 +11,10 @@ import (
 // and the production billing branch drift apart.
 type ModelPrice = backendApp.ModelPrice
 
+// MappingRule is CPA-Helper's own price mapping rule type, for the same reason
+// ModelPrice is: the rules are handed to app.UsageRecordCost unchanged.
+type MappingRule = backendApp.ModelPriceMappingRule
+
 // PriceKey is (provider, model), both lowercased and trimmed -- the same shape
 // CPA-Helper keys its price map by. It is an alias, not a new type: the price
 // map must be passable to app.UsageRecordCost without a rebuild, or the wiring
