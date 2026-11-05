@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -92,6 +93,10 @@ func (r *PriceSyncRunner) loop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		result, err := r.app.syncLiteLLMPricesIfDue(ctx, time.Now())
 		cancel()
+		if errors.Is(err, errLiteLLMSyncSuperseded) {
+			log.Printf("daily LiteLLM price sync skipped: %v", err)
+			continue
+		}
 		if err != nil {
 			log.Printf("daily LiteLLM price sync failed, retrying in %s: %v", priceSyncCheckInterval, err)
 			continue
@@ -108,9 +113,10 @@ func priceSyncDisabled() bool {
 }
 
 // syncLiteLLMPricesIfDue syncs from the default LiteLLM source when liteLLMPriceSyncDue says so.
-// It returns nil, nil when the rows are still fresh.
+// It returns nil, nil when the rows are still fresh, and errLiteLLMSyncSuperseded when another
+// sync committed while this one was downloading.
 func (a *App) syncLiteLLMPricesIfDue(ctx context.Context, now time.Time) (map[string]any, error) {
-	count, due, err := a.liteLLMPriceSyncDue(ctx, now)
+	guard, due, err := a.liteLLMPriceSyncDue(ctx, now)
 	if err != nil || !due {
 		return nil, err
 	}
@@ -118,27 +124,42 @@ func (a *App) syncLiteLLMPricesIfDue(ctx context.Context, now time.Time) (map[st
 	if err != nil {
 		return nil, err
 	}
-	// Require at least half as many valid rows as are stored now, so a truncated or broken
-	// download is rejected instead of replacing the table.
-	return a.syncLiteLLMPrices(ctx, defaultLiteLLMPricingURL, rawData, count/2)
+	return a.syncLiteLLMPrices(ctx, defaultLiteLLMPricingURL, rawData, guard)
 }
 
-// liteLLMPriceSyncDue reports how many LiteLLM price rows are stored and whether they are due for
-// a refresh: there are none, or the newest was synced at least priceSyncInterval ago.
-func (a *App) liteLLMPriceSyncDue(ctx context.Context, now time.Time) (int, bool, error) {
+// liteLLMPriceSyncDue reports whether the LiteLLM price rows are due for a refresh (there are
+// none, or the newest was synced at least priceSyncInterval ago) and returns the guard the sync
+// must write with: at least half as many valid rows as are stored now, and the same newest
+// last_synced_at as seen here.
+func (a *App) liteLLMPriceSyncDue(ctx context.Context, now time.Time) (*liteLLMAutoSyncGuard, bool, error) {
 	var count int
-	var lastSynced sql.NullString
-	if err := a.db.QueryRowContext(ctx, `
-		SELECT COUNT(*), MAX(CAST(last_synced_at AS TEXT)) FROM model_prices WHERE source = 'litellm'
-	`).Scan(&count, &lastSynced); err != nil {
-		return 0, false, err
+	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_prices WHERE source = 'litellm'`).Scan(&count); err != nil {
+		return nil, false, err
 	}
+	lastSynced, err := liteLLMLastSynced(ctx, a.db)
+	if err != nil {
+		return nil, false, err
+	}
+	guard := &liteLLMAutoSyncGuard{minRows: count / 2, lastSynced: lastSynced}
 	if count == 0 {
-		return 0, true, nil
+		return guard, true, nil
 	}
-	last, ok := parseDBTime(lastSynced.String)
+	last, ok := parseDBTime(lastSynced)
 	if !ok {
-		return count, true, nil
+		return guard, true, nil
 	}
-	return count, now.Sub(last) >= priceSyncInterval, nil
+	return guard, now.Sub(last) >= priceSyncInterval, nil
+}
+
+// liteLLMLastSynced returns the newest last_synced_at of the LiteLLM price rows, or "" if none.
+func liteLLMLastSynced(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (string, error) {
+	var lastSynced sql.NullString
+	if err := q.QueryRowContext(ctx, `
+		SELECT MAX(CAST(last_synced_at AS TEXT)) FROM model_prices WHERE source = 'litellm'
+	`).Scan(&lastSynced); err != nil {
+		return "", err
+	}
+	return lastSynced.String, nil
 }

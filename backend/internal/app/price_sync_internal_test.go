@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 )
@@ -16,8 +17,8 @@ func TestLiteLLMPriceSyncDue(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().In(appTimeLocation)
 
-	if count, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || count != 0 || !due {
-		t.Fatalf("empty table: count %d due %v err %v, want 0 true nil", count, due, err)
+	if guard, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || guard.minRows != 0 || guard.lastSynced != "" || !due {
+		t.Fatalf("empty table: guard %+v due %v err %v, want floor 0, no last sync, due", guard, due, err)
 	}
 
 	// Manual rows are not LiteLLM rows: they neither count nor make the table fresh.
@@ -29,8 +30,8 @@ func TestLiteLLMPriceSyncDue(t *testing.T) {
 	`, dbTime(now)); err != nil {
 		t.Fatalf("seed manual price: %v", err)
 	}
-	if count, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || count != 0 || !due {
-		t.Fatalf("manual only: count %d due %v err %v, want 0 true nil", count, due, err)
+	if guard, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || guard.minRows != 0 || !due {
+		t.Fatalf("manual only: guard %+v due %v err %v, want floor 0 and due", guard, due, err)
 	}
 
 	seed := func(model string, syncedAt time.Time) {
@@ -46,14 +47,18 @@ func TestLiteLLMPriceSyncDue(t *testing.T) {
 		}
 	}
 	seed("old-model", now.Add(-48*time.Hour))
-	if count, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || count != 1 || !due {
-		t.Fatalf("stale rows: count %d due %v err %v, want 1 true nil", count, due, err)
+	if _, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || !due {
+		t.Fatalf("stale rows: due %v err %v, want due", due, err)
 	}
 
 	// The newest LiteLLM row decides freshness.
 	seed("fresh-model", now.Add(-time.Hour))
-	if count, due, err := app.liteLLMPriceSyncDue(ctx, now); err != nil || count != 2 || due {
-		t.Fatalf("fresh rows: count %d due %v err %v, want 2 false nil", count, due, err)
+	guard, due, err := app.liteLLMPriceSyncDue(ctx, now)
+	if err != nil || due {
+		t.Fatalf("fresh rows: due %v err %v, want not due", due, err)
+	}
+	if guard.minRows != 1 || guard.lastSynced != dbTime(now.Add(-time.Hour)) {
+		t.Fatalf("fresh rows guard = %+v, want floor 1 (2 rows / 2) and the newest row's sync time", guard)
 	}
 	if _, due, _ := app.liteLLMPriceSyncDue(ctx, now.Add(priceSyncInterval)); !due {
 		t.Fatalf("rows synced a full interval ago should be due")
@@ -91,7 +96,8 @@ func TestSyncLiteLLMPricesRejectsShrunkDownload(t *testing.T) {
 		},
 		"not-a-price": "garbage",
 	}
-	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData, 2); err == nil {
+	// The seeded rows have no last_synced_at, so the guard's lastSynced is "".
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData, &liteLLMAutoSyncGuard{minRows: 2}); err == nil {
 		t.Fatalf("syncLiteLLMPrices accepted 1 valid row with minRows 2")
 	}
 	var count int
@@ -103,7 +109,7 @@ func TestSyncLiteLLMPricesRejectsShrunkDownload(t *testing.T) {
 	}
 
 	// The manual sync passes no floor, so an operator can still replace the table on purpose.
-	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData, 0); err != nil {
+	if _, err := app.syncLiteLLMPrices(context.Background(), "https://example.com/prices.json", rawData, nil); err != nil {
 		t.Fatalf("syncLiteLLMPrices with no floor failed: %v", err)
 	}
 	if err := app.db.QueryRow(`SELECT COUNT(*) FROM model_prices WHERE source = 'litellm'`).Scan(&count); err != nil {
@@ -173,7 +179,7 @@ func TestPriceSyncChangesNewQuotaChargesOnly(t *testing.T) {
 		"gpt-synced": map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000002},
 		"gpt-manual": map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000005},
 	}
-	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", rawData, 0); err != nil {
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", rawData, nil); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
 
@@ -194,5 +200,60 @@ func TestPriceSyncChangesNewQuotaChargesOnly(t *testing.T) {
 	}
 	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 97 {
 		t.Fatalf("lifetime balance = %v, want 97 (100 - 2 - 1)", user.QuotaLifetimeUSD)
+	}
+}
+
+// The daily sync decides to sync, then downloads. If a manual sync commits newer prices in the
+// meantime, the daily sync's older download must not replace them.
+func TestDailyPriceSyncYieldsToSyncDuringDownload(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	prices := func(inputPerToken float64) map[string]any {
+		return map[string]any{"gpt-race": map[string]any{"litellm_provider": "openai", "input_cost_per_token": inputPerToken}}
+	}
+	inputPrice := func() float64 {
+		t.Helper()
+		var input float64
+		if err := app.db.QueryRow(`SELECT input_usd_per_million FROM model_prices WHERE source = 'litellm' AND model = 'gpt-race'`).Scan(&input); err != nil {
+			t.Fatalf("read price: %v", err)
+		}
+		return input
+	}
+
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000001), nil); err != nil {
+		t.Fatalf("initial sync: %v", err)
+	}
+	// The daily sync checks a day later and is due; its guard records what it saw.
+	guard, due, err := app.liteLLMPriceSyncDue(ctx, time.Now().Add(priceSyncInterval+time.Minute))
+	if err != nil || !due {
+		t.Fatalf("daily check: due %v err %v, want due", due, err)
+	}
+	// While it downloads, an operator syncs newer prices by hand.
+	time.Sleep(2 * time.Millisecond) // last_synced_at has microsecond precision; make it move
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000002), nil); err != nil {
+		t.Fatalf("manual sync: %v", err)
+	}
+	// The daily sync now writes its older download with the guard from before.
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000001), guard); !errors.Is(err, errLiteLLMSyncSuperseded) {
+		t.Fatalf("stale daily write err = %v, want errLiteLLMSyncSuperseded", err)
+	}
+	if got := inputPrice(); got != 2 {
+		t.Fatalf("price after stale daily write = %v, want the manual sync's 2", got)
+	}
+	// Without an intervening sync the same guard still writes.
+	guard, _, err = app.liteLLMPriceSyncDue(ctx, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000003), guard); err != nil {
+		t.Fatalf("unraced daily write: %v", err)
+	}
+	if got := inputPrice(); got != 3 {
+		t.Fatalf("price after unraced daily write = %v, want 3", got)
 	}
 }
