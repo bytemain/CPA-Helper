@@ -123,3 +123,76 @@ func TestPriceSyncRunnerHonorsDisableEnv(t *testing.T) {
 	}
 	runner.Stop()
 }
+
+// The price table also drives quota charges, so a sync changes what NEW usage deducts from a
+// limited user's balance. Charges already recorded are not re-applied, and a manual price still
+// wins over the synced LiteLLM price for the same model.
+func TestPriceSyncChangesNewQuotaChargesOnly(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+	userID := seedQuotaTestUser(t, app, "member")
+	apiKey := "sk-quota-price-sync"
+	seedQuotaTestAPIKey(t, app, userID, apiKey)
+	seedQuotaTestPrice(t, app, "openai", "gpt-manual", 1)
+	lifetime := 100.0
+	if _, err := app.updateUserQuota(ctx, userID, userQuotaPayload{LifetimeQuotaUSD: &lifetime}); err != nil {
+		t.Fatalf("update quota: %v", err)
+	}
+	usage := func(model, requestID string) {
+		t.Helper()
+		raw := `{"api_key":"` + apiKey + `","provider":"openai","model":"` + model + `","input_tokens":1000000,"request_id":"` + requestID + `"}`
+		if _, created, err := app.saveUsageMessage(ctx, []byte(raw)); err != nil || !created {
+			t.Fatalf("usage %s created=%v err=%v", requestID, created, err)
+		}
+	}
+	charge := func(requestID string) (float64, bool) {
+		t.Helper()
+		var amount float64
+		var unpriced bool
+		if err := app.db.QueryRow(`
+			SELECT c.amount_usd, c.unpriced FROM user_quota_charges c
+			JOIN usage_records r ON r.id = c.usage_record_id WHERE r.request_id = ?
+		`, requestID).Scan(&amount, &unpriced); err != nil {
+			t.Fatalf("charge for %s: %v", requestID, err)
+		}
+		return amount, unpriced
+	}
+
+	usage("gpt-synced", "before-sync")
+	if amount, unpriced := charge("before-sync"); amount != 0 || !unpriced {
+		t.Fatalf("before sync: amount %v unpriced %v, want 0 true", amount, unpriced)
+	}
+
+	rawData := map[string]any{
+		"gpt-synced": map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000002},
+		"gpt-manual": map[string]any{"litellm_provider": "openai", "input_cost_per_token": 0.000005},
+	}
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", rawData, 0); err != nil {
+		t.Fatalf("sync: %v", err)
+	}
+
+	usage("gpt-synced", "after-sync")
+	usage("gpt-manual", "manual-after-sync")
+	if amount, unpriced := charge("after-sync"); amount != 2 || unpriced {
+		t.Fatalf("after sync: amount %v unpriced %v, want 2 false", amount, unpriced)
+	}
+	if amount, _ := charge("manual-after-sync"); amount != 1 {
+		t.Fatalf("manual price: amount %v, want 1 (manual row, not the synced 5)", amount)
+	}
+	if amount, unpriced := charge("before-sync"); amount != 0 || !unpriced {
+		t.Fatalf("recorded charge changed after sync: amount %v unpriced %v, want 0 true", amount, unpriced)
+	}
+	user, err := app.getUser(ctx, userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.QuotaLifetimeUSD == nil || *user.QuotaLifetimeUSD != 97 {
+		t.Fatalf("lifetime balance = %v, want 97 (100 - 2 - 1)", user.QuotaLifetimeUSD)
+	}
+}
