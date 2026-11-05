@@ -257,3 +257,36 @@ func TestDailyPriceSyncYieldsToSyncDuringDownload(t *testing.T) {
 		t.Fatalf("price after unraced daily write = %v, want 3", got)
 	}
 }
+
+// Same race starting from an empty table: the daily check sees no LiteLLM rows, a manual sync
+// then fills the table, and the daily write of its download must still yield.
+func TestDailyPriceSyncYieldsWhenTableFilledDuringDownload(t *testing.T) {
+	t.Setenv("CPA_HELPER_DATA_DIR", t.TempDir())
+	app, err := New()
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer app.Close()
+	ctx := context.Background()
+	prices := func(inputPerToken float64) map[string]any {
+		return map[string]any{"gpt-race": map[string]any{"litellm_provider": "openai", "input_cost_per_token": inputPerToken}}
+	}
+
+	guard, due, err := app.liteLLMPriceSyncDue(ctx, time.Now())
+	if err != nil || !due || guard.minRows != 0 || guard.lastSynced != "" {
+		t.Fatalf("empty-table check: guard %+v due %v err %v, want due with floor 0 and no sync time", guard, due, err)
+	}
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000002), nil); err != nil {
+		t.Fatalf("manual sync: %v", err)
+	}
+	if _, err := app.syncLiteLLMPrices(ctx, "https://example.com/prices.json", prices(0.000001), guard); !errors.Is(err, errLiteLLMSyncSuperseded) {
+		t.Fatalf("daily write after table filled: err = %v, want errLiteLLMSyncSuperseded", err)
+	}
+	var input float64
+	if err := app.db.QueryRow(`SELECT input_usd_per_million FROM model_prices WHERE source = 'litellm' AND model = 'gpt-race'`).Scan(&input); err != nil {
+		t.Fatalf("read price: %v", err)
+	}
+	if input != 2 {
+		t.Fatalf("price = %v, want the manual sync's 2", input)
+	}
+}

@@ -132,19 +132,20 @@ func (a *App) syncLiteLLMPricesIfDue(ctx context.Context, now time.Time) (map[st
 // must write with: at least half as many valid rows as are stored now, and the same newest
 // last_synced_at as seen here.
 func (a *App) liteLLMPriceSyncDue(ctx context.Context, now time.Time) (*liteLLMAutoSyncGuard, bool, error) {
+	// One query, so the count and the sync time come from the same snapshot; read separately, a
+	// sync committing in between could pair an old count with a new time and pass the guard.
 	var count int
-	if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM model_prices WHERE source = 'litellm'`).Scan(&count); err != nil {
+	var lastSynced sql.NullString
+	if err := a.db.QueryRowContext(ctx, `
+		SELECT COUNT(*), MAX(CAST(last_synced_at AS TEXT)) FROM model_prices WHERE source = 'litellm'
+	`).Scan(&count, &lastSynced); err != nil {
 		return nil, false, err
 	}
-	lastSynced, err := liteLLMLastSynced(ctx, a.db)
-	if err != nil {
-		return nil, false, err
-	}
-	guard := &liteLLMAutoSyncGuard{minRows: count / 2, lastSynced: lastSynced}
+	guard := &liteLLMAutoSyncGuard{minRows: count / 2, lastSynced: lastSynced.String}
 	if count == 0 {
 		return guard, true, nil
 	}
-	last, ok := parseDBTime(lastSynced)
+	last, ok := parseDBTime(lastSynced.String)
 	if !ok {
 		return guard, true, nil
 	}
