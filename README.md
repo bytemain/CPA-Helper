@@ -341,6 +341,8 @@ Use the System Settings page to configure:
 - Token models store input, output, cache read and cache write prices as USD per million tokens. Models whose name contains `image` use a fixed USD price per successful request; if that per-request price is missing, the model is treated as unpriced.
 - Usage-history pages recalculate displayed costs with the current price catalog; already written balance charge records keep the amount calculated at the time and are not retroactively repriced.
 - LiteLLM sync can quickly fill the local price catalog while preserving manual prices. If GitHub is not reachable, configure the LiteLLM proxy from the Model Pricing page.
+- CPA-Helper also syncs LiteLLM prices automatically once a day: five minutes after startup and then hourly, it syncs when the LiteLLM prices are missing or the newest was synced at least 24 hours ago. A failed sync is logged and retried at the next hourly check. The automatic sync keeps manual prices, keeps the current prices if the download has fewer than half as many valid entries as are stored, and skips writing if another sync finished while it was downloading. Set `CPA_HELPER_PRICE_SYNC_DISABLED=1` to turn it off; the sync button keeps working.
+- A sync changes the prices that new usage is charged at for users with a balance, so a model that was unpriced (and free against the balance) starts consuming it once LiteLLM has a price for it.
 - Each API key row includes Request Test, which shows the Base URL, endpoint URL, auth header and curl example, and can send one real test request.
 - Request testing supports Chat Completions, Responses and Claude Messages formats. The examples and test payload switch with the selected format.
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -595,26 +596,11 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	if err := ensureHTTPSURL(sourceURL); err != nil {
 		return err
 	}
-	cfg, err := a.loadConfig(r.Context())
+	rawData, err := a.fetchLiteLLMPrices(r.Context(), sourceURL)
 	if err != nil {
 		return err
 	}
-	client, err := liteLLMHTTPClient(30*time.Second, cfg.LiteLLMProxy)
-	if err != nil {
-		return err
-	}
-	response, rawPayload, err := doJSON(r.Context(), client, http.MethodGet, sourceURL, nil, nil)
-	if err != nil {
-		return validationError("下载 LiteLLM 价格数据失败")
-	}
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
-	}
-	var rawData map[string]any
-	if err := json.Unmarshal(rawPayload, &rawData); err != nil {
-		return validationError("LiteLLM 价格数据不是有效 JSON")
-	}
-	result, err := a.syncLiteLLMPrices(r.Context(), sourceURL, rawData)
+	result, err := a.syncLiteLLMPrices(r.Context(), sourceURL, rawData, nil)
 	if err != nil {
 		return err
 	}
@@ -622,7 +608,46 @@ func (a *App) handleSyncLiteLLMPrices(w http.ResponseWriter, r *http.Request) er
 	return nil
 }
 
-func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData map[string]any) (map[string]any, error) {
+// fetchLiteLLMPrices downloads the LiteLLM price dictionary through the configured LiteLLM proxy.
+func (a *App) fetchLiteLLMPrices(ctx context.Context, sourceURL string) (map[string]any, error) {
+	cfg, err := a.loadConfig(ctx)
+	if err != nil {
+		return nil, err
+	}
+	client, err := liteLLMHTTPClient(30*time.Second, cfg.LiteLLMProxy)
+	if err != nil {
+		return nil, err
+	}
+	response, rawPayload, err := doJSON(ctx, client, http.MethodGet, sourceURL, nil, nil)
+	if err != nil {
+		return nil, validationError("下载 LiteLLM 价格数据失败")
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, validationError(fmt.Sprintf("下载 LiteLLM 价格数据失败：HTTP %d", response.StatusCode))
+	}
+	var rawData map[string]any
+	if err := json.Unmarshal(rawPayload, &rawData); err != nil {
+		return nil, validationError("LiteLLM 价格数据不是有效 JSON")
+	}
+	return rawData, nil
+}
+
+// liteLLMAutoSyncGuard is what the daily sync saw when it decided to sync. The manual sync passes
+// none.
+type liteLLMAutoSyncGuard struct {
+	// minRows rejects a download with fewer valid rows, so a truncated or broken file cannot
+	// wipe the price table.
+	minRows int
+	// lastSynced is the newest LiteLLM last_synced_at seen at that time. If it changed before
+	// the write, another sync (the manual one, or another process) won and this download is
+	// older than what is stored.
+	lastSynced string
+}
+
+var errLiteLLMSyncSuperseded = errors.New("another LiteLLM price sync finished first; keeping its prices")
+
+// syncLiteLLMPrices replaces the LiteLLM-sourced price rows with rawData; manual rows are kept.
+func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData map[string]any, guard *liteLLMAutoSyncGuard) (map[string]any, error) {
 	now := dbTime(time.Now())
 	type litellmPriceRow struct {
 		modelName string
@@ -642,6 +667,9 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 		}
 		rows = append(rows, litellmPriceRow{modelName: modelName, payload: payload})
 	}
+	if guard != nil && len(rows) < guard.minRows {
+		return nil, fmt.Errorf("LiteLLM price data has %d valid entries, fewer than the required %d; keeping the current prices", len(rows), guard.minRows)
+	}
 	tx, err := a.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -652,6 +680,17 @@ func (a *App) syncLiteLLMPrices(ctx context.Context, sourceURL string, rawData m
 			_ = tx.Rollback()
 		}
 	}()
+	if guard != nil {
+		// Checked inside the write transaction, so a sync that commits in between makes this
+		// one either see the change here or fail to commit.
+		lastSynced, err := liteLLMLastSynced(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		if lastSynced != guard.lastSynced {
+			return nil, errLiteLLMSyncSuperseded
+		}
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_prices WHERE source = 'litellm'`); err != nil {
 		return nil, err
 	}
